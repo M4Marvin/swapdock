@@ -1,0 +1,28 @@
+[package]
+name = "deploy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Deploy tool for a multi-app Docker host: registry, nginx front door, blue/green releases"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Release profile tuned for a CLI that ships as a single static binary.
+# `strip` and `lto` roughly halve the download; `panic = "abort"` keeps the
+# binary small and turns a panic into a non-zero exit rather than unwinding.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"

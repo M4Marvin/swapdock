@@ -1,0 +1,2 @@
+[tools]
+mr-boxington = { version = "latest", mr_boxington = true }
