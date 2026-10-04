@@ -21,6 +21,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::apply::{self, ApplyPaths};
+use crate::deploy::{self, Ctx};
 use crate::exec::{ExecError, StepSpec};
 use crate::id::RunId;
 use crate::redact::Redactor;
@@ -32,6 +33,42 @@ use crate::validator::{self, TunnelRoutes};
 
 const ABOUT: &str = "Deploy tool for a multi-app Docker host.\n\n\
                       Milestone 1: subprocess chokepoint, run log, redaction.";
+
+/// Paths shared by every command that can change the host.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeployPaths {
+    /// Where the generated nginx file goes.
+    #[arg(
+        long,
+        default_value = "/etc/nginx/conf.d/front-door.conf",
+        value_name = "PATH"
+    )]
+    pub target: PathBuf,
+
+    /// Main nginx config, tested as a whole. The target must be included from it.
+    #[arg(long, default_value = "/etc/nginx/nginx.conf", value_name = "PATH")]
+    pub main_config: PathBuf,
+
+    /// Master pid, for the reload-vs-restart check.
+    #[arg(long, default_value = "/run/nginx.pid", value_name = "PATH")]
+    pub pid_file: PathBuf,
+
+    /// nginx binary. A bare name resolves through `PATH`.
+    #[arg(long, default_value = "nginx", value_name = "PATH")]
+    pub nginx_bin: PathBuf,
+
+    /// Directory for generated compose overrides.
+    #[arg(long, default_value = "/srv/deploy/green", value_name = "DIR")]
+    pub state_dir: PathBuf,
+
+    /// Directory for lock files.
+    #[arg(long, default_value = "/run/deploy", value_name = "DIR")]
+    pub lock_dir: PathBuf,
+
+    /// Seconds to let old workers drain after the flip.
+    #[arg(long, default_value_t = crate::deploy::DRAIN_SECS)]
+    pub drain_secs: u64,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "deploy", version, about = ABOUT, long_about = None)]
@@ -101,27 +138,35 @@ pub enum Command {
     /// Check the registry: per-app rules, cross-app clashes and tunnel routes.
     Validate,
 
+    /// Deploy one app through its registry strategy.
+    Up {
+        /// App name, as in the registry.
+        app: String,
+        /// Commit to deploy. Defaults to the recorded release.
+        #[arg(long, value_name = "SHA")]
+        release: Option<String>,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
+
+    /// Roll back by deploying the previous release through the same strategy.
+    Rollback {
+        /// App name, as in the registry.
+        app: String,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
+
+    /// Fetch the app source and fast-forward it. Prints the new HEAD.
+    Sync {
+        /// App name, as in the registry.
+        app: String,
+    },
+
     /// Render the config, refuse on any error, then atomically apply and reload.
     Apply {
-        /// Where to write the generated file.
-        #[arg(
-            long,
-            default_value = "/etc/nginx/conf.d/front-door.conf",
-            value_name = "PATH"
-        )]
-        target: PathBuf,
-
-        /// Main nginx config, tested as a whole. The target must be included from it.
-        #[arg(long, default_value = "/etc/nginx/nginx.conf", value_name = "PATH")]
-        main_config: PathBuf,
-
-        /// Master pid, for the reload-vs-restart check.
-        #[arg(long, default_value = "/run/nginx.pid", value_name = "PATH")]
-        pid_file: PathBuf,
-
-        /// nginx binary. A name resolves through `PATH`.
-        #[arg(long, default_value = "nginx", value_name = "PATH")]
-        nginx_bin: PathBuf,
+        #[command(flatten)]
+        paths: DeployPaths,
     },
 }
 
@@ -152,12 +197,20 @@ impl Command {
             Command::Resume { run_id } => resume_run(cli, run_id),
             Command::Render { app } => render_config(cli, app.as_deref()),
             Command::Validate => validate_registry(cli),
-            Command::Apply {
-                target,
-                main_config,
-                pid_file,
-                nginx_bin,
-            } => apply_config(cli, target, main_config, pid_file, nginx_bin),
+            Command::Apply { paths } => apply_config(
+                cli,
+                &paths.target,
+                &paths.main_config,
+                &paths.pid_file,
+                &paths.nginx_bin,
+            ),
+            Command::Up {
+                app,
+                release,
+                paths,
+            } => up_app(cli, app, release.as_deref(), paths),
+            Command::Rollback { app, paths } => rollback_app(cli, app, paths),
+            Command::Sync { app } => sync_app(cli, app),
         }
     }
 }
@@ -716,6 +769,108 @@ fn apply_config(
     }
 }
 
+/// Builds the strategy context from CLI flags.
+fn ctx_from(cli: &Cli, paths: &DeployPaths) -> Ctx {
+    Ctx {
+        registry_dir: cli.registry.clone(),
+        state_dir: paths.state_dir.clone(),
+        lock_dir: paths.lock_dir.clone(),
+        apply_paths: ApplyPaths {
+            nginx_bin: paths.nginx_bin.clone(),
+            main_config: paths.main_config.clone(),
+            target: paths.target.clone(),
+            pid_file: Some(paths.pid_file.clone()),
+        },
+        drain_secs: paths.drain_secs,
+        lock_timeout: crate::lock::ACQUIRE_TIMEOUT,
+    }
+}
+
+/// Loads one app by name, or lists what exists.
+fn load_app(cli: &Cli, name: &str) -> anyhow::Result<crate::registry::App> {
+    let loaded = crate::registry::load_dir(&cli.registry)?;
+    let mut apps = loaded.sorted();
+    match apps.iter_mut().find(|a| a.name == name) {
+        Some(app) => Ok(app.clone()),
+        None => {
+            let mut known: Vec<&str> = loaded.apps.iter().map(|a| a.name.as_str()).collect();
+            known.sort_unstable();
+            anyhow::bail!(
+                "no app named {name:?} in {}; known apps: {}",
+                cli.registry.display(),
+                known.join(", ")
+            );
+        }
+    }
+}
+
+/// `deploy up <app> [--release]`
+fn up_app(cli: &Cli, name: &str, release: Option<&str>, paths: &DeployPaths) -> anyhow::Result<()> {
+    let mut app = load_app(cli, name)?;
+    let release = deploy::resolve_release(&app, release).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ctx = ctx_from(cli, paths);
+
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    println!(
+        "deploying {} release {release} via {}",
+        app.name,
+        app.strategy.as_str()
+    );
+    match deploy::deploy(&mut run, &ctx, &mut app, &release) {
+        Ok(()) => {
+            run.finish(RunStatus::Ok)?;
+            println!("deployed {name} release {release}");
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// `deploy rollback <app>`
+fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()> {
+    let mut app = load_app(cli, name)?;
+    let ctx = ctx_from(cli, paths);
+
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    match deploy::rollback(&mut run, &ctx, &mut app) {
+        Ok(old) => {
+            run.finish(RunStatus::Ok)?;
+            println!("rolled back {name} to release {old}");
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// `deploy sync <app>`
+fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    match deploy::sync_repo(&mut run, &app) {
+        Ok(sha) => {
+            run.finish(RunStatus::Ok)?;
+            println!("{name} is at {sha}");
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
 /// Prints an aligned table to stdout.
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let cols = headers.len();
@@ -855,19 +1010,69 @@ mod tests {
     }
 
     #[test]
+    fn up_rollback_and_sync_parse() {
+        let cli = Cli::try_parse_from(["deploy", "up", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Up { app, release, .. } => {
+                assert_eq!(app, "portfolio");
+                assert_eq!(release, None);
+            }
+            _ => panic!("expected Up"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["deploy", "up", "portfolio", "--release", "9c1f2ab"]).unwrap();
+        match cli.command {
+            Command::Up { release, .. } => assert_eq!(release.as_deref(), Some("9c1f2ab")),
+            _ => panic!("expected Up"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["deploy", "rollback", "portfolio"])
+                .unwrap()
+                .command,
+            Command::Rollback { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["deploy", "sync", "portfolio"])
+                .unwrap()
+                .command,
+            Command::Sync { .. }
+        ));
+    }
+
+    #[test]
+    fn deploy_paths_have_documented_defaults() {
+        let cli = Cli::try_parse_from(["deploy", "up", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Up { paths, .. } => {
+                assert_eq!(
+                    paths.target,
+                    PathBuf::from("/etc/nginx/conf.d/front-door.conf")
+                );
+                assert_eq!(paths.main_config, PathBuf::from("/etc/nginx/nginx.conf"));
+                assert_eq!(paths.pid_file, PathBuf::from("/run/nginx.pid"));
+                assert_eq!(paths.nginx_bin, PathBuf::from("nginx"));
+                assert_eq!(paths.state_dir, PathBuf::from("/srv/deploy/green"));
+                assert_eq!(paths.lock_dir, PathBuf::from("/run/deploy"));
+                assert_eq!(paths.drain_secs, crate::deploy::DRAIN_SECS);
+            }
+            _ => panic!("expected Up"),
+        }
+    }
+
+    #[test]
     fn apply_has_documented_defaults() {
         let cli = Cli::try_parse_from(["deploy", "apply"]).unwrap();
         match cli.command {
-            Command::Apply {
-                target,
-                main_config,
-                pid_file,
-                nginx_bin,
-            } => {
-                assert_eq!(target, PathBuf::from("/etc/nginx/conf.d/front-door.conf"));
-                assert_eq!(main_config, PathBuf::from("/etc/nginx/nginx.conf"));
-                assert_eq!(pid_file, PathBuf::from("/run/nginx.pid"));
-                assert_eq!(nginx_bin, PathBuf::from("nginx"));
+            Command::Apply { paths } => {
+                assert_eq!(
+                    paths.target,
+                    PathBuf::from("/etc/nginx/conf.d/front-door.conf")
+                );
+                assert_eq!(paths.main_config, PathBuf::from("/etc/nginx/nginx.conf"));
+                assert_eq!(paths.pid_file, PathBuf::from("/run/nginx.pid"));
+                assert_eq!(paths.nginx_bin, PathBuf::from("nginx"));
             }
             _ => panic!("expected Apply"),
         }
@@ -882,11 +1087,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Apply {
-                target, nginx_bin, ..
-            } => {
-                assert_eq!(target, PathBuf::from("/tmp/f.conf"));
-                assert_eq!(nginx_bin, PathBuf::from("/tmp/fake"));
+            Command::Apply { paths } => {
+                assert_eq!(paths.target, PathBuf::from("/tmp/f.conf"));
+                assert_eq!(paths.nginx_bin, PathBuf::from("/tmp/fake"));
             }
             _ => panic!("expected Apply"),
         }
