@@ -14,12 +14,13 @@
 //! are listed in `lib.rs` so the shape of the tool is fixed early.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use crate::apply::{self, ApplyPaths};
 use crate::exec::{ExecError, StepSpec};
 use crate::id::RunId;
 use crate::redact::Redactor;
@@ -99,6 +100,29 @@ pub enum Command {
 
     /// Check the registry: per-app rules, cross-app clashes and tunnel routes.
     Validate,
+
+    /// Render the config, refuse on any error, then atomically apply and reload.
+    Apply {
+        /// Where to write the generated file.
+        #[arg(
+            long,
+            default_value = "/etc/nginx/conf.d/front-door.conf",
+            value_name = "PATH"
+        )]
+        target: PathBuf,
+
+        /// Main nginx config, tested as a whole. The target must be included from it.
+        #[arg(long, default_value = "/etc/nginx/nginx.conf", value_name = "PATH")]
+        main_config: PathBuf,
+
+        /// Master pid, for the reload-vs-restart check.
+        #[arg(long, default_value = "/run/nginx.pid", value_name = "PATH")]
+        pid_file: PathBuf,
+
+        /// nginx binary. A name resolves through `PATH`.
+        #[arg(long, default_value = "nginx", value_name = "PATH")]
+        nginx_bin: PathBuf,
+    },
 }
 
 impl Cli {
@@ -128,6 +152,12 @@ impl Command {
             Command::Resume { run_id } => resume_run(cli, run_id),
             Command::Render { app } => render_config(cli, app.as_deref()),
             Command::Validate => validate_registry(cli),
+            Command::Apply {
+                target,
+                main_config,
+                pid_file,
+                nginx_bin,
+            } => apply_config(cli, target, main_config, pid_file, nginx_bin),
         }
     }
 }
@@ -384,20 +414,14 @@ fn show_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
         } = ev
             && id == run_id.as_str()
         {
-            rows.push(vec![
-                format!("{seq}"),
-                step.clone(),
-                format!(
-                    "{status:?} exit={} {}",
-                    exit_code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    duration_ms
-                        .map(|d| format!("{d}ms"))
-                        .unwrap_or_else(|| "-".into())
-                ),
-                argv.join(" "),
-            ]);
+            // Filesystem steps have no exit code and no duration; showing
+            // `exit=- -` for them reads as missing data rather than not applicable.
+            let result = match (exit_code, duration_ms) {
+                (Some(code), Some(ms)) => format!("{status:?} exit={code} {ms}ms"),
+                (Some(code), None) => format!("{status:?} exit={code}"),
+                (None, _) => format!("{status:?}"),
+            };
+            rows.push(vec![format!("{seq}"), step.clone(), result, argv.join(" ")]);
         }
     }
 
@@ -523,40 +547,8 @@ fn validate_registry(cli: &Cli) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let mut problems: Vec<Problem> = loaded.problems.clone();
     let apps = loaded.sorted();
-
-    for app in &apps {
-        problems.extend(app.problems());
-    }
-
-    // Cross-checks against the tunnel need its config. Absent or unreadable is a
-    // warning, never a silent pass.
-    let mut routes = TunnelRoutes::new();
-    match &cli.tunnel_config {
-        None => problems.push(Problem::warning(
-            "tunnel-not-checked",
-            None,
-            format!(
-                "no --tunnel-config given, so {} route cross-checks were skipped",
-                apps.len()
-            ),
-        )),
-        Some(path) => match tunnel::read_config(path) {
-            Ok(parsed) => {
-                problems.extend(parsed.problems);
-                routes = parsed.routes;
-            }
-            Err(e) => problems.push(Problem::warning(
-                "tunnel-config-unreadable",
-                None,
-                format!("{}: {e}; route cross-checks were skipped", path.display()),
-            )),
-        },
-    }
-
-    problems.extend(validator::validate(&apps, &routes));
-    validator::sort_problems(&mut problems);
+    let (problems, routes) = collect_problems(cli, &loaded, &apps);
 
     let (errors, warnings) = validator::counts(&problems);
 
@@ -619,6 +611,109 @@ fn flatten_cell(cell: &str) -> String {
     // Leading and trailing whitespace is never meaningful in a cell, and a
     // trailing space would inflate the column width.
     out.trim().to_string()
+}
+
+/// Shared by `validate` and `apply`: every problem in the registry, the apps
+/// they concern, and the tunnel routes when a config was supplied.
+///
+/// Returns the apps, so callers do not load twice.
+fn collect_problems(
+    cli: &Cli,
+    loaded: &Loaded,
+    apps: &[App],
+) -> (Vec<Problem>, validator::TunnelRoutes) {
+    let mut problems: Vec<Problem> = loaded.problems.clone();
+    for app in apps {
+        problems.extend(app.problems());
+    }
+
+    let mut routes = TunnelRoutes::new();
+    match &cli.tunnel_config {
+        None => problems.push(Problem::warning(
+            "tunnel-not-checked",
+            None,
+            format!(
+                "no --tunnel-config given, so {} route cross-checks were skipped",
+                apps.len()
+            ),
+        )),
+        Some(path) => match tunnel::read_config(path) {
+            Ok(parsed) => {
+                problems.extend(parsed.problems);
+                routes = parsed.routes;
+            }
+            Err(e) => problems.push(Problem::warning(
+                "tunnel-config-unreadable",
+                None,
+                format!("{}: {e}; route cross-checks were skipped", path.display()),
+            )),
+        },
+    }
+
+    problems.extend(validator::validate(apps, &routes));
+    validator::sort_problems(&mut problems);
+    (problems, routes)
+}
+
+/// `deploy apply`
+///
+/// Render, refuse on any error, then stage, test, commit and reload. The only
+/// command that changes the host.
+fn apply_config(
+    cli: &Cli,
+    target: &Path,
+    main_config: &Path,
+    pid_file: &Path,
+    nginx_bin: &Path,
+) -> anyhow::Result<()> {
+    let Some(loaded) = load(cli)? else {
+        return Ok(());
+    };
+    let apps = loaded.sorted();
+    let (problems, _) = collect_problems(cli, &loaded, &apps);
+    let (errors, _) = validator::counts(&problems);
+
+    if errors > 0 {
+        for problem in &problems {
+            eprintln!("{problem}");
+        }
+        anyhow::bail!("{errors} error(s) in the registry; nothing was applied");
+    }
+
+    let text = render::render(&apps);
+    let paths = ApplyPaths {
+        nginx_bin: nginx_bin.to_path_buf(),
+        main_config: main_config.to_path_buf(),
+        target: target.to_path_buf(),
+        pid_file: Some(pid_file.to_path_buf()),
+    };
+
+    let mut run = start(cli)?;
+    // Capture the id before `finish` consumes the run.
+    let run_id = run.id().to_string();
+    match apply::apply(&mut run, &text, &paths) {
+        Ok(outcome) => {
+            run.finish(RunStatus::Ok)?;
+            println!("applied  {}", target.display());
+            println!("reloaded {}", outcome.reloaded);
+            match (outcome.master_pid_before, outcome.master_pid_after) {
+                (Some(b), Some(a)) => println!("master   before={b} after={a} (unchanged)"),
+                _ => println!("master   unknown (no pid file to compare)"),
+            }
+            match &outcome.backup {
+                Some(b) => println!("backup   {}", b.display()),
+                None => println!("backup   none (first apply)"),
+            }
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            // The run log already holds every step; finish it as failed so the
+            // failure is attributable, then report.
+            let _ = run.finish(RunStatus::Failed);
+            Err(e.into())
+        }
+    }
 }
 
 /// Prints an aligned table to stdout.
@@ -756,6 +851,44 @@ mod tests {
         match cli.command {
             Command::Render { app } => assert_eq!(app.as_deref(), Some("portfolio")),
             _ => panic!("expected Render"),
+        }
+    }
+
+    #[test]
+    fn apply_has_documented_defaults() {
+        let cli = Cli::try_parse_from(["deploy", "apply"]).unwrap();
+        match cli.command {
+            Command::Apply {
+                target,
+                main_config,
+                pid_file,
+                nginx_bin,
+            } => {
+                assert_eq!(target, PathBuf::from("/etc/nginx/conf.d/front-door.conf"));
+                assert_eq!(main_config, PathBuf::from("/etc/nginx/nginx.conf"));
+                assert_eq!(pid_file, PathBuf::from("/run/nginx.pid"));
+                assert_eq!(nginx_bin, PathBuf::from("nginx"));
+            }
+            _ => panic!("expected Apply"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "apply",
+            "--target",
+            "/tmp/f.conf",
+            "--nginx-bin",
+            "/tmp/fake",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Apply {
+                target, nginx_bin, ..
+            } => {
+                assert_eq!(target, PathBuf::from("/tmp/f.conf"));
+                assert_eq!(nginx_bin, PathBuf::from("/tmp/fake"));
+            }
+            _ => panic!("expected Apply"),
         }
     }
 

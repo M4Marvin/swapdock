@@ -25,7 +25,8 @@ and tested before touching the host.
 | `src/render.rs` | 2 | The nginx config renderer. A pure function. |
 | `src/validator.rs` | 2 | Cross-app checks: duplicate hostnames, ports, slots, tunnel routes. |
 | `src/tunnel.rs` | 2 | Reads cloudflared's ingress rules. Degrades to a warning, never a false pass. |
-| `src/cli.rs` | 1–2 | `selftest`, `runs`, `show`, `resume`, `render`, `validate`. |
+| `src/apply.rs` | 3 | Stage, test, atomic commit, reload with restore on failure. |
+| `src/cli.rs` | 1–3 | `selftest`, `runs`, `show`, `resume`, `render`, `validate`, `apply`. |
 
 Milestone 3 is `apply`: atomic write, `nginx -t`, restore on failure, reload.
 
@@ -174,7 +175,7 @@ a token in a terminal scrollback is a leak even when the log is clean.
 
 ```bash
 cargo build --release          # ~1.6 MB, stripped
-cargo test                     # 208 tests
+cargo test                     # 226 tests
 cargo clippy --all-targets     # zero warnings
 cargo fmt
 ```
@@ -202,11 +203,44 @@ on `PATH`. It has been added to `~/.config/fish/config.fish`; `mbx setup` does n
 edit startup files itself. Without it, plain `cargo` bypasses the cache and
 `mbx <cargo-command>` still works.
 
+## How apply keeps its promises
+
+```
+stage   write <target>.staging.<pid>, fsync file and directory, mode 0644
+backup  copy the live file to <target>.bak (kept: it is the rollback source)
+commit  rename(2) staging over target — readers see old or new, never a mix
+test    nginx -t -c <main config> against the real full config
+reload  nginx -s reload -c <main config>, only after the test passed
+verify  the master pid is unchanged, proving reload and not restart
+```
+
+Every step is in the run log, including the filesystem mutations (recorded as
+`write` / `copy` / `rename` steps, since those do not go through the
+subprocess chokepoint).
+
+| Failure | File left behind | Reload issued |
+|---|---|---|
+| `nginx -t` rejects | previous file, re-tested to prove it | never |
+| `nginx -s reload` fails | previous file, re-tested to prove it | once, failed |
+| master pid changed | **new file, deliberately** — the new config is already loaded | once |
+
+A first-time apply has no backup; a failed test then removes the target rather
+than leave an untested file. `--dry-run` records the plan and touches nothing.
+
+Two details the real binary forced: paths are absolutized before invoking nginx,
+because a relative `-c` resolves against nginx's compiled prefix and would test
+the wrong file; and the reload carries `-c`, because without it nginx reads the
+default config's pid file and signals the wrong master.
+
+`proxy_pass` is emitted inside `location /`, not at server level — real `nginx
+-t` rejected the first version of the renderer, which is why the milestone 2
+golden test was wrong and the code was right to change.
+
 ## Next
 
-Milestone 3 is `apply`: render to a staging file, `mv -T` into place, `nginx -t`,
-restore the previous file if the test fails, then reload. Fault injection proves
-the restore path, because that component can affect every service on the host.
+Milestone 4 is the two deploy strategies as explicit step sequences (`swap` for
+the stateless apps, `replace` for the five with a file database), each step going
+through the chokepoint and into the run log.
 
-After that: the two deploy strategies, `verify` against the access log, and the
-`Builder` trait for a pluggable build host.
+After that: `verify` against the access log, the `Builder` trait for a pluggable
+build host, and installing nginx plus the first real migration on the host.

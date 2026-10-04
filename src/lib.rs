@@ -12,6 +12,7 @@
 //! * [`redact`] — secret masking, applied inside the chokepoint before anything
 //!   can reach a file.
 
+pub mod apply;
 pub mod cli;
 pub mod exec;
 pub mod id;

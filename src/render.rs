@@ -171,7 +171,13 @@ fn render_app(out: &mut String, app: &App) {
 
     match app.kind {
         Kind::Container => {
+            // `proxy_pass` is only legal inside `location` (or `if in location`,
+            // which nobody should write). Emitting it at server level produces a
+            // file that fails `nginx -t`, which is how this was found.
             out.push('\n');
+            out.push_str(INDENT);
+            out.push_str("location / {\n");
+            out.push_str(INDENT);
             out.push_str(INDENT);
             out.push_str("include ");
             out.push_str(PROXY_COMMON);
@@ -182,9 +188,12 @@ fn render_app(out: &mut String, app: &App) {
             // readable if it is ever rendered from a broken registry.
             let target = app.live_port.unwrap_or(app.front_port);
             out.push_str(INDENT);
+            out.push_str(INDENT);
             out.push_str("proxy_pass http://127.0.0.1:");
             out.push_str(&target.to_string());
             out.push_str(";\n");
+            out.push_str(INDENT);
+            out.push_str("}\n");
         }
         Kind::Static => {
             out.push('\n');
@@ -265,6 +274,30 @@ mod tests {
         assert!(out.contains("No apps in the registry"));
         assert!(!out.contains("server {"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn proxy_pass_is_inside_a_location_block() {
+        // Regression: proxy_pass at server level fails `nginx -t` with
+        // `"proxy_pass" directive is not allowed here`. The location wrapper is
+        // what makes the rendered file loadable.
+        let out = render(&[container()]);
+        assert!(out.contains("    location / {\n"), "{out}");
+
+        let mut in_location = false;
+        let mut server_depth_proxy = false;
+        for line in out.lines() {
+            if line == "    location / {" {
+                in_location = true;
+            } else if line == "    }" {
+                in_location = false;
+            } else if line.starts_with("        proxy_pass ") {
+                assert!(in_location, "proxy_pass outside location: {line}");
+            } else if line.starts_with("    proxy_pass ") {
+                server_depth_proxy = true;
+            }
+        }
+        assert!(!server_depth_proxy, "no server-level proxy_pass allowed");
     }
 
     #[test]
@@ -613,8 +646,10 @@ server {
 
     access_log /var/log/nginx/front-door.access.log deploy;
 
-    include /etc/nginx/snippets/proxy-common.conf;
-    proxy_pass http://127.0.0.1:9002;
+    location / {
+        include /etc/nginx/snippets/proxy-common.conf;
+        proxy_pass http://127.0.0.1:9002;
+    }
 }
 
 # ---- portfolio ----
@@ -625,8 +660,10 @@ server {
 
     access_log /var/log/nginx/front-door.access.log deploy;
 
-    include /etc/nginx/snippets/proxy-common.conf;
-    proxy_pass http://127.0.0.1:9000;
+    location / {
+        include /etc/nginx/snippets/proxy-common.conf;
+        proxy_pass http://127.0.0.1:9000;
+    }
 }
 ";
         assert_eq!(render(&[container(), charts]), expected);
