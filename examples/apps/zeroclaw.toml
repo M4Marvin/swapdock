@@ -1,0 +1,15 @@
+name = "zeroclaw"
+kind = "container"
+strategy = "replace"
+hostnames = []
+listen = ["127.0.0.1"]
+front_port = 42617
+slot = 10
+writes_state = true
+image_repo = "zeroclaw"
+build_host = "local"
+health_url = "http://127.0.0.1:42617/"
+compose_dir = "/home/marv/apps"
+compose_svc = "zeroclaw"
+env_name = "ZEROCLAW_PORT"
+branch = "main"

@@ -1,0 +1,16 @@
+name = "chats"
+kind = "container"
+strategy = "replace"
+hostnames = ["chats.m4marvin.com"]
+listen = ["127.0.0.1"]
+front_port = 8007
+slot = 8
+writes_state = true
+image_repo = "charon-chats"
+build_host = "local"
+health_url = "http://127.0.0.1:3000/"
+compose_dir = "/home/marv/apps"
+compose_svc = "chats"
+env_name = "CHATS_PORT"
+git_remote = "M4Marvin/charon"
+branch = "main"

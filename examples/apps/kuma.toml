@@ -1,0 +1,15 @@
+name = "kuma"
+kind = "container"
+strategy = "replace"
+hostnames = ["status.m4marvin.com"]
+listen = ["127.0.0.1"]
+front_port = 8005
+slot = 5
+writes_state = true
+image_repo = "louislam/uptime-kuma"
+build_host = "local"
+health_url = "http://127.0.0.1:3001/"
+compose_dir = "/home/marv/apps"
+compose_svc = "kuma"
+env_name = "KUMA_PORT"
+branch = "main"

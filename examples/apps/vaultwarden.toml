@@ -1,0 +1,15 @@
+name = "vaultwarden"
+kind = "container"
+strategy = "replace"
+hostnames = ["vault.m4marvin.com"]
+listen = ["127.0.0.1"]
+front_port = 8004
+slot = 4
+writes_state = true
+image_repo = "vaultwarden/server"
+build_host = "local"
+health_url = "http://127.0.0.1/"
+compose_dir = "/home/marv/apps"
+compose_svc = "vaultwarden"
+env_name = "VAULTWARDEN_PORT"
+branch = "main"

@@ -1,0 +1,25 @@
+tunnel: ffd206b8-f950-4b32-bdaa-81e414ee7546
+credentials-file: /home/marv/.cloudflared/ffd206b8-f950-4b32-bdaa-81e414ee7546.json
+
+ingress:
+  - hostname: m4marvin.com
+    service: http://localhost:8001
+  - hostname: chat.m4marvin.com
+    service: http://localhost:8002
+  - hostname: chats.m4marvin.com
+    service: http://localhost:8007
+  - hostname: git.m4marvin.com
+    service: http://localhost:8003
+  - hostname: vault.m4marvin.com
+    service: http://localhost:8004
+  - hostname: status.m4marvin.com
+    service: http://localhost:8005
+  - hostname: charts.m4marvin.com
+    service: http://localhost:8006
+  - hostname: files.m4marvin.com
+    service: http://localhost:8009
+  - hostname: morphotechdata.com
+    service: http://localhost:8012
+  - hostname: www.morphotechdata.com
+    service: http://localhost:8012
+  - service: http_status:404

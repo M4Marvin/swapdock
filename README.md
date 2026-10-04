@@ -7,22 +7,27 @@ that is a config value rather than a code path.
 Design notes and the full plan live alongside the video essay in
 `~/codes/deploy-explainer/`.
 
-## Status: milestone 1 complete
+## Status: milestones 1 and 2 complete
 
-The three foundations everything else assumes. No Docker, no nginx and no root
-are required for any of it, which is why it could be built and tested first.
+208 tests, zero clippy warnings, 1.6 MB stripped binary. Nothing here needs
+Docker, nginx or root — which is why the safety-critical parts could be finished
+and tested before touching the host.
 
-| Module | Purpose |
-|---|---|
-| `src/exec.rs` | The subprocess chokepoint. The only place in the crate that may create a process. |
-| `src/trace.rs` | Append-only JSONL run log: traceable, resumable, observable. |
-| `src/redact.rs` | Secret masking, applied inside the chokepoint before anything reaches a file. |
-| `src/time.rs` | RFC 3339 timestamps, no dependency. |
-| `src/id.rs` | Sortable, unique run identifiers. |
-| `src/cli.rs` | `selftest`, `runs`, `show`, `resume`. |
+| Module | Milestone | Purpose |
+|---|---|---|
+| `src/exec.rs` | 1 | The subprocess chokepoint. The only place in the crate that may create a process. |
+| `src/trace.rs` | 1 | Append-only JSONL run log: traceable, resumable, observable. |
+| `src/redact.rs` | 1 | Secret masking, applied inside the chokepoint before anything reaches a file. |
+| `src/time.rs` | 1 | RFC 3339 timestamps, no dependency. |
+| `src/id.rs` | 1 | Sortable, unique run identifiers. |
+| `src/registry.rs` | 2 | One file per app: the single source of truth. Per-app validation. |
+| `src/ports.rs` | 2 | Slot-derived back-end ports. Collision-free by construction. |
+| `src/render.rs` | 2 | The nginx config renderer. A pure function. |
+| `src/validator.rs` | 2 | Cross-app checks: duplicate hostnames, ports, slots, tunnel routes. |
+| `src/tunnel.rs` | 2 | Reads cloudflared's ingress rules. Degrades to a warning, never a false pass. |
+| `src/cli.rs` | 1–2 | `selftest`, `runs`, `show`, `resume`, `render`, `validate`. |
 
-Later milestones: `registry` + `validator` + `render` (pure functions),
-`apply` with atomic writes, the two deploy strategies, the `Builder` trait.
+Milestone 3 is `apply`: atomic write, `nginx -t`, restore on failure, reload.
 
 ## The one rule
 
@@ -48,7 +53,80 @@ cargo run -- runs              # recent runs, newest first
 cargo run -- show <run-id>     # every step of one run, in order
 cargo run -- resume <run-id>   # where a run stopped, and whether it ended
 cargo run -- --dry-run selftest
+
+# The registry commands, against the real apps in examples/
+cargo run -- --registry examples/apps \
+              --tunnel-config examples/cloudflared.yaml validate
+cargo run -- --registry examples/apps render
+cargo run -- --registry examples/apps render --app portfolio
 ```
+
+`validate` reads only and exits non-zero on any error, so it can gate a deploy.
+`render` writes the config to stdout and changes nothing.
+
+## The registry
+
+One file per app under `/srv/deploy/apps`:
+
+```toml
+name = "portfolio"
+kind = "container"            # or "static"
+strategy = "swap"             # or "replace"
+hostnames = ["m4marvin.com"]
+listen = ["127.0.0.1"]        # empty means loopback; a second address is for tailnet
+front_port = 8001             # what the tunnel points at. nginx owns it permanently.
+slot = 0                      # owns back-end ports 9000 and 9001
+writes_state = false          # true means a database file or other shared local state
+image_repo = "apps-portfolio"
+health_url = "http://127.0.0.1/"
+compose_dir = "/home/marv/apps"
+compose_svc = "portfolio"
+env_name = "PORTFOLIO_PORT"
+```
+
+`examples/apps` holds all 13 apps currently running on the deploy host, and
+`examples/cloudflared.yaml` is a copy of the tunnel config in use. Both are
+exercised by `tests/example_registry.rs`, so the real data cannot drift silently.
+
+### Design decisions worth knowing
+
+**Unknown fields are an error.** `deny_unknown_fields` is deliberate: a typo like
+`front_prot = 8001` would otherwise be ignored and the app would fall back to a
+default port — on the component that rewrites nginx for every service, that is an
+outage with a confusing cause.
+
+**Back-end ports come from a slot, not a scan.** `pair(slot) = (9000 + 2*slot,
+9000 + 2*slot + 1)`. Scanning races between concurrent deploys and strands ports
+when a deploy dies. Deriving makes collision impossible, and the port in a log
+line tells you which app it was.
+
+**`writes_state` makes the two-writers rule machine-checkable.** `chat` and
+`chats` both write `/app/data/local.db`; `forgejo`, `vaultwarden` and `kuma` use
+sqlite defaults on a volume. A blue/green swap would run two containers against
+one file. Rather than trusting everyone to remember, `strategy = "swap"` plus
+`writes_state = true` is a validation **error**. Today that leaves only
+`portfolio` and `morphotech` eligible for a swap — which is the honest answer.
+
+**Rendering is deterministic.** Apps sorted by name, no timestamp, fixed
+indentation and LF endings. That is what makes
+`diff <(deploy render) /etc/nginx/conf.d/front-door.conf` a meaningful question.
+
+**An unmigrated app gets no server block.** Every container on the host still
+publishes its own front port, so nginx cannot bind any of them. A container app
+only earns a `server` block once it has a `live_port`. Rendering blocks for
+unmigrated apps would produce a config that fails to load.
+
+**Values interpolated into nginx are allow-listed, not escaped.** `root` with a
+space, a semicolon, a quote or a `$` is rejected rather than escaped, because an
+escaping rule that misses a case is worse than a refusal.
+
+**A parse failure in one file does not hide the other twelve.** `load_dir`
+returns whatever loaded plus a problem for what did not, and `validate` reports
+both.
+
+**The tunnel parser is not a YAML parser.** It reads the one documented shape.
+If the `ingress:` key is missing or nothing parses, it warns and the tunnel
+checks are *skipped* — never silently passed.
 
 `selftest` proves, and the table it prints says what each case proves:
 
@@ -96,14 +174,14 @@ a token in a terminal scrollback is a leak even when the log is clean.
 
 ```bash
 cargo build --release          # ~1.6 MB, stripped
-cargo test                     # 82 tests
+cargo test                     # 208 tests
 cargo clippy --all-targets     # zero warnings
 cargo fmt
 ```
 
-Rust 1.98+ (edition 2024). Dependencies are kept to `clap`, `serde`,
-`serde_json`, `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`; timestamps
-and run ids are implemented in-crate to avoid two more.
+Rust 1.98+ (edition 2024). Dependencies: `clap`, `serde`, `serde_json`, `toml`,
+`anyhow`, `thiserror`, `tracing`, `tracing-subscriber`. Timestamps and run ids are
+implemented in-crate to avoid two more.
 
 ### mr-boxington
 
@@ -126,8 +204,9 @@ edit startup files itself. Without it, plain `cargo` bypasses the cache and
 
 ## Next
 
-Milestone 2 is `registry` + `validator` + `render`: the registry types, the
-cross-app checks, and the nginx config renderer as a **pure function** with no
-Docker, no nginx and no root. That is the component which can affect all 14
-services at once, so it gets tested in milliseconds before anything touches
-production.
+Milestone 3 is `apply`: render to a staging file, `mv -T` into place, `nginx -t`,
+restore the previous file if the test fails, then reload. Fault injection proves
+the restore path, because that component can affect every service on the host.
+
+After that: the two deploy strategies, `verify` against the access log, and the
+`Builder` trait for a pluggable build host.

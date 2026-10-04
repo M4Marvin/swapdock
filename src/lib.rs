@@ -15,9 +15,14 @@
 pub mod cli;
 pub mod exec;
 pub mod id;
+pub mod ports;
 pub mod redact;
+pub mod registry;
+pub mod render;
 pub mod time;
 pub mod trace;
+pub mod tunnel;
+pub mod validator;
 
 pub use id::RunId;
 pub use redact::Redactor;

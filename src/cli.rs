@@ -23,7 +23,11 @@ use clap::{Parser, Subcommand};
 use crate::exec::{ExecError, StepSpec};
 use crate::id::RunId;
 use crate::redact::Redactor;
+use crate::registry::{App, Loaded, Problem};
+use crate::render;
 use crate::trace::{Run, RunMode, RunStatus, TraceEvent, TraceLog};
+use crate::tunnel;
+use crate::validator::{self, TunnelRoutes};
 
 const ABOUT: &str = "Deploy tool for a multi-app Docker host.\n\n\
                       Milestone 1: subprocess chokepoint, run log, redaction.";
@@ -47,6 +51,19 @@ pub struct Cli {
     /// Label this run with an application name.
     #[arg(long, global = true, value_name = "NAME")]
     pub app: Option<String>,
+
+    /// Directory holding one registry file per app.
+    #[arg(
+        long,
+        global = true,
+        default_value = "/srv/deploy/apps",
+        value_name = "DIR"
+    )]
+    pub registry: PathBuf,
+
+    /// cloudflared config to cross-check routes against.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tunnel_config: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -72,6 +89,16 @@ pub enum Command {
 
     /// Report where a run stopped, so it can be resumed.
     Resume { run_id: String },
+
+    /// Print the nginx front-door config. Changes nothing.
+    Render {
+        /// Render only this app's block.
+        #[arg(long, value_name = "NAME")]
+        app: Option<String>,
+    },
+
+    /// Check the registry: per-app rules, cross-app clashes and tunnel routes.
+    Validate,
 }
 
 impl Cli {
@@ -99,6 +126,8 @@ impl Command {
             Command::Runs { limit } => list_runs(cli, *limit),
             Command::Show { run_id } => show_run(cli, run_id),
             Command::Resume { run_id } => resume_run(cli, run_id),
+            Command::Render { app } => render_config(cli, app.as_deref()),
+            Command::Validate => validate_registry(cli),
         }
     }
 }
@@ -425,12 +454,183 @@ fn resume_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Loads the registry and reports anything unreadable, or `None` on failure.
+fn load(cli: &Cli) -> anyhow::Result<Option<Loaded>> {
+    let loaded = crate::registry::load_dir(&cli.registry)?;
+    if loaded.apps.is_empty() && loaded.problems.is_empty() {
+        eprintln!(
+            "no registry files in {}; nothing to do",
+            cli.registry.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(loaded))
+}
+
+/// `deploy render`
+///
+/// Pure: reads the registry, writes stdout. Nothing is applied, so this is safe
+/// to run at any time and against any registry.
+fn render_config(cli: &Cli, only: Option<&str>) -> anyhow::Result<()> {
+    let Some(loaded) = load(cli)? else {
+        return Ok(());
+    };
+
+    // Load-time problems still belong on stderr: the config on stdout must stay
+    // usable in a pipeline.
+    for problem in &loaded.problems {
+        eprintln!("{problem}");
+    }
+
+    let apps = loaded.sorted();
+    let selected: Vec<App> = match only {
+        None => apps,
+        Some(name) => {
+            let found: Vec<App> = apps.into_iter().filter(|a| a.name == name).collect();
+            if found.is_empty() {
+                let mut known: Vec<&str> = loaded.apps.iter().map(|a| a.name.as_str()).collect();
+                known.sort_unstable();
+                anyhow::bail!(
+                    "no app named {name:?} in {}; known apps: {}",
+                    cli.registry.display(),
+                    known.join(", ")
+                );
+            }
+            found
+        }
+    };
+
+    print!("{}", render::render(&selected));
+
+    let errors = selected
+        .iter()
+        .flat_map(|a| a.problems())
+        .filter(|p| p.is_error())
+        .count();
+    if errors > 0 {
+        eprintln!(
+            "note: {errors} problem(s) in the registry; the config above must not be applied"
+        );
+    }
+    Ok(())
+}
+
+/// `deploy validate`
+///
+/// Reads only. Exits non-zero when anything is an error, so it can gate a deploy.
+fn validate_registry(cli: &Cli) -> anyhow::Result<()> {
+    let Some(loaded) = load(cli)? else {
+        return Ok(());
+    };
+
+    let mut problems: Vec<Problem> = loaded.problems.clone();
+    let apps = loaded.sorted();
+
+    for app in &apps {
+        problems.extend(app.problems());
+    }
+
+    // Cross-checks against the tunnel need its config. Absent or unreadable is a
+    // warning, never a silent pass.
+    let mut routes = TunnelRoutes::new();
+    match &cli.tunnel_config {
+        None => problems.push(Problem::warning(
+            "tunnel-not-checked",
+            None,
+            format!(
+                "no --tunnel-config given, so {} route cross-checks were skipped",
+                apps.len()
+            ),
+        )),
+        Some(path) => match tunnel::read_config(path) {
+            Ok(parsed) => {
+                problems.extend(parsed.problems);
+                routes = parsed.routes;
+            }
+            Err(e) => problems.push(Problem::warning(
+                "tunnel-config-unreadable",
+                None,
+                format!("{}: {e}; route cross-checks were skipped", path.display()),
+            )),
+        },
+    }
+
+    problems.extend(validator::validate(&apps, &routes));
+    validator::sort_problems(&mut problems);
+
+    let (errors, warnings) = validator::counts(&problems);
+
+    println!("registry  {}", cli.registry.display());
+    println!("apps      {}", apps.len());
+    println!(
+        "tunnel    {}",
+        match &cli.tunnel_config {
+            Some(p) => format!("{} ({} routes)", p.display(), routes.len()),
+            None => "not checked".to_string(),
+        }
+    );
+    println!();
+
+    if problems.is_empty() {
+        println!("no problems");
+    } else {
+        let rows: Vec<Vec<String>> = problems
+            .iter()
+            .map(|p| {
+                vec![
+                    p.severity.to_string(),
+                    p.code.to_string(),
+                    p.app.clone().unwrap_or_else(|| "-".to_string()),
+                    p.message.clone(),
+                ]
+            })
+            .collect();
+        print_table(&["severity", "code", "app", "message"], &rows);
+    }
+
+    println!();
+    println!("{errors} error(s), {warnings} warning(s)");
+
+    if errors > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Flattens a cell to one line.
+///
+/// A multi-line cell — a TOML parse error carries its own source excerpt — would
+/// otherwise break every column after it and make the table unreadable. The
+/// content is kept; only the line breaks go.
+fn flatten_cell(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut last_was_space = false;
+    for ch in cell.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    // Leading and trailing whitespace is never meaningful in a cell, and a
+    // trailing space would inflate the column width.
+    out.trim().to_string()
+}
+
 /// Prints an aligned table to stdout.
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let cols = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|c| flatten_cell(c)).collect())
+        .collect();
 
-    for row in rows {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &cells {
         for (i, cell) in row.iter().enumerate().take(cols) {
             widths[i] = widths[i].max(cell.chars().count());
         }
@@ -453,7 +653,7 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
         .join("  ");
     let _ = writeln!(out, "{rule}");
 
-    for row in rows {
+    for row in &cells {
         let line = row
             .iter()
             .enumerate()
@@ -540,6 +740,67 @@ mod tests {
         assert_eq!(first_line(""), "");
         let long = "x".repeat(100);
         assert_eq!(first_line(&long).chars().count(), 60);
+    }
+
+    #[test]
+    fn parses_the_new_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["deploy", "render"]).unwrap().command,
+            Command::Render { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["deploy", "validate"]).unwrap().command,
+            Command::Validate
+        ));
+        let cli = Cli::try_parse_from(["deploy", "render", "--app", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Render { app } => assert_eq!(app.as_deref(), Some("portfolio")),
+            _ => panic!("expected Render"),
+        }
+    }
+
+    #[test]
+    fn registry_and_tunnel_flags_have_documented_defaults() {
+        let cli = Cli::try_parse_from(["deploy", "validate"]).unwrap();
+        assert_eq!(cli.registry, PathBuf::from("/srv/deploy/apps"));
+        assert_eq!(cli.tunnel_config, None);
+
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "--registry",
+            "/tmp/apps",
+            "--tunnel-config",
+            "/tmp/cloudflared.yaml",
+            "validate",
+        ])
+        .unwrap();
+        assert_eq!(cli.registry, PathBuf::from("/tmp/apps"));
+        assert_eq!(
+            cli.tunnel_config,
+            Some(PathBuf::from("/tmp/cloudflared.yaml"))
+        );
+    }
+
+    #[test]
+    fn a_multi_line_cell_is_flattened() {
+        // A TOML parse error spans several lines; it must not break the columns.
+        assert_eq!(flatten_cell("a\nb"), "a b");
+        assert_eq!(flatten_cell("a\n  b"), "a b");
+        assert_eq!(flatten_cell("a\n\n\nb"), "a b");
+        assert_eq!(flatten_cell("no breaks"), "no breaks");
+        assert_eq!(flatten_cell("trailing\n"), "trailing");
+        assert_eq!(flatten_cell("  leading"), "leading");
+        assert_eq!(flatten_cell("   "), "");
+        assert_eq!(flatten_cell(""), "");
+    }
+
+    #[test]
+    fn print_table_survives_a_multi_line_cell() {
+        let rows = vec![
+            vec!["short".to_string(), "ok".to_string()],
+            vec!["a\nb\nc".to_string(), "also-ok".to_string()],
+        ];
+        print_table(&["code", "app"], &rows);
     }
 
     #[test]

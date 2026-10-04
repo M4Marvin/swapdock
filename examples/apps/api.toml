@@ -1,0 +1,15 @@
+name = "api"
+kind = "container"
+strategy = "replace"
+hostnames = []
+listen = ["127.0.0.1"]
+front_port = 8010
+slot = 12
+writes_state = true
+image_repo = "apps-jobs-api"
+build_host = "local"
+health_url = "http://127.0.0.1:8000/"
+compose_dir = "/home/marv/jobs"
+compose_svc = "api"
+env_name = "JOBS_API_PORT"
+branch = "main"
