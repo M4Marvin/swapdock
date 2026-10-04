@@ -200,6 +200,12 @@ pub struct App {
     pub git_remote: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Local checkout of the app source, when the tool manages it.
+    ///
+    /// Used by `deploy sync` (fetch and fast-forward). Absent for apps whose
+    /// source lives elsewhere or is vendored.
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
 }
 
 impl App {
@@ -230,6 +236,49 @@ impl App {
 
     pub fn git_branch(&self) -> &str {
         self.branch.as_deref().unwrap_or("main")
+    }
+
+    /// Project name for `docker compose -p`. Explicitly set in a future field;
+    /// for now, the compose directory name, which matches `apps` and `jobs`.
+    pub fn compose_project(&self) -> String {
+        self.compose_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "apps".to_string())
+    }
+
+    /// Container name for the green candidate. The live container keeps its
+    /// compose-assigned name; the green one must differ globally, because
+    /// `container_name` is not namespaced by project.
+    pub fn green_container_name(&self) -> String {
+        format!("{}-green", self.compose_svc)
+    }
+
+    /// Advances the recorded release after a successful deploy.
+    ///
+    /// The previous release becomes the rollback target, so `rollback` is always
+    /// one step back with no extra bookkeeping.
+    pub fn advance(&mut self, release: String, new_live_port: u16) {
+        self.old_release = self.release.take();
+        self.release = Some(release);
+        self.old_port = self.live_port;
+        self.live_port = Some(new_live_port);
+    }
+
+    /// The image reference for a release: `repo:release`.
+    ///
+    /// Repos that already contain a registry path (`codeberg.org/forgejo/forgejo`)
+    /// are used as-is; bare names (`apps-portfolio`) are local tags.
+    pub fn image_ref(&self, release: &str) -> Option<String> {
+        self.image_repo
+            .as_ref()
+            .map(|repo| format!("{repo}:{release}"))
+    }
+
+    /// True when the image must be pulled rather than assumed present.
+    pub fn needs_pull(&self) -> bool {
+        !matches!(self.image_registry(), ImageRegistry::Local)
     }
 
     /// Every check that can be made by looking at this app alone.
@@ -612,6 +661,38 @@ pub fn to_toml(app: &App) -> String {
     toml::to_string_pretty(app).expect("App is always serializable")
 }
 
+/// Writes one app's file atomically: temp file, fsync, rename.
+///
+/// Reads back what it wrote, so a torn write fails loudly instead of leaving a
+/// half-file registry behind.
+pub fn save_app(dir: &Path, app: &App) -> std::io::Result<()> {
+    let target = dir.join(format!("{}.toml", app.name));
+    let staging = dir.join(format!(".{}.toml.staging", app.name));
+
+    std::fs::write(&staging, to_toml(app))?;
+    {
+        let file = std::fs::File::open(&staging)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staging, &target)?;
+
+    // Prove the write: parse the file back and compare.
+    let raw = std::fs::read_to_string(&target)?;
+    let back: App = toml::from_str(&raw).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("wrote {} but it does not parse back: {e}", target.display()),
+        )
+    })?;
+    if back != *app {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("wrote {} but it reads back differently", target.display()),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // small helpers, kept here so validation and tests agree on one definition
 // ---------------------------------------------------------------------------
@@ -735,6 +816,7 @@ pub(crate) mod tests {
             env_name: "PORTFOLIO_PORT".into(),
             git_remote: Some("M4Marvin/main-site".into()),
             branch: Some("master".into()),
+            repo: Some(PathBuf::from("/home/marv/apps/main-site")),
         }
     }
 
@@ -1236,6 +1318,110 @@ pub(crate) mod tests {
         let loaded = load_dir(&dir.path().join("nope")).unwrap();
         assert!(loaded.apps.is_empty());
         assert!(loaded.problems.is_empty());
+    }
+
+    #[test]
+    fn advance_moves_the_release_chain_forward() {
+        let mut app = sample();
+        assert_eq!(app.release.as_deref(), Some("9c1f2ab"));
+        assert_eq!(app.old_release.as_deref(), Some("4d8e0f1"));
+
+        app.advance("d34db33".into(), 9001);
+
+        assert_eq!(app.release.as_deref(), Some("d34db33"));
+        assert_eq!(app.old_release.as_deref(), Some("9c1f2ab"));
+        assert_eq!(app.live_port, Some(9001));
+        assert_eq!(app.old_port, Some(9000));
+        assert!(app.problems().is_empty(), "{:?}", app.problems());
+    }
+
+    #[test]
+    fn advance_from_no_release_starts_the_chain() {
+        let mut app = sample();
+        app.release = None;
+        app.old_release = None;
+        app.live_port = None;
+
+        app.advance("9c1f2ab".into(), 9000);
+
+        assert_eq!(app.release.as_deref(), Some("9c1f2ab"));
+        assert_eq!(app.old_release, None);
+        assert_eq!(app.live_port, Some(9000));
+    }
+
+    #[test]
+    fn image_ref_pins_the_release_as_the_tag() {
+        let app = sample();
+        assert_eq!(
+            app.image_ref("d34db33").as_deref(),
+            Some("apps-portfolio:d34db33")
+        );
+
+        let mut remote = sample();
+        remote.image_repo = Some("codeberg.org/forgejo/forgejo".into());
+        assert_eq!(
+            remote.image_ref("abc1234").as_deref(),
+            Some("codeberg.org/forgejo/forgejo:abc1234")
+        );
+
+        let mut none = sample();
+        none.image_repo = None;
+        assert_eq!(none.image_ref("abc1234"), None);
+    }
+
+    #[test]
+    fn pull_is_skipped_for_local_images() {
+        let mut app = sample();
+        app.registry = Some(ImageRegistry::Local);
+        assert!(!app.needs_pull());
+
+        app.registry = None;
+        assert!(app.needs_pull(), "default registry is remote");
+
+        app.registry = Some(ImageRegistry::Ghcr);
+        assert!(app.needs_pull());
+    }
+
+    #[test]
+    fn compose_project_comes_from_the_directory_name() {
+        let app = sample();
+        assert_eq!(app.compose_project(), "apps");
+
+        let mut jobs = sample();
+        jobs.compose_dir = PathBuf::from("/home/marv/jobs");
+        assert_eq!(jobs.compose_project(), "jobs");
+    }
+
+    #[test]
+    fn green_container_name_derives_from_the_service() {
+        assert_eq!(sample().green_container_name(), "portfolio-green");
+    }
+
+    #[test]
+    fn save_app_round_trips_through_the_filesystem() {
+        let dir = TempDir::new().unwrap();
+        let mut app = sample();
+        app.advance("d34db33".into(), 9001);
+        save_app(dir.path(), &app).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("portfolio.toml")).unwrap();
+        let back: App = toml::from_str(&raw).unwrap();
+        assert_eq!(back, app);
+        assert!(!dir.path().join(".portfolio.toml.staging").exists());
+    }
+
+    #[test]
+    fn save_app_with_a_path_separator_fails_instead_of_writing_elsewhere() {
+        // `App.name` is validated to a slug long before saving, so this cannot
+        // occur through the CLI. The save still must not write outside the dir.
+        let dir = TempDir::new().unwrap();
+        let mut app = sample();
+        app.name = "../escape".into();
+        let err = save_app(dir.path(), &app).unwrap_err();
+        assert!(
+            !dir.path().parent().unwrap().join("escape.toml").exists(),
+            "must not write outside the registry dir (got {err})"
+        );
     }
 
     #[test]

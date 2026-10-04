@@ -14,8 +14,14 @@
 
 pub mod apply;
 pub mod cli;
+pub mod compose;
+pub mod deploy;
+pub mod docker;
 pub mod exec;
+pub mod git;
+pub mod health;
 pub mod id;
+pub mod lock;
 pub mod ports;
 pub mod redact;
 pub mod registry;
