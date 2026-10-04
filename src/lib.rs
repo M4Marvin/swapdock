@@ -13,6 +13,7 @@
 //!   can reach a file.
 
 pub mod apply;
+pub mod builder;
 pub mod cli;
 pub mod compose;
 pub mod deploy;

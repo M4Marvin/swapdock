@@ -112,11 +112,7 @@ pub struct Flip {
 ///
 /// Hostnames compare case-insensitively after the same normalization the
 /// registry uses, because the log records what the client sent.
-pub fn verify(
-    hostnames: &[String],
-    since_ms: i64,
-    lines: impl Iterator<Item = String>,
-) -> Report {
+pub fn verify(hostnames: &[String], since_ms: i64, lines: impl Iterator<Item = String>) -> Report {
     let wanted: BTreeSet<String> = hostnames.iter().map(|h| normalize_hostname(h)).collect();
     let mut report = Report::default();
     // Upstream serving each consecutive request; a change is a flip candidate.
@@ -156,16 +152,15 @@ pub fn verify(
 
             // The first request served by a different upstream is the flip.
             // Later alternations are recorded only as upstream info.
-            if current.as_ref() != Some(&up) {
-                if let Some(from) = current.replace(up.clone()) {
-                    if report.flip.is_none() {
-                        report.flip = Some(Flip {
-                            at_ms: entry.ts_ms,
-                            from,
-                            to: up,
-                        });
-                    }
-                }
+            if current.as_ref() != Some(&up)
+                && let Some(from) = current.replace(up.clone())
+                && report.flip.is_none()
+            {
+                report.flip = Some(Flip {
+                    at_ms: entry.ts_ms,
+                    from,
+                    to: up,
+                });
             }
         }
     }
@@ -193,8 +188,10 @@ mod tests {
 
     #[test]
     fn parses_a_complete_line() {
-        let entry = parse_line("2026-10-04T21:02:33+00:00 charts.m4marvin.com 200 rt=0.012 up=127.0.0.1:9004 us=200")
-            .expect("must parse");
+        let entry = parse_line(
+            "2026-10-04T21:02:33+00:00 charts.m4marvin.com 200 rt=0.012 up=127.0.0.1:9004 us=200",
+        )
+        .expect("must parse");
         assert_eq!(entry.host, "charts.m4marvin.com");
         assert_eq!(entry.status, 200);
         assert_eq!(entry.upstream.as_deref(), Some("127.0.0.1:9004"));
@@ -218,9 +215,14 @@ mod tests {
 
     #[test]
     fn a_multi_upstream_line_is_not_attributed() {
-        let entry = parse_line("2026-10-04T21:02:33Z h.com 200 rt=0.1 up=127.0.0.1:9001,127.0.0.1:9002 us=200")
-            .expect("must parse");
-        assert_eq!(entry.upstream, None, "cannot attribute one request to two upstreams");
+        let entry = parse_line(
+            "2026-10-04T21:02:33Z h.com 200 rt=0.1 up=127.0.0.1:9001,127.0.0.1:9002 us=200",
+        )
+        .expect("must parse");
+        assert_eq!(
+            entry.upstream, None,
+            "cannot attribute one request to two upstreams"
+        );
     }
 
     #[test]
@@ -239,10 +241,30 @@ mod tests {
     #[test]
     fn verify_counts_requests_statuses_and_upstreams() {
         let lines = vec![
-            line("2026-10-04T21:00:00+00:00", "charts.m4marvin.com", 200, "127.0.0.1:9002"),
-            line("2026-10-04T21:01:00+00:00", "charts.m4marvin.com", 200, "127.0.0.1:9002"),
-            line("2026-10-04T21:02:00+00:00", "other.m4marvin.com", 200, "127.0.0.1:9002"),
-            line("2026-10-04T21:03:00+00:00", "charts.m4marvin.com", 502, "127.0.0.1:9002"),
+            line(
+                "2026-10-04T21:00:00+00:00",
+                "charts.m4marvin.com",
+                200,
+                "127.0.0.1:9002",
+            ),
+            line(
+                "2026-10-04T21:01:00+00:00",
+                "charts.m4marvin.com",
+                200,
+                "127.0.0.1:9002",
+            ),
+            line(
+                "2026-10-04T21:02:00+00:00",
+                "other.m4marvin.com",
+                200,
+                "127.0.0.1:9002",
+            ),
+            line(
+                "2026-10-04T21:03:00+00:00",
+                "charts.m4marvin.com",
+                502,
+                "127.0.0.1:9002",
+            ),
             "garbage line".to_string(),
         ];
         let report = verify(
@@ -264,10 +286,30 @@ mod tests {
     fn verify_finds_the_flip_and_ignores_earlier_traffic() {
         let t0 = parse_rfc3339("2026-10-04T21:00:00+00:00").unwrap();
         let lines = vec![
-            line("2026-10-04T20:59:00+00:00", "m4marvin.com", 200, "127.0.0.1:9000"),
-            line("2026-10-04T21:00:00+00:00", "m4marvin.com", 200, "127.0.0.1:9001"),
-            line("2026-10-04T21:01:00+00:00", "m4marvin.com", 200, "127.0.0.1:9004"),
-            line("2026-10-04T21:02:00+00:00", "m4marvin.com", 200, "127.0.0.1:9004"),
+            line(
+                "2026-10-04T20:59:00+00:00",
+                "m4marvin.com",
+                200,
+                "127.0.0.1:9000",
+            ),
+            line(
+                "2026-10-04T21:00:00+00:00",
+                "m4marvin.com",
+                200,
+                "127.0.0.1:9001",
+            ),
+            line(
+                "2026-10-04T21:01:00+00:00",
+                "m4marvin.com",
+                200,
+                "127.0.0.1:9004",
+            ),
+            line(
+                "2026-10-04T21:02:00+00:00",
+                "m4marvin.com",
+                200,
+                "127.0.0.1:9004",
+            ),
         ];
         let report = verify(&["m4marvin.com".to_string()], t0, lines.into_iter());
 
@@ -275,7 +317,10 @@ mod tests {
         let flip = report.flip.expect("must find the flip");
         assert_eq!(flip.from, "127.0.0.1:9001");
         assert_eq!(flip.to, "127.0.0.1:9004");
-        assert_eq!(flip.at_ms, parse_rfc3339("2026-10-04T21:01:00+00:00").unwrap());
+        assert_eq!(
+            flip.at_ms,
+            parse_rfc3339("2026-10-04T21:01:00+00:00").unwrap()
+        );
         assert_eq!(report.upstreams.len(), 2);
         assert_eq!(report.upstreams["127.0.0.1:9004"].requests, 2);
     }
@@ -288,11 +333,7 @@ mod tests {
             200,
             "127.0.0.1:9002",
         )];
-        let report = verify(
-            &["charts.m4marvin.com".to_string()],
-            0,
-            lines.into_iter(),
-        );
+        let report = verify(&["charts.m4marvin.com".to_string()], 0, lines.into_iter());
         assert_eq!(report.requests, 1);
     }
 

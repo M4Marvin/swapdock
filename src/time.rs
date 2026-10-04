@@ -270,9 +270,7 @@ mod tests {
         );
         assert_eq!(
             parse_rfc3339("2026-10-04T21:02:33.123+00:00"),
-            Some(
-                parse_rfc3339("2026-10-04T21:02:33.123Z").expect("must parse")
-            )
+            Some(parse_rfc3339("2026-10-04T21:02:33.123Z").expect("must parse"))
         );
     }
 
@@ -292,9 +290,9 @@ mod tests {
             "2026-10-04",
             "2026-10-04T25:00:00Z",
             "2026-13-01T00:00:00Z",
-            "2026-02-30T00:00:00Z", // February never has 30 days
-            "2023-02-29T00:00:00Z", // 2023 is not a leap year
-            "2026-10-04T21:02:33",  // no zone
+            "2026-02-30T00:00:00Z",      // February never has 30 days
+            "2023-02-29T00:00:00Z",      // 2023 is not a leap year
+            "2026-10-04T21:02:33",       // no zone
             "2026-10-04T21:02:33.1234Z", // more than milliseconds
             "2026-10-04T21:02:33+25:00",
         ] {

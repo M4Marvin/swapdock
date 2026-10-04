@@ -21,6 +21,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::apply::{self, ApplyPaths};
+use crate::builder;
 use crate::deploy::{self, Ctx};
 use crate::exec::{ExecError, StepSpec};
 use crate::id::RunId;
@@ -163,6 +164,30 @@ pub enum Command {
         app: String,
     },
 
+    /// Build a release on the configured build host. Prints the image ref.
+    Build {
+        /// App name, as in the registry.
+        app: String,
+        /// Commit to build. Defaults to the recorded release.
+        #[arg(long, value_name = "SHA")]
+        release: Option<String>,
+        /// Build host. Defaults to DEPLOY_BUILD_HOST, then the registry.
+        #[arg(long, value_name = "HOST")]
+        build_host: Option<String>,
+    },
+
+    /// Check the access log since a time or run: failures, upstreams, the flip.
+    Verify {
+        /// App name, as in the registry.
+        app: String,
+        /// Start of the window: RFC 3339 timestamp or a run id.
+        #[arg(long, value_name = "SINCE")]
+        since: String,
+        /// Access log to read.
+        #[arg(long, default_value = crate::verify::DEFAULT_ACCESS_LOG, value_name = "PATH")]
+        access_log: PathBuf,
+    },
+
     /// Render the config, refuse on any error, then atomically apply and reload.
     Apply {
         #[command(flatten)]
@@ -211,6 +236,16 @@ impl Command {
             } => up_app(cli, app, release.as_deref(), paths),
             Command::Rollback { app, paths } => rollback_app(cli, app, paths),
             Command::Sync { app } => sync_app(cli, app),
+            Command::Build {
+                app,
+                release,
+                build_host,
+            } => build_app(cli, app, release.as_deref(), build_host.as_deref()),
+            Command::Verify {
+                app,
+                since,
+                access_log,
+            } => verify_app(cli, app, since, access_log),
         }
     }
 }
@@ -871,6 +906,116 @@ fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `deploy build <app> [--release] [--build-host]`
+fn build_app(
+    cli: &Cli,
+    name: &str,
+    release: Option<&str>,
+    build_host: Option<&str>,
+) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let release = release
+        .map(str::to_string)
+        .or(app.release.clone())
+        .ok_or_else(|| anyhow::anyhow!("no release: pass --release, or sync the source first"))?;
+
+    let env_host = std::env::var("DEPLOY_BUILD_HOST").ok();
+    let host = builder::resolve_host(build_host, env_host.as_deref(), &app);
+
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    let built = if builder::is_local(&host) {
+        let work_parent = std::env::temp_dir().join("deploy-build");
+        builder::build_local(&mut run, &app, &release, &work_parent)
+    } else {
+        builder::build_ssh(&mut run, &app, &release, &host)
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    run.finish(RunStatus::Ok)?;
+    println!("built    {}", built.image_ref);
+    println!("release  {}", built.release);
+    println!("host     {host}");
+    println!("run      {run_id}");
+    println!();
+    println!(
+        "deploy it with: deploy up {name} --release {}",
+        built.release
+    );
+    Ok(())
+}
+
+/// `deploy verify <app> --since <ts|run-id>`
+fn verify_app(cli: &Cli, name: &str, since: &str, access_log: &Path) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+
+    // A run id resolves to when that run started; anything else must parse as
+    // an RFC 3339 timestamp.
+    let since_ms = match crate::id::RunId::parse(since) {
+        Some(id) => run_started_at(cli, &id)
+            .ok_or_else(|| anyhow::anyhow!("no run {id} in {}", cli.trace.display()))?,
+        None => crate::time::parse_rfc3339(since).ok_or_else(|| {
+            anyhow::anyhow!("{since:?} is neither a run id nor an RFC 3339 timestamp")
+        })?,
+    };
+
+    let lines = crate::verify::read_lines(access_log)?;
+    let report = crate::verify::verify(&app.hostnames, since_ms, lines.into_iter());
+
+    println!("app       {name}");
+    println!(
+        "since     {}",
+        crate::time::Timestamp::from_epoch_millis(since_ms).to_rfc3339()
+    );
+    println!("requests  {}", report.requests);
+    println!("errors    {} (5xx)", report.errors_5xx);
+    if report.malformed > 0 {
+        println!("malformed {} line(s) skipped", report.malformed);
+    }
+    println!();
+    if report.upstreams.is_empty() {
+        println!("no requests in the window");
+    } else {
+        let rows: Vec<Vec<String>> = report
+            .upstreams
+            .iter()
+            .map(|(up, info)| {
+                vec![
+                    up.clone(),
+                    info.requests.to_string(),
+                    info.errors_5xx.to_string(),
+                    crate::time::Timestamp::from_epoch_millis(info.first_ms).to_rfc3339(),
+                ]
+            })
+            .collect();
+        print_table(&["upstream", "requests", "5xx", "first seen"], &rows);
+    }
+    if let Some(flip) = &report.flip {
+        println!();
+        println!(
+            "flip      {} -> {} at {}",
+            flip.from,
+            flip.to,
+            crate::time::Timestamp::from_epoch_millis(flip.at_ms).to_rfc3339()
+        );
+    }
+    if report.errors_5xx > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// When a run started, for `--since <run-id>`.
+fn run_started_at(cli: &Cli, id: &crate::id::RunId) -> Option<i64> {
+    let read = crate::trace::TraceLog::read(&cli.trace).ok()?;
+    read.events.iter().find_map(|e| match e {
+        crate::trace::TraceEvent::RunStart { run_id, ts_ms, .. } if run_id == id.as_str() => {
+            Some(*ts_ms)
+        }
+        _ => None,
+    })
+}
+
 /// Prints an aligned table to stdout.
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let cols = headers.len();
@@ -1092,6 +1237,66 @@ mod tests {
                 assert_eq!(paths.nginx_bin, PathBuf::from("/tmp/fake"));
             }
             _ => panic!("expected Apply"),
+        }
+    }
+
+    #[test]
+    fn build_and_verify_parse() {
+        let cli = Cli::try_parse_from(["deploy", "build", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Build {
+                app,
+                release,
+                build_host,
+            } => {
+                assert_eq!(app, "portfolio");
+                assert_eq!(release, None);
+                assert_eq!(build_host, None);
+            }
+            _ => panic!("expected Build"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "build",
+            "portfolio",
+            "--release",
+            "9c1f2ab",
+            "--build-host",
+            "buildbox",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Build {
+                release,
+                build_host,
+                ..
+            } => {
+                assert_eq!(release.as_deref(), Some("9c1f2ab"));
+                assert_eq!(build_host.as_deref(), Some("buildbox"));
+            }
+            _ => panic!("expected Build"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "verify",
+            "portfolio",
+            "--since",
+            "2026-10-04T21:00:00+00:00",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Verify {
+                app,
+                since,
+                access_log,
+            } => {
+                assert_eq!(app, "portfolio");
+                assert_eq!(since, "2026-10-04T21:00:00+00:00");
+                assert_eq!(access_log, PathBuf::from(crate::verify::DEFAULT_ACCESS_LOG));
+            }
+            _ => panic!("expected Verify"),
         }
     }
 

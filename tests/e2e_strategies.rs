@@ -529,6 +529,124 @@ fn sync_clones_fetches_and_fast_forwards() {
 }
 
 #[test]
+fn build_local_clones_checks_out_and_builds() {
+    if !daemon() {
+        return;
+    }
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+
+    // A real source repo: Dockerfile plus a commit to build.
+    let origin = dir.path().join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@localhost"]);
+    git(&["config", "user.name", "test"]);
+    std::fs::write(
+        origin.join("Dockerfile"),
+        "FROM nginx:alpine\nRUN echo built > /built\n",
+    )
+    .unwrap();
+    git(&["add", "Dockerfile"]);
+    git(&["commit", "-m", "build me"]);
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&origin)
+        .output()
+        .unwrap();
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(sha.len(), 40);
+
+    let app = App {
+        name: "buildapp".into(),
+        kind: Kind::Container,
+        strategy: Strategy::Swap,
+        hostnames: vec![],
+        listen: vec![],
+        front_port: 18999,
+        slot: 100,
+        live_port: None,
+        old_port: None,
+        writes_state: false,
+        image_repo: Some("e2e-buildapp".into()),
+        registry: Some(ImageRegistry::Local),
+        release: None,
+        old_release: None,
+        build_host: Some("local".into()),
+        root: None,
+        health_url: None,
+        compose_dir: dir.path().to_path_buf(),
+        compose_svc: "web".into(),
+        env_name: "WEB_PORT".into(),
+        git_remote: Some(format!("file://{}", origin.display())),
+        branch: Some("main".into()),
+        repo: None,
+    };
+
+    let log = deploy::TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+    let mut run = Run::start(
+        log,
+        RunMode::Live,
+        None,
+        &["deploy".to_string()],
+        deploy::Redactor::new(),
+    )
+    .unwrap();
+
+    let built =
+        deploy::builder::build_local(&mut run, &app, &sha, &dir.path().join("work")).unwrap();
+    run.finish(deploy::RunStatus::Ok).unwrap();
+
+    assert_eq!(built.release, sha);
+    assert_eq!(built.image_ref, format!("e2e-buildapp:{sha}"));
+    assert!(
+        docker(&["image", "inspect", &built.image_ref])
+            .status
+            .success(),
+        "the image must exist in the daemon"
+    );
+    assert!(
+        !dir.path()
+            .join("work")
+            .join(format!("buildapp-{sha}-build"))
+            .exists(),
+        "the build context must be cleaned up"
+    );
+
+    // The trace shows clone, checkout, build — and no push for a local image.
+    let read = deploy::TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+    let steps: Vec<&str> = read
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            deploy::trace::TraceEvent::Step { step, .. } => Some(step.as_str()),
+            _ => None,
+        })
+        .collect();
+    for expected in ["build-clone", "build-checkout", "docker-build"] {
+        assert!(steps.contains(&expected), "{steps:?}");
+    }
+    assert!(
+        !steps.contains(&"docker-push"),
+        "local images are not pushed: {steps:?}"
+    );
+
+    docker(&["rmi", &built.image_ref]);
+}
+
+#[test]
 fn swap_on_a_stateful_app_is_refused_before_anything_starts() {
     let Some(estate) = Estate::setup("badapp", Strategy::Swap) else {
         return;

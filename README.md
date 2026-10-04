@@ -9,7 +9,7 @@ Design notes and the full plan live alongside the video essay in
 
 ## Status: milestones 1 and 2 complete
 
-208 tests, zero clippy warnings, 1.6 MB stripped binary. Nothing here needs
+295 tests, zero clippy warnings, 1.6 MB stripped binary. Nothing here needs
 Docker, nginx or root — which is why the safety-critical parts could be finished
 and tested before touching the host.
 
@@ -26,7 +26,15 @@ and tested before touching the host.
 | `src/validator.rs` | 2 | Cross-app checks: duplicate hostnames, ports, slots, tunnel routes. |
 | `src/tunnel.rs` | 2 | Reads cloudflared's ingress rules. Degrades to a warning, never a false pass. |
 | `src/apply.rs` | 3 | Stage, test, atomic commit, reload with restore on failure. |
-| `src/cli.rs` | 1–3 | `selftest`, `runs`, `show`, `resume`, `render`, `validate`, `apply`. |
+| `src/deploy.rs` | 4 | Swap and replace as explicit step sequences. Rollback via the same gate. |
+| `src/compose.rs` | 4 | `docker compose` argv builders. Pure. |
+| `src/docker.rs` | 4 | `docker` argv builders. Pure. |
+| `src/git.rs` | 4 | `git` argv builders. Pure. |
+| `src/lock.rs` | 4 | Per-app and global nginx locks via flock. |
+| `src/health.rs` | 4 | Container health gate plus a std-only HTTP probe. |
+| `src/verify.rs` | 5 | Access-log verdict: failures, upstreams, the flip instant. |
+| `src/builder.rs` | 6 | Local, SSH and no-op builders behind one resolution order. |
+| `src/cli.rs` | 1–6 | `selftest`, `runs`, `show`, `resume`, `render`, `validate`, `apply`, `up`, `rollback`, `sync`, `build`, `verify`. |
 
 Milestone 3 is `apply`: atomic write, `nginx -t`, restore on failure, reload.
 
@@ -60,6 +68,12 @@ cargo run -- --registry examples/apps \
               --tunnel-config examples/cloudflared.yaml validate
 cargo run -- --registry examples/apps render
 cargo run -- --registry examples/apps render --app portfolio
+
+# The commands that change the host. Refuse on any registry error.
+sudo deploy --registry /srv/deploy/apps apply
+sudo deploy --registry /srv/deploy/apps up portfolio --release 9c1f2ab
+sudo deploy --registry /srv/deploy/apps rollback portfolio
+sudo deploy --registry /srv/deploy/apps verify portfolio --since <run-id>
 ```
 
 `validate` reads only and exits non-zero on any error, so it can gate a deploy.
@@ -175,7 +189,7 @@ a token in a terminal scrollback is a leak even when the log is clean.
 
 ```bash
 cargo build --release          # ~1.6 MB, stripped
-cargo test                     # 226 tests
+cargo test                     # 295 tests (6 against real Docker)
 cargo clippy --all-targets     # zero warnings
 cargo fmt
 ```
@@ -236,11 +250,47 @@ default config's pid file and signals the wrong master.
 -t` rejected the first version of the renderer, which is why the milestone 2
 golden test was wrong and the code was right to change.
 
-## Next
+## How a deploy runs
 
-Milestone 4 is the two deploy strategies as explicit step sequences (`swap` for
-the stateless apps, `replace` for the five with a file database), each step going
-through the chokepoint and into the run log.
+```
+deploy up portfolio --release 9c1f2ab
+  lock                 per-app flock; the kernel releases it if the tool dies
+  resolve-release      flag, then recorded release, then an error
+  pull                 skipped for local-only images
+  green-start          same compose file, generated override for the name,
+                       PORT and IMAGE from the environment, own project
+  health-wait          Health.Status until healthy (missing healthcheck fails),
+                       then GET the candidate port directly
+  render-validate      the post-commit registry, validated as it will be
+  apply                stage, test, atomic commit, reload (milestone 3)
+  probe-front          every hostname on the front port with its Host header
+  drain-wait           15 s for old keepalive workers to finish
+  stop-old             by published port, never by assumed name
+  registry-commit      release chain advances atomically
+```
 
-After that: `verify` against the access log, the `Builder` trait for a pluggable
-build host, and installing nginx plus the first real migration on the host.
+`replace` keeps one port: render, apply only when the text changed, stop, start
+in place, gate, probe, commit. `rollback` deploys `old_release` through the same
+strategy, so the way back has the same gate as the way forward.
+
+`deploy build` runs on whichever host the resolution order picks (`--build-host`,
+`DEPLOY_BUILD_HOST`, the registry, local) and prints the image ref. It never
+touches the registry: building is not deploying.
+
+`deploy verify` reads the access log back and reports failures, per-upstream
+counts and the exact flip instant. It exits non-zero on any 5xx, so it can gate
+automation — and `--since` takes a run id, so the window starts when the deploy
+did.
+
+## What is left
+
+These are operations on the host, not code:
+
+1. `apt install nginx` plus `proxy-common.conf`, the `deploy` log_format and the
+   `front-door.conf` include — the three prerequisites the test harness fakes.
+2. The 6 healthchecks in the two compose files. Without them the health gate
+   refuses every deploy, which is correct but means nothing can ship.
+3. Ports in compose as `${ENV_NAME}` with an `${IMAGE:-default}` image, so the
+   tool can inject per-deploy values without editing files.
+4. `~/apps` under version control, so compose files have history and rollback.
+5. The first real migration: `charts` on its pair, measured with `verify`.
