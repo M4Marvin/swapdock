@@ -30,6 +30,7 @@ pub mod time;
 pub mod trace;
 pub mod tunnel;
 pub mod validator;
+pub mod verify;
 
 pub use deploy::{Ctx, DeployError, rollback, run_replace, run_swap};
 pub use id::RunId;

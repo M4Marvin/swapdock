@@ -61,6 +61,108 @@ impl Timestamp {
     }
 }
 
+/// Parses `YYYY-MM-DDTHH:MM:SS[.mmm][Z|±HH:MM]` into milliseconds since epoch.
+///
+/// Accepts what nginx `$time_iso8601` emits (`2026-10-04T21:02:33+00:00`) as
+/// well as the `Z` form this module writes. Returns `None` for anything else
+/// rather than guessing: a deploy gate must not misread a timestamp.
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (datetime, offset) = split_offset(text)?;
+
+    let date = datetime.get(..10)?;
+    let time = datetime.get(10..)?;
+    let time = time.strip_prefix(['T', 't', ' '])?;
+
+    let year: i64 = date.get(..4)?.parse().ok()?;
+    let month: u32 = date.get(5..7)?.parse().ok()?;
+    let day: u32 = date.get(8..10)?.parse().ok()?;
+    if date.as_bytes().get(4) != Some(&b'-') || date.as_bytes().get(7) != Some(&b'-') {
+        return None;
+    }
+
+    let hour: i64 = time.get(..2)?.parse().ok()?;
+    let minute: i64 = time.get(3..5)?.parse().ok()?;
+    let second: i64 = time.get(6..8)?.parse().ok()?;
+    if time.as_bytes().get(2) != Some(&b':') || time.as_bytes().get(5) != Some(&b':') {
+        return None;
+    }
+
+    let mut millis: i64 = 0;
+    let rest = time.get(8..).unwrap_or("");
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || digits.len() > 3 {
+            return None;
+        }
+        let scale = 10i64.pow(3 - digits.len() as u32);
+        millis = digits.parse::<i64>().ok()? * scale;
+    }
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    let local_ms = ((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis;
+    Some(local_ms - offset * 60_000)
+}
+
+/// Splits trailing `Z` or `±HH:MM` off, returning the offset in minutes east.
+fn split_offset(text: &str) -> Option<(&str, i64)> {
+    if let Some(base) = text.strip_suffix(['Z', 'z']) {
+        return Some((base, 0));
+    }
+    // The sign closest to the end, after the date's own dashes.
+    let pos = text.rfind(['+', '-'])?;
+    if pos < 10 {
+        return None;
+    }
+    let (base, zone) = text.split_at(pos);
+    let (sign, hhmm) = zone.split_at(1);
+    let (hh, mm) = hhmm.split_once(':')?;
+    if hh.len() != 2 || mm.len() != 2 {
+        return None;
+    }
+    let hours: i64 = hh.parse().ok()?;
+    let minutes: i64 = mm.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let total = hours * 60 + minutes;
+    Some((base, if sign == "-" { -total } else { total }))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date. Inverse of
+/// `civil_from_days`; rejects impossible dates like February 30.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap(year) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 /// Converts a count of days since 1970-01-01 into a proleptic Gregorian date.
 ///
 /// Shift the epoch to 0000-03-01 so that the leap day lands at the end of the
@@ -141,6 +243,63 @@ mod tests {
         let early = Timestamp::from_epoch_millis(1_700_000_000_000).to_rfc3339();
         let late = Timestamp::from_epoch_millis(1_800_000_000_000).to_rfc3339();
         assert!(early < late, "{early} must sort before {late}");
+    }
+
+    #[test]
+    fn parse_round_trips_through_format() {
+        for millis in [
+            0,
+            1,
+            999,
+            1_000,
+            1_709_164_800_000, // 2024-02-29, the leap day
+            1_770_934_951_004,
+            1_800_000_000_123,
+        ] {
+            let text = Timestamp::from_epoch_millis(millis).to_rfc3339();
+            assert_eq!(parse_rfc3339(&text), Some(millis), "{text}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_nginx_iso8601() {
+        // Exactly what $time_iso8601 emits.
+        assert_eq!(
+            parse_rfc3339("2026-10-04T21:02:33+00:00"),
+            parse_rfc3339("2026-10-04T21:02:33Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-04T21:02:33.123+00:00"),
+            Some(
+                parse_rfc3339("2026-10-04T21:02:33.123Z").expect("must parse")
+            )
+        );
+    }
+
+    #[test]
+    fn parse_applies_the_offset() {
+        let zulu = parse_rfc3339("2026-10-04T21:02:33Z").unwrap();
+        // +02:00 is two hours east, so the instant is two hours earlier in UTC.
+        assert_eq!(parse_rfc3339("2026-10-04T23:02:33+02:00"), Some(zulu));
+        assert_eq!(parse_rfc3339("2026-10-04T16:02:33-05:00"), Some(zulu));
+    }
+
+    #[test]
+    fn parse_rejects_impossible_dates() {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-10-04",
+            "2026-10-04T25:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-02-30T00:00:00Z", // February never has 30 days
+            "2023-02-29T00:00:00Z", // 2023 is not a leap year
+            "2026-10-04T21:02:33",  // no zone
+            "2026-10-04T21:02:33.1234Z", // more than milliseconds
+            "2026-10-04T21:02:33+25:00",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?} must be rejected");
+        }
     }
 
     #[test]
