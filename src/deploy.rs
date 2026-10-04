@@ -499,6 +499,13 @@ fn apply_new_state(
             app.name
         )));
     };
+    // Simulate the post-commit registry, not a halfway state: when the port
+    // moves, the current live port becomes the rollback target. Without this,
+    // rolling back to the recorded old port looks like live-equals-old and
+    // fails validation. When the port stays (replace), old is left alone.
+    if entry.live_port != Some(new_live_port) {
+        entry.old_port = entry.live_port;
+    }
     entry.live_port = Some(new_live_port);
 
     let mut problems = Vec::new();

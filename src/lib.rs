@@ -31,6 +31,7 @@ pub mod trace;
 pub mod tunnel;
 pub mod validator;
 
+pub use deploy::{Ctx, DeployError, rollback, run_replace, run_swap};
 pub use id::RunId;
 pub use redact::Redactor;
 pub use trace::{Run, RunMode, RunStatus, StepStatus, TraceLog};
