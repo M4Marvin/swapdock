@@ -39,6 +39,15 @@ enforced, not remembered.
 cargo install --locked swapdock
 ```
 
+Then scaffold your first app and check it:
+
+```bash
+mkdir -p ~/swapdock-apps && cd ~/swapdock-apps
+swapdock init blog
+# edit blog.toml: front_port, slot, hostnames
+swapdock --registry . validate
+```
+
 Or build the static binary and run the installer, which sets up
 `/srv/swapdock`, the nginx snippet files, log rotation, and passwordless sudo
 for the binary:
@@ -67,6 +76,7 @@ swapdock --registry examples/apps render
 | `sync <app>` | repo only | Fetch and fast-forward the app source. Refuses on dirty checkouts. |
 | `build <app> [--release]` | build host | Build the release image. Never touches the registry. |
 | `verify <app> --since` | no | Access-log verdict: failures, upstreams, the flip instant. |
+| `init <name>` | no | Write a commented registry template. Refuses to overwrite. |
 | `selftest` | no | Exercise every subprocess guarantee. |
 | `runs` / `show` / `resume` | no | Inspect the append-only run log. |
 

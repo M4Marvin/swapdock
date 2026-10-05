@@ -158,6 +158,18 @@ pub enum Command {
         paths: DeployPaths,
     },
 
+    /// Write a commented registry template for a new app. Changes nothing existing.
+    Init {
+        /// App name. Becomes <name>.toml in the directory.
+        name: String,
+        /// Where to write the file. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Kind of app: container or static.
+        #[arg(long, default_value = "container", value_name = "KIND")]
+        kind: String,
+    },
+
     /// Fetch the app source and fast-forward it. Prints the new HEAD.
     Sync {
         /// App name, as in the registry.
@@ -236,6 +248,7 @@ impl Command {
             } => up_app(cli, app, release.as_deref(), paths),
             Command::Rollback { app, paths } => rollback_app(cli, app, paths),
             Command::Sync { app } => sync_app(cli, app),
+            Command::Init { name, dir, kind } => init_app(name, dir.clone(), kind),
             Command::Build {
                 app,
                 release,
@@ -887,6 +900,85 @@ fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()
     }
 }
 
+/// The template `init` writes. Every field is explained where it is used, so a
+/// first registry file teaches the format instead of just filling it.
+fn init_template(name: &str, kind: &str) -> anyhow::Result<String> {
+    if !crate::registry::is_valid_slug(name) {
+        anyhow::bail!("{name:?} is not a valid app name: lowercase letters, digits and dashes");
+    }
+    let (kind_block, strategy_note) = match kind {
+        "container" => (
+            "kind = \"container\"\nstrategy = \"swap\"\n",
+            "# strategy is \"swap\" for stateless apps, \"replace\" when the app\n# writes to a database file or other shared local state.",
+        ),
+        "static" => (
+            "kind = \"static\"\nstrategy = \"swap\"\nroot = \"/srv/www/NAME/current\"\n",
+            "# static apps always swap: the symlink rename is atomic.",
+        ),
+        other => anyhow::bail!("kind must be \"container\" or \"static\", not {other:?}"),
+    };
+    let kind_block = kind_block.replace("NAME", name);
+    Ok(format!(
+        r#"# Registry file for {name}. One file per app; the file name must match.
+# Validate it any time with: swapdock validate --registry <this directory>
+name = "{name}"
+{kind_block}# Hostnames routed here. Empty until the app is onboarded.
+hostnames = ["{name}.example.com"]
+# Extra bind addresses beyond loopback, e.g. a private interface.
+listen = []
+# The front port: what the tunnel or DNS points at. Never changes.
+front_port = 8001
+# Slot owning this app's back-end port pair (9000 + 2*slot, +1). Unique per app.
+slot = 0
+# True when the app writes to a database file or other shared local state.
+writes_state = false
+# Image name; the release tag is appended (repo:release). Omit for static apps.
+image_repo = "{name}"
+# Where releases are built: "local" or an SSH destination.
+build_host = "local"
+# Commit currently running. Never "latest": a moving tag has no rollback target.
+# release = ""
+# Health endpoint path; host and port always come from the gated container.
+health_url = "http://127.0.0.1/"
+# Compose project layout and the env var carrying the back-end port.
+compose_dir = "/srv/example/compose"
+compose_svc = "{name}"
+env_name = "{upper}_PORT"
+# Source location for `swapdock sync`. Omit when the tool does not manage it.
+# git_remote = "example-org/{name}"
+branch = "main"
+# repo = "/srv/example/{name}"
+{strategy_note}
+"#,
+        upper = name.to_uppercase().replace('-', "_")
+    ))
+}
+
+/// `swapdock init <name>`
+fn init_app(name: &str, dir: Option<PathBuf>, kind: &str) -> anyhow::Result<()> {
+    let text = init_template(name, kind)?;
+    let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+    let path = dir.join(format!("{name}.toml"));
+    if path.exists() {
+        anyhow::bail!("{path:?} already exists; refusing to overwrite");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &text)?;
+
+    // Prove the template is valid by loading it back.
+    let back: crate::registry::App = toml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("generated template does not parse: {e}"))?;
+    assert_eq!(back.name, name);
+    println!("wrote {path:?}");
+    println!(
+        "next: set front_port, slot, hostnames, then swapdock validate --registry {}",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// `swapdock sync <app>`
 fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     let app = load_app(cli, name)?;
@@ -1241,6 +1333,49 @@ mod tests {
             }
             _ => panic!("expected Apply"),
         }
+    }
+
+    #[test]
+    fn init_parses_and_writes_a_valid_template() {
+        let cli = Cli::try_parse_from(["swapdock", "init", "blog"]).unwrap();
+        match cli.command {
+            Command::Init { name, dir, kind } => {
+                assert_eq!(name, "blog");
+                assert_eq!(dir, None);
+                assert_eq!(kind, "container");
+            }
+            _ => panic!("expected Init"),
+        }
+
+        for kind in ["container", "static"] {
+            let text = init_template("blog", kind).unwrap();
+            let app: crate::registry::App = toml::from_str(&text).unwrap();
+            assert_eq!(app.name, "blog");
+            // A fresh template validates except for the placeholder port/slot,
+            // which the operator must set.
+            assert!(app.front_port == 8001 && app.slot == 0);
+        }
+
+        assert!(init_template("Bad Name", "container").is_err());
+        assert!(init_template("blog", "vm").is_err());
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("blog.toml"), "name = \"x\"\n").unwrap();
+        let err = init_app("blog", Some(dir.path().to_path_buf()), "container").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn init_writes_a_file_that_validates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_app("blog", Some(dir.path().to_path_buf()), "static").unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("blog.toml")).unwrap();
+        assert!(raw.contains("root = \"/srv/www/blog/current\""), "{raw}");
+        let app: crate::registry::App = toml::from_str(&raw).unwrap();
+        assert_eq!(app.kind, crate::registry::Kind::Static);
     }
 
     #[test]
