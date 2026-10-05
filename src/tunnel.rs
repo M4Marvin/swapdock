@@ -10,9 +10,9 @@
 //!
 //! ```yaml
 //! ingress:
-//!   - hostname: m4marvin.com
+//!   - hostname: example.com
 //!     service: http://localhost:8001
-//!   - hostname: chat.m4marvin.com
+//!   - hostname: chat.example.com
 //!     service: http://localhost:8002
 //!   - service: http_status:404        # the catch-all, last
 //! ```
@@ -151,13 +151,13 @@ tunnel: ffd206b8-f950-4b32-bdaa-81e414ee7546
 credentials-file: /home/marv/.cloudflared/ffd206b8-f960.json
 
 ingress:
-  - hostname: m4marvin.com
+  - hostname: example.com
     service: http://localhost:8001
-  - hostname: chat.m4marvin.com
+  - hostname: chat.example.com
     service: http://localhost:8002
-  - hostname: morphotechdata.com
+  - hostname: docs.example.com
     service: http://localhost:8012
-  - hostname: www.morphotechdata.com
+  - hostname: www.shop.example.com
     service: http://localhost:8012
   - service: http_status:404
 "#;
@@ -167,10 +167,10 @@ ingress:
         let parsed = parse_ingress(REAL);
         assert!(parsed.problems.is_empty(), "{:?}", parsed.problems);
         assert_eq!(parsed.routes.len(), 4);
-        assert_eq!(parsed.routes.get("m4marvin.com"), Some(8001));
-        assert_eq!(parsed.routes.get("chat.m4marvin.com"), Some(8002));
-        assert_eq!(parsed.routes.get("morphotechdata.com"), Some(8012));
-        assert_eq!(parsed.routes.get("www.morphotechdata.com"), Some(8012));
+        assert_eq!(parsed.routes.get("example.com"), Some(8001));
+        assert_eq!(parsed.routes.get("chat.example.com"), Some(8002));
+        assert_eq!(parsed.routes.get("docs.example.com"), Some(8012));
+        assert_eq!(parsed.routes.get("www.shop.example.com"), Some(8012));
     }
 
     #[test]
@@ -186,9 +186,9 @@ ingress:
     #[test]
     fn hostnames_are_normalised() {
         let parsed = parse_ingress(
-            "ingress:\n  - hostname: M4Marvin.COM.\n    service: http://localhost:8001\n",
+            "ingress:\n  - hostname: Example.COM.\n    service: http://localhost:8001\n",
         );
-        assert_eq!(parsed.routes.get("m4marvin.com"), Some(8001));
+        assert_eq!(parsed.routes.get("example.com"), Some(8001));
     }
 
     #[test]

@@ -189,10 +189,10 @@ mod tests {
     #[test]
     fn parses_a_complete_line() {
         let entry = parse_line(
-            "2026-10-04T21:02:33+00:00 charts.m4marvin.com 200 rt=0.012 up=127.0.0.1:9004 us=200",
+            "2026-10-04T21:02:33+00:00 shop.example.com 200 rt=0.012 up=127.0.0.1:9004 us=200",
         )
         .expect("must parse");
-        assert_eq!(entry.host, "charts.m4marvin.com");
+        assert_eq!(entry.host, "shop.example.com");
         assert_eq!(entry.status, 200);
         assert_eq!(entry.upstream.as_deref(), Some("127.0.0.1:9004"));
         assert_eq!(entry.upstream_status, Some(200));
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn parses_a_line_with_no_upstream() {
         // Static files and the 404 catch-all have no upstream.
-        let entry = parse_line("2026-10-04T21:02:33Z m4marvin.com 404 rt=0.001 up=- us=-")
+        let entry = parse_line("2026-10-04T21:02:33Z example.com 404 rt=0.001 up=- us=-")
             .expect("must parse");
         assert_eq!(entry.upstream, None);
         assert_eq!(entry.upstream_status, None);
@@ -243,32 +243,32 @@ mod tests {
         let lines = vec![
             line(
                 "2026-10-04T21:00:00+00:00",
-                "charts.m4marvin.com",
+                "shop.example.com",
                 200,
                 "127.0.0.1:9002",
             ),
             line(
                 "2026-10-04T21:01:00+00:00",
-                "charts.m4marvin.com",
+                "shop.example.com",
                 200,
                 "127.0.0.1:9002",
             ),
             line(
                 "2026-10-04T21:02:00+00:00",
-                "other.m4marvin.com",
+                "other.example.com",
                 200,
                 "127.0.0.1:9002",
             ),
             line(
                 "2026-10-04T21:03:00+00:00",
-                "charts.m4marvin.com",
+                "shop.example.com",
                 502,
                 "127.0.0.1:9002",
             ),
             "garbage line".to_string(),
         ];
         let report = verify(
-            &["charts.m4marvin.com".to_string()],
+            &["shop.example.com".to_string()],
             parse_rfc3339("2026-10-04T21:00:00+00:00").unwrap(),
             lines.into_iter(),
         );
@@ -288,30 +288,30 @@ mod tests {
         let lines = vec![
             line(
                 "2026-10-04T20:59:00+00:00",
-                "m4marvin.com",
+                "example.com",
                 200,
                 "127.0.0.1:9000",
             ),
             line(
                 "2026-10-04T21:00:00+00:00",
-                "m4marvin.com",
+                "example.com",
                 200,
                 "127.0.0.1:9001",
             ),
             line(
                 "2026-10-04T21:01:00+00:00",
-                "m4marvin.com",
+                "example.com",
                 200,
                 "127.0.0.1:9004",
             ),
             line(
                 "2026-10-04T21:02:00+00:00",
-                "m4marvin.com",
+                "example.com",
                 200,
                 "127.0.0.1:9004",
             ),
         ];
-        let report = verify(&["m4marvin.com".to_string()], t0, lines.into_iter());
+        let report = verify(&["example.com".to_string()], t0, lines.into_iter());
 
         assert_eq!(report.requests, 3, "the 20:59 line predates the window");
         let flip = report.flip.expect("must find the flip");
@@ -329,17 +329,17 @@ mod tests {
     fn hostnames_match_case_insensitively() {
         let lines = vec![line(
             "2026-10-04T21:00:00+00:00",
-            "Charts.M4Marvin.COM",
+            "Shop.Example.COM",
             200,
             "127.0.0.1:9002",
         )];
-        let report = verify(&["charts.m4marvin.com".to_string()], 0, lines.into_iter());
+        let report = verify(&["shop.example.com".to_string()], 0, lines.into_iter());
         assert_eq!(report.requests, 1);
     }
 
     #[test]
     fn an_empty_log_is_a_clean_report_not_an_error() {
-        let report = verify(&["m4marvin.com".to_string()], 0, Vec::new().into_iter());
+        let report = verify(&["example.com".to_string()], 0, Vec::new().into_iter());
         assert_eq!(report.requests, 0);
         assert_eq!(report.errors_5xx, 0);
         assert_eq!(report.flip, None);

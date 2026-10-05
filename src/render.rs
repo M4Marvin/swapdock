@@ -304,7 +304,7 @@ mod tests {
     fn a_container_block_has_the_expected_directives() {
         let out = render(&[container()]);
         assert!(out.contains("listen 127.0.0.1:8001;"), "{out}");
-        assert!(out.contains("server_name m4marvin.com;"), "{out}");
+        assert!(out.contains("server_name example.com;"), "{out}");
         assert!(out.contains(&format!("include {PROXY_COMMON};")), "{out}");
         assert!(out.contains("proxy_pass http://127.0.0.1:9000;"), "{out}");
         assert!(
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn a_static_block_uses_root_not_proxy_pass() {
         let out = render(&[static_app()]);
-        assert!(out.contains("root /srv/www/morphotech/current;"), "{out}");
+        assert!(out.contains("root /srv/www/docs/current;"), "{out}");
         assert!(out.contains("try_files $uri $uri/ =404;"), "{out}");
         assert!(!out.contains("proxy_pass"), "static must not proxy: {out}");
         assert!(
@@ -342,7 +342,7 @@ mod tests {
     fn several_hostnames_share_one_block() {
         let out = render(&[static_app()]);
         assert!(
-            out.contains("server_name morphotechdata.com www.morphotechdata.com;"),
+            out.contains("server_name docs.example.com www.shop.example.com;"),
             "{out}"
         );
         assert_eq!(out.matches("server {").count(), 1, "one block, both names");
@@ -359,10 +359,10 @@ mod tests {
     #[test]
     fn a_second_listen_address_becomes_a_second_listen_line() {
         let mut app = container();
-        app.listen = vec!["127.0.0.1".into(), "100.80.96.4".into()];
+        app.listen = vec!["127.0.0.1".into(), "192.0.2.10".into()];
         let out = render(&[app]);
         assert!(out.contains("listen 127.0.0.1:8001;"), "{out}");
-        assert!(out.contains("listen 100.80.96.4:8001;"), "{out}");
+        assert!(out.contains("listen 192.0.2.10:8001;"), "{out}");
     }
 
     // ---- determinism ----
@@ -544,14 +544,14 @@ mod tests {
     #[test]
     fn rendered_hostnames_are_normalised_sorted_and_deduplicated() {
         let mut a = container();
-        a.hostnames = vec!["M4Marvin.com".into(), "chat.m4marvin.com".into()];
+        a.hostnames = vec!["Example.com".into(), "chat.example.com".into()];
         let mut b = static_app();
-        b.hostnames = vec!["chat.m4marvin.com".into(), "files.m4marvin.com".into()];
+        b.hostnames = vec!["chat.example.com".into(), "files.example.com".into()];
 
         let hosts = rendered_hostnames(&[a, b]);
         assert_eq!(
             hosts,
-            vec!["chat.m4marvin.com", "files.m4marvin.com", "m4marvin.com"]
+            vec!["chat.example.com", "example.com", "files.example.com"]
         );
     }
 
@@ -564,14 +564,14 @@ mod tests {
         let mut c = container();
         c.name = "tailnet".into();
         c.front_port = 8002;
-        c.listen = vec!["100.80.96.4".into()];
+        c.listen = vec!["192.0.2.10".into()];
 
         assert_eq!(
             rendered_listeners(&[a, b, c]),
             vec![
-                ("100.80.96.4".to_string(), 8002),
                 ("127.0.0.1".to_string(), 8001),
                 ("127.0.0.1".to_string(), 8012),
+                ("192.0.2.10".to_string(), 8002),
             ]
         );
     }
@@ -616,7 +616,7 @@ mod tests {
         charts.slot = 1;
         charts.live_port = Some(9002);
         charts.old_port = Some(9003);
-        charts.hostnames = vec!["charts.m4marvin.com".into()];
+        charts.hostnames = vec!["shop.example.com".into()];
         charts.compose_svc = "charts".into();
         charts.env_name = "CHARTS_PORT".into();
         charts.health_url = Some("http://127.0.0.1:8001/".into());
@@ -642,7 +642,7 @@ mod tests {
 # container, strategy swap, release a1b2c3d
 server {
     listen 127.0.0.1:8006;
-    server_name charts.m4marvin.com;
+    server_name shop.example.com;
 
     access_log /var/log/nginx/front-door.access.log swapdock;
 
@@ -656,7 +656,7 @@ server {
 # container, strategy swap, release 9c1f2ab
 server {
     listen 127.0.0.1:8001;
-    server_name m4marvin.com;
+    server_name example.com;
 
     access_log /var/log/nginx/front-door.access.log swapdock;
 

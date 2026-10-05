@@ -289,7 +289,7 @@ mod tests {
         let app = sample();
         assert_eq!(
             remote_url(&app).unwrap(),
-            "https://github.com/M4Marvin/main-site.git"
+            "https://github.com/ExampleOrg/main-site.git"
         );
 
         let mut full = sample();
@@ -314,25 +314,25 @@ mod tests {
     #[test]
     fn remote_build_script_clones_checks_out_builds_and_pushes() {
         let script = remote_build_script(
-            "https://github.com/M4Marvin/main-site.git",
+            "https://github.com/ExampleOrg/main-site.git",
             "9c1f2ab",
-            "ghcr.io/m4marvin/main-site:9c1f2ab",
+            "ghcr.io/example-org/main-site:9c1f2ab",
             true,
         );
         assert!(script.starts_with("set -e\n"), "{script}");
         assert!(script.contains("mktemp -d"), "{script}");
         assert!(script.contains("trap "), "must clean up: {script}");
         assert!(
-            script.contains("git clone https://github.com/M4Marvin/main-site.git"),
+            script.contains("git clone https://github.com/ExampleOrg/main-site.git"),
             "{script}"
         );
         assert!(script.contains("checkout 9c1f2ab"), "{script}");
         assert!(
-            script.contains("docker build -t ghcr.io/m4marvin/main-site:9c1f2ab"),
+            script.contains("docker build -t ghcr.io/example-org/main-site:9c1f2ab"),
             "{script}"
         );
         assert!(
-            script.contains("docker push ghcr.io/m4marvin/main-site:9c1f2ab"),
+            script.contains("docker push ghcr.io/example-org/main-site:9c1f2ab"),
             "{script}"
         );
     }

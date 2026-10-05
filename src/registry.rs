@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! /srv/swapdock/apps/portfolio.toml
-//! /srv/swapdock/apps/morphotech.toml
+//! /srv/swapdock/apps/docs.toml
 //! ```
 //!
 //! One file per app rather than one file for all apps, so two concurrent deploys
@@ -148,7 +148,7 @@ pub struct App {
     /// Addresses nginx binds for the front port. Empty means `127.0.0.1`.
     ///
     /// A second address is for services also reachable over the tailnet, such as
-    /// `chat` on `100.80.96.4:8002`. Kept as `String` so a typo becomes a
+    /// `chat` on `192.0.2.10:8002`. Kept as `String` so a typo becomes a
     /// validation message instead of a deserialization failure.
     #[serde(default)]
     pub listen: Vec<String>,
@@ -220,8 +220,8 @@ impl App {
 
     /// Hostnames lowercased with any trailing dot removed.
     ///
-    /// DNS is case-insensitive and `m4marvin.com.` is the same name as
-    /// `m4marvin.com`, so two spellings of one hostname would otherwise slip
+    /// DNS is case-insensitive and `example.com.` is the same name as
+    /// `example.com`, so two spellings of one hostname would otherwise slip
     /// past a duplicate check.
     pub fn normalized_hostnames(&self) -> Vec<String> {
         self.hostnames
@@ -268,7 +268,7 @@ impl App {
 
     /// The image reference for a release: `repo:release`.
     ///
-    /// Repos that already contain a registry path (`codeberg.org/forgejo/forgejo`)
+    /// Repos that already contain a registry path (`ghcr.io/example-org/git`)
     /// are used as-is; bare names (`apps-portfolio`) are local tags.
     pub fn image_ref(&self, release: &str) -> Option<String> {
         self.image_repo
@@ -797,7 +797,7 @@ pub(crate) mod tests {
             name: "portfolio".into(),
             kind: Kind::Container,
             strategy: Strategy::Swap,
-            hostnames: vec!["m4marvin.com".into()],
+            hostnames: vec!["example.com".into()],
             listen: vec![],
             front_port: 8001,
             slot: 0,
@@ -814,7 +814,7 @@ pub(crate) mod tests {
             compose_dir: PathBuf::from("/home/marv/apps"),
             compose_svc: "portfolio".into(),
             env_name: "PORTFOLIO_PORT".into(),
-            git_remote: Some("M4Marvin/main-site".into()),
+            git_remote: Some("ExampleOrg/main-site".into()),
             branch: Some("master".into()),
             repo: Some(PathBuf::from("/home/marv/apps/main-site")),
         }
@@ -823,10 +823,10 @@ pub(crate) mod tests {
     /// A valid static app.
     pub(crate) fn sample_static() -> App {
         App {
-            name: "morphotech".into(),
+            name: "docs".into(),
             kind: Kind::Static,
             strategy: Strategy::Swap,
-            hostnames: vec!["morphotechdata.com".into(), "www.morphotechdata.com".into()],
+            hostnames: vec!["docs.example.com".into(), "www.shop.example.com".into()],
             front_port: 8012,
             slot: 3,
             live_port: None,
@@ -835,10 +835,10 @@ pub(crate) mod tests {
             image_repo: None,
             release: None,
             old_release: None,
-            root: Some("/srv/www/morphotech/current".into()),
+            root: Some("/srv/www/docs/current".into()),
             health_url: None,
-            compose_svc: "morphotech".into(),
-            env_name: "MORPHOTECH_PORT".into(),
+            compose_svc: "docs".into(),
+            env_name: "DOCS_PORT".into(),
             ..sample()
         }
     }
@@ -892,7 +892,7 @@ pub(crate) mod tests {
             name = "charts"
             kind = "container"
             strategy = "replace"
-            hostnames = ["charts.m4marvin.com"]
+            hostnames = ["shop.example.com"]
             front_port = 8006
             slot = 1
             writes_state = false
@@ -919,7 +919,7 @@ pub(crate) mod tests {
             name = "portfolio"
             kind = "container"
             strategy = "swap"
-            hostnames = ["m4marvin.com"]
+            hostnames = ["example.com"]
             front_prot = 8001
             slot = 0
             image_repo = "apps-portfolio"
@@ -958,10 +958,10 @@ pub(crate) mod tests {
         // DNS is case-insensitive, so two spellings of one name must not both
         // be accepted as separate entries.
         let mut app = sample();
-        app.hostnames = vec!["M4Marvin.com".into(), "m4marvin.COM".into()];
+        app.hostnames = vec!["Example.com".into(), "example.COM".into()];
         assert_eq!(
             app.normalized_hostnames(),
-            vec!["m4marvin.com", "m4marvin.com"]
+            vec!["example.com", "example.com"]
         );
         let found = codes(&app);
         assert!(found.contains(&"hostname-duplicate-in-app"), "{found:?}");
@@ -973,14 +973,14 @@ pub(crate) mod tests {
         // A trailing dot is a typo in a config file. It is normalised away for
         // comparison, but never accepted as input, and never emitted into nginx.
         let mut app = sample();
-        app.hostnames = vec!["m4marvin.com.".into()];
+        app.hostnames = vec!["example.com.".into()];
         assert!(
             codes(&app).contains(&"hostname-invalid"),
             "{:?}",
             codes(&app)
         );
-        assert_eq!(normalize_hostname("m4marvin.com."), "m4marvin.com");
-        assert!(!is_valid_hostname("m4marvin.com."));
+        assert_eq!(normalize_hostname("example.com."), "example.com");
+        assert!(!is_valid_hostname("example.com."));
     }
 
     #[test]
@@ -989,21 +989,21 @@ pub(crate) mod tests {
             "",
             "a",
             "localhost",
-            "*.m4marvin.com",
-            "https://m4marvin.com",
-            "m4marvin.com:8001",
-            "m4marvin.com/path",
-            "-lead.m4marvin.com",
-            "trail-.m4marvin.com",
+            "*.example.com",
+            "https://example.com",
+            "example.com:8001",
+            "example.com/path",
+            "-lead.example.com",
+            "trail-.example.com",
             "double..dot.com",
             "sp ace.com",
         ] {
             assert!(!is_valid_hostname(bad), "{bad:?} must be rejected");
         }
         for good in [
-            "m4marvin.com",
+            "example.com",
             "a.b",
-            "charts.m4marvin.com",
+            "shop.example.com",
             "xn--80ak6aa92e.com",
             "my-site.co.uk",
         ] {
@@ -1169,14 +1169,7 @@ pub(crate) mod tests {
             app.name = bad.into();
             assert!(codes(&app).contains(&"name-invalid"), "{bad:?}");
         }
-        for good in [
-            "a",
-            "portfolio",
-            "charon-chats",
-            "a1",
-            "charts",
-            "copyparty",
-        ] {
+        for good in ["a", "portfolio", "chat-alt", "a1", "charts", "files"] {
             assert!(is_valid_slug(good), "{good:?} must be accepted");
         }
     }
@@ -1224,7 +1217,7 @@ pub(crate) mod tests {
     #[test]
     fn a_second_listen_address_is_allowed() {
         let mut app = sample();
-        app.listen = vec!["127.0.0.1".into(), "100.80.96.4".into()];
+        app.listen = vec!["127.0.0.1".into(), "192.0.2.10".into()];
         assert!(app.problems().is_empty(), "{:?}", app.problems());
     }
 
@@ -1246,7 +1239,7 @@ pub(crate) mod tests {
                 codes(&app)
             );
         }
-        for good in ["/srv/www/portfolio/current", "/var/www/morphotechdata"] {
+        for good in ["/srv/www/portfolio/current", "/var/www/docsdata"] {
             assert!(is_safe_nginx_value(good), "{good:?}");
         }
     }
@@ -1270,7 +1263,7 @@ pub(crate) mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("portfolio.toml"), to_toml(&sample())).unwrap();
         let static_app = sample_static();
-        std::fs::write(dir.path().join("morphotech.toml"), to_toml(&static_app)).unwrap();
+        std::fs::write(dir.path().join("docs.toml"), to_toml(&static_app)).unwrap();
         std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
 
         let loaded = load_dir(dir.path()).unwrap();
@@ -1279,7 +1272,7 @@ pub(crate) mod tests {
 
         let sorted = loaded.sorted();
         let names: Vec<&str> = sorted.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["morphotech", "portfolio"], "sorted by name");
+        assert_eq!(names, ["docs", "portfolio"], "sorted by name");
     }
 
     #[test]
@@ -1358,10 +1351,10 @@ pub(crate) mod tests {
         );
 
         let mut remote = sample();
-        remote.image_repo = Some("codeberg.org/forgejo/forgejo".into());
+        remote.image_repo = Some("ghcr.io/example-org/git".into());
         assert_eq!(
             remote.image_ref("abc1234").as_deref(),
-            Some("codeberg.org/forgejo/forgejo:abc1234")
+            Some("ghcr.io/example-org/git:abc1234")
         );
 
         let mut none = sample();

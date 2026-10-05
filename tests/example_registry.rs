@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use swapdock::registry::{self, App, Kind};
+use swapdock::registry::{self, App};
 use swapdock::render;
 use swapdock::tunnel;
 use swapdock::validator::{self, TunnelRoutes};
@@ -230,7 +230,11 @@ fn nothing_is_fronted_yet_so_no_listener_is_emitted() {
         .iter()
         .filter(|a| a.kind == registry::Kind::Container)
         .collect();
-    assert_eq!(out.matches("server {").count(), 1, "only docs renders: {out}");
+    assert_eq!(
+        out.matches("server {").count(),
+        1,
+        "only docs renders: {out}"
+    );
     assert!(out.contains("root /srv/www/docs/current;"), "{out}");
     assert_eq!(
         out.matches("# not yet fronted").count(),

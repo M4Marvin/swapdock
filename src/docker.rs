@@ -88,9 +88,9 @@ mod tests {
     #[test]
     fn pull_tags_and_removals_carry_the_reference() {
         assert!(
-            pull("ghcr.io/m4marvin/portfolio:9c1f2ab")
+            pull("ghcr.io/example-org/portfolio:9c1f2ab")
                 .full_argv()
-                .ends_with(&["ghcr.io/m4marvin/portfolio:9c1f2ab".to_string()])
+                .ends_with(&["ghcr.io/example-org/portfolio:9c1f2ab".to_string()])
         );
         assert!(
             stop("portfolio-green")

@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn clone_is_shallow_and_single_branch() {
         let argv = clone_branch(
-            "https://github.com/M4Marvin/main-site.git",
+            "https://github.com/ExampleOrg/main-site.git",
             "master",
             &PathBuf::from("/srv/src/main-site"),
         )
@@ -107,7 +107,7 @@ mod tests {
                 "1",
                 "--branch",
                 "master",
-                "https://github.com/M4Marvin/main-site.git",
+                "https://github.com/ExampleOrg/main-site.git",
                 "/srv/src/main-site"
             ]
         );

@@ -319,8 +319,8 @@ mod tests {
     #[test]
     fn a_clean_estate_has_no_cross_app_problems() {
         let apps = vec![
-            container_named("charts", 8006, 1, "charts.m4marvin.com"),
-            container_named("portfolio", 8001, 0, "m4marvin.com"),
+            container_named("charts", 8006, 1, "shop.example.com"),
+            container_named("portfolio", 8001, 0, "example.com"),
         ];
         let tunnel = tunnel_of(&apps);
         assert_eq!(validate(&apps, &tunnel), vec![]);
@@ -333,16 +333,16 @@ mod tests {
 
     #[test]
     fn two_apps_claiming_one_hostname_is_an_error() {
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("mirror", 8002, 1, "m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("mirror", 8002, 1, "example.com");
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-hostname"), "{found:?}");
     }
 
     #[test]
     fn a_hostname_collision_is_found_despite_different_casing() {
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("mirror", 8002, 1, "M4Marvin.COM");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("mirror", 8002, 1, "Example.COM");
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-hostname"), "{found:?}");
     }
@@ -351,8 +351,8 @@ mod tests {
     fn two_apps_listening_on_one_address_and_port_is_an_error() {
         // Distinct hostnames, so only the listener collides: exactly the case that
         // makes nginx refuse to start.
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("mirror", 8001, 1, "www.m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("mirror", 8001, 1, "www.example.com");
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-listener"), "{found:?}");
     }
@@ -361,28 +361,28 @@ mod tests {
     fn the_same_port_on_different_addresses_is_allowed() {
         // chat binds loopback and the tailnet address on the same port. That is
         // two sockets, not a collision.
-        let mut a = container_named("chat", 8002, 1, "chat.m4marvin.com");
+        let mut a = container_named("chat", 8002, 1, "chat.example.com");
         a.listen = vec!["127.0.0.1".into()];
-        let mut b = container_named("beszel", 8002, 2, "status.m4marvin.com");
-        b.listen = vec!["100.80.96.4".into()];
+        let mut b = container_named("monitor", 8002, 2, "status.example.com");
+        b.listen = vec!["192.0.2.10".into()];
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(!found.contains(&"duplicate-listener"), "{found:?}");
     }
 
     #[test]
     fn two_apps_sharing_a_slot_is_an_error() {
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("mirror", 8002, 0, "www.m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("mirror", 8002, 0, "www.example.com");
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-slot"), "{found:?}");
     }
 
     #[test]
     fn two_apps_live_on_one_port_is_an_error() {
-        let mut a = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let mut a = container_named("portfolio", 8001, 0, "example.com");
         a.live_port = Some(9000);
         a.old_port = Some(9001);
-        let mut b = container_named("charts", 8006, 1, "charts.m4marvin.com");
+        let mut b = container_named("charts", 8006, 1, "shop.example.com");
         b.live_port = Some(9000); // outside its own slot pair, but that is per-app
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-live-port"), "{found:?}");
@@ -390,8 +390,8 @@ mod tests {
 
     #[test]
     fn a_rollback_target_used_by_another_app_is_an_error() {
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("charts", 8006, 1, "charts.m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("charts", 8006, 1, "shop.example.com");
         let (a_port, b_live) = (a.old_port.unwrap(), b.live_port.unwrap());
         let mut a = a;
         a.old_port = Some(b_live);
@@ -404,17 +404,17 @@ mod tests {
 
     #[test]
     fn an_app_may_roll_back_to_its_own_old_port() {
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
-        let b = container_named("charts", 8006, 1, "charts.m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
+        let b = container_named("charts", 8006, 1, "shop.example.com");
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(!found.contains(&"old-port-in-use"), "{found:?}");
     }
 
     #[test]
     fn two_files_declaring_one_name_is_an_error() {
-        let a = container_named("portfolio", 8001, 0, "a.m4marvin.com");
-        let mut b = container_named("portfolio", 8002, 1, "b.m4marvin.com");
-        b.hostnames = vec!["b.m4marvin.com".into()];
+        let a = container_named("portfolio", 8001, 0, "a.example.com");
+        let mut b = container_named("portfolio", 8002, 1, "b.example.com");
+        b.hostnames = vec!["b.example.com".into()];
         let found = codes(&validate(&[a, b], &TunnelRoutes::new()));
         assert!(found.contains(&"duplicate-name"), "{found:?}");
     }
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_hostname_with_no_tunnel_route_is_an_error() {
-        let app = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let app = container_named("portfolio", 8001, 0, "example.com");
         let mut tunnel = TunnelRoutes::new();
         tunnel.add("something.else.com", 8001);
         let found = codes(&validate(&[app], &tunnel));
@@ -432,9 +432,9 @@ mod tests {
 
     #[test]
     fn a_tunnel_route_to_the_wrong_port_is_an_error() {
-        let app = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let app = container_named("portfolio", 8001, 0, "example.com");
         let mut tunnel = TunnelRoutes::new();
-        tunnel.add("m4marvin.com", 8009); // wrong front port
+        tunnel.add("example.com", 8009); // wrong front port
         let found = codes(&validate(&[app], &tunnel));
         assert!(found.contains(&"tunnel-route-wrong-port"), "{found:?}");
     }
@@ -442,10 +442,10 @@ mod tests {
     #[test]
     fn a_tunnel_hostname_no_app_claims_is_only_a_warning() {
         // Expected during a migration, before the registry file exists.
-        let app = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let app = container_named("portfolio", 8001, 0, "example.com");
         let mut tunnel = TunnelRoutes::new();
-        tunnel.add("m4marvin.com", 8001);
-        tunnel.add("not-yet.m4marvin.com", 8099);
+        tunnel.add("example.com", 8001);
+        tunnel.add("not-yet.example.com", 8099);
 
         let problems = validate(&[app], &tunnel);
         let orphan = problems
@@ -461,16 +461,16 @@ mod tests {
     #[test]
     fn tunnel_checks_are_skipped_when_there_are_no_routes() {
         // An empty route set means "not supplied", not "nothing is routed".
-        let app = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let app = container_named("portfolio", 8001, 0, "example.com");
         assert!(validate(&[app], &TunnelRoutes::new()).is_empty());
     }
 
     #[test]
     fn tunnel_lookup_normalises_the_hostname() {
         let mut t = TunnelRoutes::new();
-        t.add("M4Marvin.COM.", 8001);
-        assert_eq!(t.get("m4marvin.com"), Some(8001));
-        assert_eq!(t.get("M4Marvin.com"), Some(8001));
+        t.add("Example.COM.", 8001);
+        assert_eq!(t.get("example.com"), Some(8001));
+        assert_eq!(t.get("Example.com"), Some(8001));
         assert_eq!(t.len(), 1);
     }
 
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn a_static_app_is_checked_like_any_other() {
         let mut s = sample_static();
-        s.name = "morphotech".into();
+        s.name = "docs".into();
         s.front_port = 8012;
         s.slot = 3;
         s.kind = Kind::Static;
@@ -488,7 +488,7 @@ mod tests {
         s.old_release = None;
         s.health_url = None;
 
-        let a = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let a = container_named("portfolio", 8001, 0, "example.com");
         let mut collide = s.clone();
         collide.front_port = 8001;
         let found = codes(&validate(&[a, collide], &TunnelRoutes::new()));
@@ -499,8 +499,8 @@ mod tests {
 
     #[test]
     fn findings_are_sorted_so_output_is_stable() {
-        let a = container_named("zeta", 8001, 0, "z.m4marvin.com");
-        let b = container_named("alpha", 8001, 0, "a.m4marvin.com");
+        let a = container_named("zeta", 8001, 0, "z.example.com");
+        let b = container_named("alpha", 8001, 0, "a.example.com");
         let forward = validate(&[a.clone(), b.clone()], &TunnelRoutes::new());
         let reversed = validate(&[b, a], &TunnelRoutes::new());
         assert_eq!(forward, reversed, "order of input must not change output");
@@ -509,10 +509,10 @@ mod tests {
 
     #[test]
     fn counts_separates_errors_from_warnings() {
-        let app = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let app = container_named("portfolio", 8001, 0, "example.com");
         let mut tunnel = TunnelRoutes::new();
-        tunnel.add("m4marvin.com", 8001);
-        tunnel.add("stray.m4marvin.com", 9999);
+        tunnel.add("example.com", 8001);
+        tunnel.add("stray.example.com", 9999);
 
         let problems = validate(&[app], &tunnel);
         let (errors, warnings) = counts(&problems);
@@ -526,7 +526,7 @@ mod tests {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
-        let mut good = container_named("portfolio", 8001, 0, "m4marvin.com");
+        let mut good = container_named("portfolio", 8001, 0, "example.com");
         good.compose_svc = "portfolio".into();
         std::fs::write(
             dir.path().join("portfolio.toml"),
@@ -535,17 +535,17 @@ mod tests {
         .unwrap();
 
         // A stateful app configured to swap: caught per-app.
-        let mut bad = container_named("forgejo", 8003, 1, "git.m4marvin.com");
+        let mut bad = container_named("gitapp", 8003, 1, "git.example.com");
         bad.writes_state = true;
         bad.strategy = crate::registry::Strategy::Swap;
         std::fs::write(
-            dir.path().join("forgejo.toml"),
+            dir.path().join("gitapp.toml"),
             crate::registry::to_toml(&bad),
         )
         .unwrap();
 
         // A third app colliding with the second's front port: caught cross-app.
-        let mut collide = container_named("mirror", 8003, 2, "git2.m4marvin.com");
+        let mut collide = container_named("mirror", 8003, 2, "git2.example.com");
         collide.compose_svc = "mirror".into();
         std::fs::write(
             dir.path().join("mirror.toml"),
