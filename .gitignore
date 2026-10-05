@@ -2,3 +2,4 @@
 deploy.jsonl
 *.jsonl
 .once
+hetzner/

@@ -14,7 +14,9 @@
 # .bak first, and it aborts on the first failure.
 set -euo pipefail
 
-DIST="${1:-$HOME/swapdock-dist}"
+# Under sudo, $HOME is /root, so default to the invoking user's home instead.
+DIST="${1:-${SUDO_USER:+/home/$SUDO_USER/swapdock-dist}}"
+test -n "$DIST" || { echo "usage: sudo bash $0 /path/to/swapdock-dist" >&2; exit 1; }
 test -d "$DIST" || { echo "dist dir missing: $DIST" >&2; exit 1; }
 test "$(id -u)" = "0" || { echo "run as root: sudo bash $0 $DIST" >&2; exit 1; }
 
