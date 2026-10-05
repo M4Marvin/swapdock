@@ -1,10 +1,14 @@
 [package]
-name = "deploy"
+name = "swapdock"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Deploy tool for a multi-app Docker host: registry, nginx front door, blue/green releases"
+description = "Registry-driven blue/green deploys for a multi-app Docker host, behind an nginx front door"
 license = "MIT"
+repository = "https://github.com/M4Marvin/swapdock"
+homepage = "https://github.com/M4Marvin/swapdock"
+keywords = ["deploy", "docker", "nginx", "blue-green", "devops"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"

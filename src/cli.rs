@@ -32,8 +32,8 @@ use crate::trace::{Run, RunMode, RunStatus, TraceEvent, TraceLog};
 use crate::tunnel;
 use crate::validator::{self, TunnelRoutes};
 
-const ABOUT: &str = "Deploy tool for a multi-app Docker host.\n\n\
-                      Milestone 1: subprocess chokepoint, run log, redaction.";
+const ABOUT: &str = "Registry-driven blue/green deploys for a multi-app Docker host,\n\
+                      behind an nginx front door.";
 
 /// Paths shared by every command that can change the host.
 #[derive(Debug, Clone, clap::Args)]
@@ -59,11 +59,11 @@ pub struct DeployPaths {
     pub nginx_bin: PathBuf,
 
     /// Directory for generated compose overrides.
-    #[arg(long, default_value = "/srv/deploy/green", value_name = "DIR")]
+    #[arg(long, default_value = "/srv/swapdock/green", value_name = "DIR")]
     pub state_dir: PathBuf,
 
     /// Directory for lock files.
-    #[arg(long, default_value = "/run/deploy", value_name = "DIR")]
+    #[arg(long, default_value = "/run/swapdock", value_name = "DIR")]
     pub lock_dir: PathBuf,
 
     /// Seconds to let old workers drain after the flip.
@@ -72,13 +72,13 @@ pub struct DeployPaths {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "deploy", version, about = ABOUT, long_about = None)]
+#[command(name = "swapdock", version, about = ABOUT, long_about = None)]
 pub struct Cli {
     /// Path to the append-only run log.
     #[arg(
         long,
         global = true,
-        default_value = "deploy.jsonl",
+        default_value = "swapdock.jsonl",
         value_name = "PATH"
     )]
     pub trace: PathBuf,
@@ -95,7 +95,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        default_value = "/srv/deploy/apps",
+        default_value = "/srv/swapdock/apps",
         value_name = "DIR"
     )]
     pub registry: PathBuf,
@@ -122,7 +122,7 @@ pub enum Command {
 
     /// Print every step of one run, in order.
     Show {
-        /// Run id, as shown by `deploy runs`.
+        /// Run id, as shown by `swapdock runs`.
         run_id: String,
     },
 
@@ -143,7 +143,7 @@ pub enum Command {
     Up {
         /// App name, as in the registry.
         app: String,
-        /// Commit to deploy. Defaults to the recorded release.
+        /// Commit to swapdock. Defaults to the recorded release.
         #[arg(long, value_name = "SHA")]
         release: Option<String>,
         #[command(flatten)]
@@ -171,7 +171,7 @@ pub enum Command {
         /// Commit to build. Defaults to the recorded release.
         #[arg(long, value_name = "SHA")]
         release: Option<String>,
-        /// Build host. Defaults to DEPLOY_BUILD_HOST, then the registry.
+        /// Build host. Defaults to SWAPDOCK_BUILD_HOST, then the registry.
         #[arg(long, value_name = "HOST")]
         build_host: Option<String>,
     },
@@ -265,7 +265,7 @@ fn start(cli: &Cli) -> anyhow::Result<Run> {
     Run::start(log, mode(cli), cli.app.clone(), &argv, Redactor::new())
 }
 
-/// `deploy selftest`
+/// `swapdock selftest`
 ///
 /// Exercises every behaviour the chokepoint promises: success, non-zero exit,
 /// stderr capture, argument pass-through without a shell, timeout enforcement,
@@ -383,7 +383,7 @@ fn selftest(cli: &Cli) -> anyhow::Result<()> {
     println!("secret leak  {}", if leaked { "YES - BUG" } else { "no" });
     println!();
     println!("inspect it with:");
-    println!("  deploy --trace {} show {run_id}", cli.trace.display());
+    println!("  swapdock --trace {} show {run_id}", cli.trace.display());
     println!(
         "  grep -o '\"step\":\"[a-z-]*\"' {} | sort | uniq -c",
         cli.trace.display()
@@ -395,7 +395,7 @@ fn selftest(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One row of `deploy runs`.
+/// One row of `swapdock runs`.
 struct RunSummary {
     run_id: String,
     started: String,
@@ -407,7 +407,7 @@ struct RunSummary {
     non_ok: u32,
 }
 
-/// `deploy runs`
+/// `swapdock runs`
 fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
     let read = TraceLog::read(&cli.trace)?;
 
@@ -480,7 +480,7 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deploy show <run-id>`
+/// `swapdock show <run-id>`
 fn show_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     let run_id = RunId::parse(run_id).ok_or_else(|| {
         anyhow::anyhow!("not a valid run id: {run_id:?} (expected 27 lowercase hex characters)")
@@ -521,7 +521,7 @@ fn show_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deploy resume <run-id>`
+/// `swapdock resume <run-id>`
 fn resume_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     let run_id =
         RunId::parse(run_id).ok_or_else(|| anyhow::anyhow!("not a valid run id: {run_id:?}"))?;
@@ -579,7 +579,7 @@ fn load(cli: &Cli) -> anyhow::Result<Option<Loaded>> {
     Ok(Some(loaded))
 }
 
-/// `deploy render`
+/// `swapdock render`
 ///
 /// Pure: reads the registry, writes stdout. Nothing is applied, so this is safe
 /// to run at any time and against any registry.
@@ -627,9 +627,9 @@ fn render_config(cli: &Cli, only: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deploy validate`
+/// `swapdock validate`
 ///
-/// Reads only. Exits non-zero when anything is an error, so it can gate a deploy.
+/// Reads only. Exits non-zero when anything is an error, so it can gate a swapdock.
 fn validate_registry(cli: &Cli) -> anyhow::Result<()> {
     let Some(loaded) = load(cli)? else {
         return Ok(());
@@ -743,7 +743,7 @@ fn collect_problems(
     (problems, routes)
 }
 
-/// `deploy apply`
+/// `swapdock apply`
 ///
 /// Render, refuse on any error, then stage, test, commit and reload. The only
 /// command that changes the host.
@@ -839,7 +839,7 @@ fn load_app(cli: &Cli, name: &str) -> anyhow::Result<crate::registry::App> {
     }
 }
 
-/// `deploy up <app> [--release]`
+/// `swapdock up <app> [--release]`
 fn up_app(cli: &Cli, name: &str, release: Option<&str>, paths: &DeployPaths) -> anyhow::Result<()> {
     let mut app = load_app(cli, name)?;
     let release = deploy::resolve_release(&app, release).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -866,7 +866,7 @@ fn up_app(cli: &Cli, name: &str, release: Option<&str>, paths: &DeployPaths) -> 
     }
 }
 
-/// `deploy rollback <app>`
+/// `swapdock rollback <app>`
 fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()> {
     let mut app = load_app(cli, name)?;
     let ctx = ctx_from(cli, paths);
@@ -887,7 +887,7 @@ fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()
     }
 }
 
-/// `deploy sync <app>`
+/// `swapdock sync <app>`
 fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     let app = load_app(cli, name)?;
     let mut run = start(cli)?;
@@ -906,7 +906,7 @@ fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     }
 }
 
-/// `deploy build <app> [--release] [--build-host]`
+/// `swapdock build <app> [--release] [--build-host]`
 fn build_app(
     cli: &Cli,
     name: &str,
@@ -919,13 +919,13 @@ fn build_app(
         .or(app.release.clone())
         .ok_or_else(|| anyhow::anyhow!("no release: pass --release, or sync the source first"))?;
 
-    let env_host = std::env::var("DEPLOY_BUILD_HOST").ok();
+    let env_host = std::env::var("SWAPDOCK_BUILD_HOST").ok();
     let host = builder::resolve_host(build_host, env_host.as_deref(), &app);
 
     let mut run = start(cli)?;
     let run_id = run.id().to_string();
     let built = if builder::is_local(&host) {
-        let work_parent = std::env::temp_dir().join("deploy-build");
+        let work_parent = std::env::temp_dir().join("swapdock-build");
         builder::build_local(&mut run, &app, &release, &work_parent)
     } else {
         builder::build_ssh(&mut run, &app, &release, &host)
@@ -939,13 +939,13 @@ fn build_app(
     println!("run      {run_id}");
     println!();
     println!(
-        "deploy it with: deploy up {name} --release {}",
+        "swapdock it with: swapdock up {name} --release {}",
         built.release
     );
     Ok(())
 }
 
-/// `deploy verify <app> --since <ts|run-id>`
+/// `swapdock verify <app> --since <ts|run-id>`
 fn verify_app(cli: &Cli, name: &str, since: &str, access_log: &Path) -> anyhow::Result<()> {
     let app = load_app(cli, name)?;
 
@@ -1084,25 +1084,26 @@ mod tests {
 
     #[test]
     fn parses_a_bare_selftest() {
-        let cli = Cli::try_parse_from(["deploy", "selftest"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "selftest"]).unwrap();
         assert!(matches!(cli.command, Command::Selftest));
-        assert_eq!(cli.trace, PathBuf::from("deploy.jsonl"));
+        assert_eq!(cli.trace, PathBuf::from("swapdock.jsonl"));
         assert!(!cli.dry_run);
     }
 
     #[test]
     fn global_flags_work_before_and_after_the_subcommand() {
-        let a = Cli::try_parse_from(["deploy", "--dry-run", "selftest"]).unwrap();
-        let b = Cli::try_parse_from(["deploy", "selftest", "--dry-run"]).unwrap();
+        let a = Cli::try_parse_from(["swapdock", "--dry-run", "selftest"]).unwrap();
+        let b = Cli::try_parse_from(["swapdock", "selftest", "--dry-run"]).unwrap();
         assert!(a.dry_run && b.dry_run);
 
-        let c = Cli::try_parse_from(["deploy", "--trace", "/tmp/x.jsonl", "runs"]).unwrap();
+        let c = Cli::try_parse_from(["swapdock", "--trace", "/tmp/x.jsonl", "runs"]).unwrap();
         assert_eq!(c.trace, PathBuf::from("/tmp/x.jsonl"));
     }
 
     #[test]
     fn parses_run_identification_arguments() {
-        let cli = Cli::try_parse_from(["deploy", "show", "01JQ7FABCDEFGHJKMNPQRSTUVWXYZ"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["swapdock", "show", "01JQ7FABCDEFGHJKMNPQRSTUVWXYZ"]).unwrap();
         match cli.command {
             Command::Show { run_id } => {
                 assert_eq!(run_id, "01JQ7FABCDEFGHJKMNPQRSTUVWXYZ")
@@ -1110,7 +1111,7 @@ mod tests {
             _ => panic!("expected Show"),
         }
 
-        let cli = Cli::try_parse_from(["deploy", "runs", "--limit", "5"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "runs", "--limit", "5"]).unwrap();
         match cli.command {
             Command::Runs { limit } => assert_eq!(limit, 5),
             _ => panic!("expected Runs"),
@@ -1119,7 +1120,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_subcommand() {
-        assert!(Cli::try_parse_from(["deploy", "frobnicate"]).is_err());
+        assert!(Cli::try_parse_from(["swapdock", "frobnicate"]).is_err());
     }
 
     #[test]
@@ -1140,14 +1141,16 @@ mod tests {
     #[test]
     fn parses_the_new_subcommands() {
         assert!(matches!(
-            Cli::try_parse_from(["deploy", "render"]).unwrap().command,
+            Cli::try_parse_from(["swapdock", "render"]).unwrap().command,
             Command::Render { .. }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["deploy", "validate"]).unwrap().command,
+            Cli::try_parse_from(["swapdock", "validate"])
+                .unwrap()
+                .command,
             Command::Validate
         ));
-        let cli = Cli::try_parse_from(["deploy", "render", "--app", "portfolio"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "render", "--app", "portfolio"]).unwrap();
         match cli.command {
             Command::Render { app } => assert_eq!(app.as_deref(), Some("portfolio")),
             _ => panic!("expected Render"),
@@ -1156,7 +1159,7 @@ mod tests {
 
     #[test]
     fn up_rollback_and_sync_parse() {
-        let cli = Cli::try_parse_from(["deploy", "up", "portfolio"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "up", "portfolio"]).unwrap();
         match cli.command {
             Command::Up { app, release, .. } => {
                 assert_eq!(app, "portfolio");
@@ -1166,20 +1169,20 @@ mod tests {
         }
 
         let cli =
-            Cli::try_parse_from(["deploy", "up", "portfolio", "--release", "9c1f2ab"]).unwrap();
+            Cli::try_parse_from(["swapdock", "up", "portfolio", "--release", "9c1f2ab"]).unwrap();
         match cli.command {
             Command::Up { release, .. } => assert_eq!(release.as_deref(), Some("9c1f2ab")),
             _ => panic!("expected Up"),
         }
 
         assert!(matches!(
-            Cli::try_parse_from(["deploy", "rollback", "portfolio"])
+            Cli::try_parse_from(["swapdock", "rollback", "portfolio"])
                 .unwrap()
                 .command,
             Command::Rollback { .. }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["deploy", "sync", "portfolio"])
+            Cli::try_parse_from(["swapdock", "sync", "portfolio"])
                 .unwrap()
                 .command,
             Command::Sync { .. }
@@ -1188,7 +1191,7 @@ mod tests {
 
     #[test]
     fn deploy_paths_have_documented_defaults() {
-        let cli = Cli::try_parse_from(["deploy", "up", "portfolio"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "up", "portfolio"]).unwrap();
         match cli.command {
             Command::Up { paths, .. } => {
                 assert_eq!(
@@ -1198,8 +1201,8 @@ mod tests {
                 assert_eq!(paths.main_config, PathBuf::from("/etc/nginx/nginx.conf"));
                 assert_eq!(paths.pid_file, PathBuf::from("/run/nginx.pid"));
                 assert_eq!(paths.nginx_bin, PathBuf::from("nginx"));
-                assert_eq!(paths.state_dir, PathBuf::from("/srv/deploy/green"));
-                assert_eq!(paths.lock_dir, PathBuf::from("/run/deploy"));
+                assert_eq!(paths.state_dir, PathBuf::from("/srv/swapdock/green"));
+                assert_eq!(paths.lock_dir, PathBuf::from("/run/swapdock"));
                 assert_eq!(paths.drain_secs, crate::deploy::DRAIN_SECS);
             }
             _ => panic!("expected Up"),
@@ -1208,7 +1211,7 @@ mod tests {
 
     #[test]
     fn apply_has_documented_defaults() {
-        let cli = Cli::try_parse_from(["deploy", "apply"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "apply"]).unwrap();
         match cli.command {
             Command::Apply { paths } => {
                 assert_eq!(
@@ -1223,7 +1226,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "deploy",
+            "swapdock",
             "apply",
             "--target",
             "/tmp/f.conf",
@@ -1242,7 +1245,7 @@ mod tests {
 
     #[test]
     fn build_and_verify_parse() {
-        let cli = Cli::try_parse_from(["deploy", "build", "portfolio"]).unwrap();
+        let cli = Cli::try_parse_from(["swapdock", "build", "portfolio"]).unwrap();
         match cli.command {
             Command::Build {
                 app,
@@ -1257,7 +1260,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "deploy",
+            "swapdock",
             "build",
             "portfolio",
             "--release",
@@ -1279,7 +1282,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "deploy",
+            "swapdock",
             "verify",
             "portfolio",
             "--since",
@@ -1302,12 +1305,12 @@ mod tests {
 
     #[test]
     fn registry_and_tunnel_flags_have_documented_defaults() {
-        let cli = Cli::try_parse_from(["deploy", "validate"]).unwrap();
-        assert_eq!(cli.registry, PathBuf::from("/srv/deploy/apps"));
+        let cli = Cli::try_parse_from(["swapdock", "validate"]).unwrap();
+        assert_eq!(cli.registry, PathBuf::from("/srv/swapdock/apps"));
         assert_eq!(cli.tunnel_config, None);
 
         let cli = Cli::try_parse_from([
-            "deploy",
+            "swapdock",
             "--registry",
             "/tmp/apps",
             "--tunnel-config",

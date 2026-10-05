@@ -2,7 +2,7 @@
 //!
 //! `validate` needs to know which hostname the tunnel sends to which front port,
 //! because that is the join between the registry and the one config file the
-//! deploy tool must not need to restart.
+//! swapdock tool must not need to restart.
 //!
 //! ## Not a YAML parser
 //!
@@ -145,7 +145,7 @@ pub fn read_config(path: &std::path::Path) -> std::io::Result<Parsed> {
 mod tests {
     use super::*;
 
-    /// The real config shape from the deploy host.
+    /// The real config shape from the swapdock host.
     const REAL: &str = r#"
 tunnel: ffd206b8-f950-4b32-bdaa-81e414ee7546
 credentials-file: /home/marv/.cloudflared/ffd206b8-f960.json

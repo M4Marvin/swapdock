@@ -1,4 +1,4 @@
-//! The two deploy strategies.
+//! The two swapdock strategies.
 //!
 //! ```text
 //! swap     start the new version alongside the old, flip traffic, retire old
@@ -11,7 +11,7 @@
 //! module runs, the strategy is safe by construction.
 //!
 //! Both strategies are explicit step sequences. Every step goes through the exec
-//! chokepoint or is recorded as a filesystem step, so a failed deploy leaves a
+//! chokepoint or is recorded as a filesystem step, so a failed swapdock leaves a
 //! complete trace and `resume` knows where it stopped.
 //!
 //! ```text
@@ -112,9 +112,9 @@ pub struct Ctx {
 impl Default for Ctx {
     fn default() -> Self {
         Self {
-            registry_dir: PathBuf::from("/srv/deploy/apps"),
-            state_dir: PathBuf::from("/srv/deploy/green"),
-            lock_dir: PathBuf::from("/run/deploy"),
+            registry_dir: PathBuf::from("/srv/swapdock/apps"),
+            state_dir: PathBuf::from("/srv/swapdock/green"),
+            lock_dir: PathBuf::from("/run/swapdock"),
             apply_paths: ApplyPaths::default(),
             drain_secs: DRAIN_SECS,
             lock_timeout: lock::ACQUIRE_TIMEOUT,
@@ -122,10 +122,10 @@ impl Default for Ctx {
     }
 }
 
-/// Why a deploy did not finish.
+/// Why a swapdock did not finish.
 #[derive(Debug, Error)]
 pub enum DeployError {
-    #[error("no release to deploy: pass --release, or record one with a previous deploy")]
+    #[error("no release to swapdock: pass --release, or record one with a previous swapdock")]
     NoRelease,
 
     #[error("{0} error(s) in the registry; nothing was started")]
@@ -137,16 +137,16 @@ pub enum DeployError {
     #[error("apply failed: {0}")]
     Apply(#[from] apply::ApplyError),
 
-    #[error("could not take the deploy lock: {0}")]
+    #[error("could not take the swapdock lock: {0}")]
     Lock(#[from] LockError),
 
-    #[error("refused to deploy into a broken estate: {0}")]
+    #[error("refused to swapdock into a broken estate: {0}")]
     Estate(String),
 
     #[error("sync failed: {0}")]
     Sync(String),
 
-    #[error("could not run a deploy step: {0}")]
+    #[error("could not run a swapdock step: {0}")]
     Exec(#[from] crate::exec::ExecError),
 
     #[error("could not pull {image_ref}: {stderr}")]
@@ -159,7 +159,7 @@ pub enum DeployError {
     Trace(#[from] anyhow::Error),
 }
 
-/// Decides which commit to deploy: the flag wins, then the recorded release.
+/// Decides which commit to swapdock: the flag wins, then the recorded release.
 pub fn resolve_release(app: &App, flag: Option<&str>) -> Result<String, DeployError> {
     if let Some(sha) = flag {
         return Ok(sha.to_string());
@@ -261,7 +261,7 @@ pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Resul
     let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
     refuse_if_broken(run, ctx)?;
 
-    // Without a live port there is nothing to alternate against: a first deploy
+    // Without a live port there is nothing to alternate against: a first swapdock
     // starts on the pair's first port.
     let green_port = match app.live_port {
         Some(live) => {
@@ -312,7 +312,7 @@ pub fn run_replace(
 
     let port = app.live_port.ok_or_else(|| {
         DeployError::Estate(format!(
-            "{} has no live_port yet; a first deploy must use swap",
+            "{} has no live_port yet; a first swapdock must use swap",
             app.name
         ))
     })?;
@@ -376,7 +376,7 @@ fn hold(run: &mut Run, ctx: &Ctx, name: &str) -> Result<Option<Lock>, DeployErro
     Ok(Some(Lock::acquire(&ctx.lock_dir, name, ctx.lock_timeout)?))
 }
 
-/// Refuses to deploy into an estate that does not validate.
+/// Refuses to swapdock into an estate that does not validate.
 fn refuse_if_broken(run: &mut Run, ctx: &Ctx) -> Result<(), DeployError> {
     let loaded = registry::load_dir(&ctx.registry_dir)
         .map_err(|e| DeployError::Io(format!("read {}: {e}", ctx.registry_dir.display())))?;
@@ -599,7 +599,7 @@ fn drain(run: &mut Run, ctx: &Ctx) -> Result<(), DeployError> {
 /// Stops and removes every container publishing `port`, if any.
 fn stop_publishing(run: &mut Run, port: Option<u16>) -> Result<(), DeployError> {
     let Some(port) = port else {
-        record_skip(run, "stop-old", "no previous container; first deploy")?;
+        record_skip(run, "stop-old", "no previous container; first swapdock")?;
         return Ok(());
     };
     let found = run.exec(&docker::ps_publishing(port))?;
@@ -817,8 +817,8 @@ mod tests {
     #[test]
     fn green_override_paths_live_in_the_state_dir() {
         assert_eq!(
-            green_override_path(Path::new("/srv/deploy/green"), "portfolio"),
-            PathBuf::from("/srv/deploy/green/portfolio.yml")
+            green_override_path(Path::new("/srv/swapdock/green"), "portfolio"),
+            PathBuf::from("/srv/swapdock/green/portfolio.yml")
         );
     }
 

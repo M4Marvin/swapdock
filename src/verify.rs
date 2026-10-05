@@ -1,17 +1,17 @@
-//! Verifying a deploy against the nginx access log.
+//! Verifying a swapdock against the nginx access log.
 //!
-//! The deploy tool must not grade its own homework. Exit code zero from a
+//! The swapdock tool must not grade its own homework. Exit code zero from a
 //! reload means the signal was accepted, not that traffic moved. The access log
 //! is the system's own record, so `verify` reads it back:
 //!
 //! ```text
-//! log_format deploy '$time_iso8601 $host $status rt=$request_time '
+//! log_format swapdock '$time_iso8601 $host $status rt=$request_time '
 //!                    'up=$upstream_addr us=$upstream_status';
 //! ```
 //!
 //! For one app and a start time, the report answers three questions:
 //!
-//! 1. Did any request fail (5xx) since the deploy?
+//! 1. Did any request fail (5xx) since the swapdock?
 //! 2. Which upstreams served, and when did each first appear?
 //! 3. At what instant did traffic move from the old upstream to the new one?
 //!
@@ -24,7 +24,7 @@ use std::path::Path;
 use crate::registry::normalize_hostname;
 use crate::time::parse_rfc3339;
 
-/// Default location of the front-door access log on the deploy host.
+/// Default location of the front-door access log on the swapdock host.
 pub const DEFAULT_ACCESS_LOG: &str = "/var/log/nginx/front-door.access.log";
 
 /// One parsed access-log line.

@@ -3,12 +3,12 @@
 //! Two deploys must never interleave: one rewriting the nginx config while
 //! another renames a registry file is how state corrupts across apps. `flock`
 //! is the right primitive because the kernel releases it when the holder dies,
-//! so a killed deploy cannot wedge every later one.
+//! so a killed swapdock cannot wedge every later one.
 //!
 //! Two lock domains, matching the two kinds of shared state:
 //!
-//! * one file per app (`deploy-<app>.lock`) around build, start and health gate;
-//! * one global file (`deploy-nginx.lock`) around generate, test and reload.
+//! * one file per app (`swapdock-<app>.lock`) around build, start and health gate;
+//! * one global file (`swapdock-nginx.lock`) around generate, test and reload.
 //!
 //! Two apps build and health-gate in parallel and serialize only for the few
 //! hundred milliseconds of generate-and-reload. That is the minimum contention
@@ -32,7 +32,7 @@ pub enum LockError {
     #[error("could not create lock file {path}: {reason}")]
     Create { path: String, reason: String },
 
-    #[error("timed out after {timeout_ms} ms waiting for {path}; another deploy holds it")]
+    #[error("timed out after {timeout_ms} ms waiting for {path}; another swapdock holds it")]
     Timeout { path: String, timeout_ms: u64 },
 }
 
@@ -89,14 +89,14 @@ impl Lock {
     }
 }
 
-/// Lock file name for one app's deploy.
+/// Lock file name for one app's swapdock.
 pub fn app_lock_name(app: &str) -> String {
-    format!("deploy-{app}")
+    format!("swapdock-{app}")
 }
 
 /// Lock file name for the nginx critical section.
 pub fn nginx_lock_name() -> &'static str {
-    "deploy-nginx"
+    "swapdock-nginx"
 }
 
 #[cfg(test)]
@@ -107,22 +107,23 @@ mod tests {
     #[test]
     fn acquire_and_release() {
         let dir = TempDir::new().unwrap();
-        let lock = Lock::acquire(dir.path(), "deploy-test", Duration::from_secs(5)).unwrap();
-        assert_eq!(lock.path(), dir.path().join("deploy-test.lock"));
+        let lock = Lock::acquire(dir.path(), "swapdock-test", Duration::from_secs(5)).unwrap();
+        assert_eq!(lock.path(), dir.path().join("swapdock-test.lock"));
         assert!(lock.path().exists());
         drop(lock);
 
         // Re-acquirable immediately after the guard drops.
-        Lock::acquire(dir.path(), "deploy-test", Duration::from_secs(5)).unwrap();
+        Lock::acquire(dir.path(), "swapdock-test", Duration::from_secs(5)).unwrap();
     }
 
     #[test]
     fn a_second_holder_times_out() {
         let dir = TempDir::new().unwrap();
-        let _first = Lock::acquire(dir.path(), "deploy-test", Duration::from_secs(5)).unwrap();
+        let _first = Lock::acquire(dir.path(), "swapdock-test", Duration::from_secs(5)).unwrap();
 
         let started = Instant::now();
-        let err = Lock::acquire(dir.path(), "deploy-test", Duration::from_millis(300)).unwrap_err();
+        let err =
+            Lock::acquire(dir.path(), "swapdock-test", Duration::from_millis(300)).unwrap_err();
         assert!(
             matches!(err, LockError::Timeout { .. }),
             "expected a timeout, got {err:?}"
@@ -132,22 +133,25 @@ mod tests {
             "must give up at the deadline, took {:?}",
             started.elapsed()
         );
-        assert!(err.to_string().contains("another deploy holds it"), "{err}");
+        assert!(
+            err.to_string().contains("another swapdock holds it"),
+            "{err}"
+        );
     }
 
     #[test]
     fn different_names_do_not_contend() {
         let dir = TempDir::new().unwrap();
-        let _a = Lock::acquire(dir.path(), "deploy-a", Duration::from_secs(5)).unwrap();
-        let _b = Lock::acquire(dir.path(), "deploy-b", Duration::from_secs(5)).unwrap();
+        let _a = Lock::acquire(dir.path(), "swapdock-a", Duration::from_secs(5)).unwrap();
+        let _b = Lock::acquire(dir.path(), "swapdock-b", Duration::from_secs(5)).unwrap();
     }
 
     #[test]
     fn a_missing_directory_is_created() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a").join("b");
-        Lock::acquire(&nested, "deploy-test", Duration::from_secs(5)).unwrap();
-        assert!(nested.join("deploy-test.lock").exists());
+        Lock::acquire(&nested, "swapdock-test", Duration::from_secs(5)).unwrap();
+        assert!(nested.join("swapdock-test.lock").exists());
     }
 
     #[test]
@@ -162,7 +166,7 @@ mod tests {
         let writable = std::fs::write(ro.join(".probe"), b"x").is_ok();
         let _ = std::fs::remove_file(ro.join(".probe"));
         if !writable {
-            let err = Lock::acquire(&ro, "deploy-test", Duration::from_secs(5)).unwrap_err();
+            let err = Lock::acquire(&ro, "swapdock-test", Duration::from_secs(5)).unwrap_err();
             assert!(matches!(err, LockError::Create { .. }), "{err:?}");
         }
 
@@ -171,7 +175,7 @@ mod tests {
 
     #[test]
     fn lock_names_follow_the_convention() {
-        assert_eq!(app_lock_name("portfolio"), "deploy-portfolio");
-        assert_eq!(nginx_lock_name(), "deploy-nginx");
+        assert_eq!(app_lock_name("portfolio"), "swapdock-portfolio");
+        assert_eq!(nginx_lock_name(), "swapdock-nginx");
     }
 }

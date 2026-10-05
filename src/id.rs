@@ -1,7 +1,7 @@
 //! Run identifiers.
 //!
 //! A run id is 27 lowercase hex characters: 11 of milliseconds-since-epoch
-//! followed by 16 of randomness. That shape buys three properties a deploy tool
+//! followed by 16 of randomness. That shape buys three properties a swapdock tool
 //! needs:
 //!
 //! * **Sortable** — ids sort in the order the runs were created, so `ls` on a
@@ -9,7 +9,7 @@
 //! * **Typed** — 27 characters is short enough to type after a paste, and long
 //!   enough that a typo is caught by the log lookup.
 //! * **Grouped** — every step record of one run carries the same id, so
-//!   `grep <id> deploy.jsonl` reconstructs the whole run in order.
+//!   `grep <id> swapdock.jsonl` reconstructs the whole run in order.
 
 use std::fmt;
 

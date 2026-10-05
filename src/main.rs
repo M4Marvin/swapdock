@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use deploy::cli::Cli;
+use swapdock::cli::Cli;
 
 fn main() -> ExitCode {
     // Human-facing progress goes to stderr so stdout stays a clean data stream.

@@ -1,17 +1,17 @@
 //! Tests against the real registry in `examples/`.
 //!
 //! The unit tests prove the logic. These prove the *data* — the 13 apps actually
-//! running on the deploy host, cross-checked against the tunnel config that is
+//! running on the swapdock host, cross-checked against the tunnel config that is
 //! actually in use. That turns "the validator works" into "the validator agrees
 //! with production", and catches a hand-edited registry file immediately.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use deploy::registry::{self, App};
-use deploy::render;
-use deploy::tunnel;
-use deploy::validator::{self, TunnelRoutes};
+use swapdock::registry::{self, App};
+use swapdock::render;
+use swapdock::tunnel;
+use swapdock::validator::{self, TunnelRoutes};
 
 fn examples(sub: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

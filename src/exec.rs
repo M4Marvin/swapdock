@@ -12,7 +12,7 @@
 //! | Logging | argv, exit code, duration and output tails go to the run log |
 //! | Dry run | intercepted before spawn, so `--dry-run` needs no second path |
 //! | Redaction | applied before anything reaches the tracer |
-//! | Timeouts | every command has one, so a hung `compose up` cannot wedge a deploy |
+//! | Timeouts | every command has one, so a hung `compose up` cannot wedge a swapdock |
 //!
 //! The rule is enforced by an integration test that greps the source for
 //! `process::Command` and fails if it appears anywhere else. See
@@ -45,7 +45,7 @@ const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Default per-command timeout. Long enough for `docker compose pull` on a cold
-/// cache, short enough that a wedged daemon cannot hold a deploy open.
+/// cache, short enough that a wedged daemon cannot hold a swapdock open.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Description of one command to run.
@@ -425,12 +425,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn run(dir: &TempDir) -> Run {
-        let log = TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+        let log = TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
         Run::start(
             log,
             RunMode::Live,
             Some("test".into()),
-            &["deploy".to_string()],
+            &["swapdock".to_string()],
             Redactor::new(),
         )
         .unwrap()
@@ -547,7 +547,7 @@ mod tests {
         let mut r = run(&dir);
         let _ = r.exec(&sh("slow", "sleep 30").timeout(Duration::from_millis(100)));
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let statuses: Vec<StepStatus> = read
             .events
             .iter()
@@ -633,7 +633,7 @@ mod tests {
         let mut r = run(&dir);
         let _ = r.exec(&StepSpec::new("nope", "definitely-not-a-real-program-xyz"));
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         assert!(read.events.iter().any(|e| matches!(
             e,
             TraceEvent::Step {
@@ -648,12 +648,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let marker = dir.path().spawn_file_marker();
 
-        let log = TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+        let log = TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
         let mut r = Run::start(
             log,
             RunMode::DryRun,
             None,
-            &["deploy".into()],
+            &["swapdock".into()],
             Redactor::new(),
         )
         .unwrap();
@@ -683,12 +683,12 @@ mod tests {
     #[test]
     fn dry_run_records_the_intent_with_the_full_argv() {
         let dir = TempDir::new().unwrap();
-        let log = TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+        let log = TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
         let mut r = Run::start(
             log,
             RunMode::DryRun,
             None,
-            &["deploy".into()],
+            &["swapdock".into()],
             Redactor::new(),
         )
         .unwrap();
@@ -701,7 +701,7 @@ mod tests {
         .unwrap();
         r.finish(RunStatus::DryRun).unwrap();
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let step = read
             .events
             .iter()
@@ -734,7 +734,7 @@ mod tests {
         }
 
         // The invariant that matters is the sequence recorded in the log.
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let seqs: Vec<u32> = read
             .events
             .iter()
@@ -758,7 +758,7 @@ mod tests {
         .unwrap();
         r.finish(RunStatus::Ok).unwrap();
 
-        let raw = std::fs::read_to_string(dir.path().join("deploy.jsonl")).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("swapdock.jsonl")).unwrap();
         assert!(!raw.contains("ghp_supersecretvalue1234"), "leaked:\n{raw}");
     }
 
@@ -771,7 +771,7 @@ mod tests {
             .unwrap();
         r.finish(RunStatus::Ok).unwrap();
 
-        let raw = std::fs::read_to_string(dir.path().join("deploy.jsonl")).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("swapdock.jsonl")).unwrap();
         assert!(!raw.contains("ghp_abcdefghijklmnop1234"), "leaked:\n{raw}");
     }
 
@@ -788,7 +788,7 @@ mod tests {
             .unwrap_err();
         r.finish(RunStatus::Failed).unwrap();
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let steps = read
             .events
             .iter()
@@ -812,7 +812,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let argv = read
             .events
             .iter()
@@ -843,7 +843,7 @@ mod tests {
         let mut r = run(&dir);
         r.exec(&sh("slow-ok", "sleep 0.2")).unwrap();
 
-        let read = TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
         let ms = read
             .events
             .iter()

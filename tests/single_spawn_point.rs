@@ -120,7 +120,7 @@ fn the_chokepoint_is_actually_used_by_the_cli() {
 #[test]
 fn exec_records_every_outcome() {
     // Guards the four statuses the trace distinguishes. If one is dropped, a
-    // failed deploy becomes invisible in the log.
+    // failed swapdock becomes invisible in the log.
     let source = fs::read_to_string(src_dir().join("exec.rs")).unwrap();
     for variant in ["StepStatus::Ok", "StepStatus::Error", "StepStatus::Timeout"] {
         assert!(

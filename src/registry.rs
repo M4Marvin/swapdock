@@ -3,8 +3,8 @@
 //! Layout on the host:
 //!
 //! ```text
-//! /srv/deploy/apps/portfolio.toml
-//! /srv/deploy/apps/morphotech.toml
+//! /srv/swapdock/apps/portfolio.toml
+//! /srv/swapdock/apps/morphotech.toml
 //! ```
 //!
 //! One file per app rather than one file for all apps, so two concurrent deploys
@@ -67,7 +67,7 @@ pub enum ImageRegistry {
     #[default]
     Ghcr,
     DockerHub,
-    /// A `registry:2` container on the deploy host.
+    /// A `registry:2` container on the swapdock host.
     Local,
 }
 
@@ -202,7 +202,7 @@ pub struct App {
     pub branch: Option<String>,
     /// Local checkout of the app source, when the tool manages it.
     ///
-    /// Used by `deploy sync` (fetch and fast-forward). Absent for apps whose
+    /// Used by `swapdock sync` (fetch and fast-forward). Absent for apps whose
     /// source lives elsewhere or is vendored.
     #[serde(default)]
     pub repo: Option<PathBuf>,
@@ -255,7 +255,7 @@ impl App {
         format!("{}-green", self.compose_svc)
     }
 
-    /// Advances the recorded release after a successful deploy.
+    /// Advances the recorded release after a successful swapdock.
     ///
     /// The previous release becomes the rollback target, so `rollback` is always
     /// one step back with no extra bookkeeping.
@@ -481,7 +481,7 @@ impl App {
                     None => out.push(Problem::error(
                         "health-url-missing",
                         Some(name),
-                        "a container app needs health_url: it is the gate a deploy waits on",
+                        "a container app needs health_url: it is the gate a swapdock waits on",
                     )),
                     Some(u) if !(u.starts_with("http://") || u.starts_with("https://")) => {
                         out.push(Problem::error(
@@ -628,7 +628,7 @@ pub fn load_dir(dir: &Path) -> std::io::Result<Loaded> {
         match toml::from_str::<App>(&raw) {
             Ok(app) => {
                 // The file name is part of the identity: `portfolio.toml` must be
-                // the app named `portfolio`, or `deploy show portfolio` and a
+                // the app named `portfolio`, or `swapdock show portfolio` and a
                 // human reading the directory disagree.
                 if app.name != stem {
                     loaded.problems.push(Problem::error(

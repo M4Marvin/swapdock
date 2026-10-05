@@ -1,6 +1,6 @@
 //! RFC 3339 timestamps with no external dependency.
 //!
-//! A deploy log is only useful if every line carries a timestamp that sorts
+//! A swapdock log is only useful if every line carries a timestamp that sorts
 //! lexicographically and that anyone can read. Storing epoch milliseconds as a
 //! separate integer field alongside the formatted string gives us both: exact
 //! arithmetic for durations, human correlation across machines.
@@ -65,7 +65,7 @@ impl Timestamp {
 ///
 /// Accepts what nginx `$time_iso8601` emits (`2026-10-04T21:02:33+00:00`) as
 /// well as the `Z` form this module writes. Returns `None` for anything else
-/// rather than guessing: a deploy gate must not misread a timestamp.
+/// rather than guessing: a swapdock gate must not misread a timestamp.
 pub fn parse_rfc3339(text: &str) -> Option<i64> {
     let text = text.trim();
     let (datetime, offset) = split_offset(text)?;

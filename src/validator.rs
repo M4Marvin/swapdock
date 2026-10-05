@@ -181,7 +181,7 @@ fn check_live_ports(apps: &[App], out: &mut Vec<Problem>) {
 
 fn check_old_ports(apps: &[App], out: &mut Vec<Problem>) {
     // A rollback target that another app is already serving on is a trap: the
-    // rollback looks fine until the next deploy of the other app.
+    // rollback looks fine until the next swapdock of the other app.
     let live: BTreeMap<u16, &str> = apps
         .iter()
         .filter_map(|a| a.live_port.map(|p| (p, a.name.as_str())))

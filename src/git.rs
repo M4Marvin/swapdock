@@ -26,7 +26,7 @@ pub fn rev_parse(dir: &Path, branch: &str) -> StepSpec {
 }
 
 /// Fast-forwards the checkout to `origin/<branch>`. Refuses when that is not a
-/// fast-forward, which is the correct behaviour for a deploy source: history on
+/// fast-forward, which is the correct behaviour for a swapdock source: history on
 /// the server must never diverge.
 pub fn merge_ff_only(dir: &Path, branch: &str) -> StepSpec {
     StepSpec::new("git-merge", "git")

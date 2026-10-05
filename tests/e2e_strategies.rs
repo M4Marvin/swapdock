@@ -16,8 +16,8 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use deploy::registry::{self, App, ImageRegistry, Kind, Strategy};
-use deploy::{Ctx, Run, RunMode};
+use swapdock::registry::{self, App, ImageRegistry, Kind, Strategy};
+use swapdock::{Ctx, Run, RunMode};
 use tempfile::TempDir;
 
 /// Serializes this file's tests. See the module docs for why.
@@ -152,9 +152,9 @@ impl Estate {
         for a in &apps {
             problems.extend(a.problems());
         }
-        problems.extend(deploy::validator::validate(
+        problems.extend(swapdock::validator::validate(
             &apps,
-            &deploy::validator::TunnelRoutes::new(),
+            &swapdock::validator::TunnelRoutes::new(),
         ));
         for p in &problems {
             eprintln!("NEW-STATE PROBLEM {p}");
@@ -167,9 +167,9 @@ impl Estate {
         for a in &loaded.apps {
             problems.extend(a.problems());
         }
-        problems.extend(deploy::validator::validate(
+        problems.extend(swapdock::validator::validate(
             &loaded.sorted(),
-            &deploy::validator::TunnelRoutes::new(),
+            &swapdock::validator::TunnelRoutes::new(),
         ));
         for p in &problems {
             eprintln!("PROBLEM {p}");
@@ -224,7 +224,7 @@ impl Estate {
             registry_dir: self.registry_dir(),
             state_dir: self.dir.path().join("green"),
             lock_dir: self.dir.path().join("locks"),
-            apply_paths: deploy::apply::ApplyPaths {
+            apply_paths: swapdock::apply::ApplyPaths {
                 nginx_bin: self.dir.path().join("nginx"),
                 main_config: self.compose_dir().join("nginx.conf"),
                 target: self.dir.path().join("front-door.conf"),
@@ -236,13 +236,13 @@ impl Estate {
     }
 
     fn run(&self) -> Run {
-        let log = deploy::TraceLog::open(self.dir.path().join("deploy.jsonl")).unwrap();
+        let log = swapdock::TraceLog::open(self.dir.path().join("swapdock.jsonl")).unwrap();
         Run::start(
             log,
             RunMode::Live,
             Some("e2e".into()),
-            &["deploy".to_string()],
-            deploy::Redactor::new(),
+            &["swapdock".to_string()],
+            swapdock::Redactor::new(),
         )
         .unwrap()
     }
@@ -267,7 +267,7 @@ impl Estate {
     fn assert_serves(port: u16) {
         let mut last = String::new();
         for _ in 0..30 {
-            match deploy::health::http_status("127.0.0.1", port, "/") {
+            match swapdock::health::http_status("127.0.0.1", port, "/") {
                 Ok(200) => return,
                 Ok(code) => last = format!("HTTP {code}"),
                 Err(e) => last = e,
@@ -313,20 +313,20 @@ fn swap_deploys_twice_and_retires_the_old() {
     let ctx = estate.ctx();
     let release1 = estate.new_release(&app, 1);
 
-    // First deploy: nothing live, starts on the pair's first port.
+    // First swapdock: nothing live, starts on the pair's first port.
     let mut run = estate.run();
-    deploy::run_swap(&mut run, &ctx, &mut app, &release1).unwrap();
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    swapdock::run_swap(&mut run, &ctx, &mut app, &release1).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     let live1 = app.live_port.unwrap();
     assert_eq!(live1, 9200, "slot 100 starts on 9200");
     Estate::assert_serves(live1);
 
-    // Second deploy: green on the other port, flip, retire.
+    // Second swapdock: green on the other port, flip, retire.
     let release2 = estate.new_release(&app, 2);
     let mut run = estate.run();
-    deploy::run_swap(&mut run, &ctx, &mut app, &release2).unwrap();
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    swapdock::run_swap(&mut run, &ctx, &mut app, &release2).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     let live2 = app.live_port.unwrap();
     assert_eq!(live2, 9201, "the flip must move to the other port");
@@ -380,11 +380,11 @@ fn replace_restarts_on_the_same_port() {
     // Replace it with release 2 on the same port.
     let release2 = estate.new_release(&app, 2);
     let mut run = estate.run();
-    if let Err(e) = deploy::run_replace(&mut run, &ctx, &mut app, &release2) {
+    if let Err(e) = swapdock::run_replace(&mut run, &ctx, &mut app, &release2) {
         estate.dump_problems();
         panic!("replace failed: {e:?}");
     }
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     assert_eq!(app.live_port, Some(9200), "replace keeps the port");
     assert_eq!(app.release.as_deref(), Some(release2.as_str()));
@@ -403,22 +403,22 @@ fn rollback_redeploys_the_previous_release() {
 
     let r1 = estate.new_release(&app, 1);
     let mut run = estate.run();
-    deploy::run_swap(&mut run, &ctx, &mut app, &r1).unwrap();
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    swapdock::run_swap(&mut run, &ctx, &mut app, &r1).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     let r2 = estate.new_release(&app, 2);
     let mut run = estate.run();
-    if let Err(e) = deploy::run_swap(&mut run, &ctx, &mut app, &r2) {
+    if let Err(e) = swapdock::run_swap(&mut run, &ctx, &mut app, &r2) {
         estate.dump_problems();
         estate.dump_new_state(9201);
         panic!("second swap failed: {e:?}");
     }
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
     assert_eq!(app.release.as_deref(), Some(r2.as_str()));
 
     let mut run = estate.run();
-    let back = deploy::rollback(&mut run, &ctx, &mut app).unwrap();
-    run.finish(deploy::RunStatus::Ok).unwrap();
+    let back = swapdock::rollback(&mut run, &ctx, &mut app).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     assert_eq!(back, r1);
     assert_eq!(app.release.as_deref(), Some(r1.as_str()));
@@ -458,17 +458,17 @@ fn sync_clones_fetches_and_fast_forwards() {
     let origin = git_origin(dir.path(), "syncapp");
     let repo = dir.path().join("checkout");
 
-    let log = deploy::TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+    let log = swapdock::TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
     let mut run = Run::start(
         log,
         RunMode::Live,
         None,
-        &["deploy".to_string()],
-        deploy::Redactor::new(),
+        &["swapdock".to_string()],
+        swapdock::Redactor::new(),
     )
     .unwrap();
 
-    let mut app = deploy::registry::App {
+    let mut app = swapdock::registry::App {
         name: "syncapp".into(),
         kind: Kind::Container,
         strategy: Strategy::Swap,
@@ -512,7 +512,7 @@ fn sync_clones_fetches_and_fast_forwards() {
         .unwrap();
     assert!(out.status.success());
 
-    let sha = deploy::deploy::sync_repo(&mut run, &app).unwrap();
+    let sha = swapdock::deploy::sync_repo(&mut run, &app).unwrap();
     assert_eq!(sha.len(), 40, "full commit name: {sha}");
 
     let head = Command::new("git")
@@ -524,7 +524,7 @@ fn sync_clones_fetches_and_fast_forwards() {
 
     // Dirty checkout refuses.
     std::fs::write(repo.join("uncommitted.txt"), "x").unwrap();
-    let err = deploy::deploy::sync_repo(&mut run, &app).unwrap_err();
+    let err = swapdock::deploy::sync_repo(&mut run, &app).unwrap_err();
     assert!(err.to_string().contains("uncommitted"), "{err}");
 }
 
@@ -595,19 +595,19 @@ fn build_local_clones_checks_out_and_builds() {
         repo: None,
     };
 
-    let log = deploy::TraceLog::open(dir.path().join("deploy.jsonl")).unwrap();
+    let log = swapdock::TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
     let mut run = Run::start(
         log,
         RunMode::Live,
         None,
-        &["deploy".to_string()],
-        deploy::Redactor::new(),
+        &["swapdock".to_string()],
+        swapdock::Redactor::new(),
     )
     .unwrap();
 
     let built =
-        deploy::builder::build_local(&mut run, &app, &sha, &dir.path().join("work")).unwrap();
-    run.finish(deploy::RunStatus::Ok).unwrap();
+        swapdock::builder::build_local(&mut run, &app, &sha, &dir.path().join("work")).unwrap();
+    run.finish(swapdock::RunStatus::Ok).unwrap();
 
     assert_eq!(built.release, sha);
     assert_eq!(built.image_ref, format!("e2e-buildapp:{sha}"));
@@ -626,12 +626,12 @@ fn build_local_clones_checks_out_and_builds() {
     );
 
     // The trace shows clone, checkout, build — and no push for a local image.
-    let read = deploy::TraceLog::read(dir.path().join("deploy.jsonl")).unwrap();
+    let read = swapdock::TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
     let steps: Vec<&str> = read
         .events
         .iter()
         .filter_map(|e| match e {
-            deploy::trace::TraceEvent::Step { step, .. } => Some(step.as_str()),
+            swapdock::trace::TraceEvent::Step { step, .. } => Some(step.as_str()),
             _ => None,
         })
         .collect();
@@ -659,18 +659,18 @@ fn swap_on_a_stateful_app_is_refused_before_anything_starts() {
     let ctx = estate.ctx();
     let release = estate.new_release(&app, 1);
     let mut run = estate.run();
-    let err = deploy::run_swap(&mut run, &ctx, &mut app, &release).unwrap_err();
+    let err = swapdock::run_swap(&mut run, &ctx, &mut app, &release).unwrap_err();
     assert!(
-        matches!(err, deploy::DeployError::ValidationFailed(_)),
+        matches!(err, swapdock::DeployError::ValidationFailed(_)),
         "expected a validation refusal, got {err:?}"
     );
 
     // Nothing started: no container publishes anything.
     assert!(Estate::published_back_ports().is_empty());
     // And the trace says where it stopped.
-    let read = deploy::TraceLog::read(estate.dir.path().join("deploy.jsonl")).unwrap();
+    let read = swapdock::TraceLog::read(estate.dir.path().join("swapdock.jsonl")).unwrap();
     assert!(read.events.iter().any(|e| matches!(
         e,
-        deploy::trace::TraceEvent::Step { step, .. } if step == "refuse-broken-estate"
+        swapdock::trace::TraceEvent::Step { step, .. } if step == "refuse-broken-estate"
     )));
 }

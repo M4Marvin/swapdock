@@ -34,7 +34,7 @@ pub fn pull(compose_file: &Path, project: &str, service: &str) -> StepSpec {
 /// Starts one service detached, without touching its dependencies.
 ///
 /// `--no-deps` matters: without it compose may recreate dependencies of the
-/// service, which turns a one-app deploy into a multi-app event. `--wait` is a
+/// service, which turns a one-app swapdock into a multi-app event. `--wait` is a
 /// backstop; the explicit health gate in `health.rs` is what reports clearly.
 pub fn up_detached(
     compose_file: &Path,
@@ -103,13 +103,13 @@ mod tests {
 
     #[test]
     fn extra_files_come_before_the_subcommand() {
-        let extra = PathBuf::from("/srv/deploy/green/portfolio.yml");
+        let extra = PathBuf::from("/srv/swapdock/green/portfolio.yml");
         let spec = up_detached(&file(), "apps-green", &[extra.as_path()], "portfolio");
         let argv = spec.full_argv();
         let up_pos = argv.iter().position(|a| a == "up").unwrap();
         let extra_pos = argv
             .iter()
-            .position(|a| a == "/srv/deploy/green/portfolio.yml")
+            .position(|a| a == "/srv/swapdock/green/portfolio.yml")
             .unwrap();
         assert!(
             extra_pos < up_pos,

@@ -14,11 +14,11 @@
 //! ```
 //!
 //! Resolution order for which one runs: `--build-host`, then
-//! `DEPLOY_BUILD_HOST`, then the app's `build_host`, then local. The string
+//! `SWAPDOCK_BUILD_HOST`, then the app's `build_host`, then local. The string
 //! `local` and an empty value both mean this machine; anything else is an SSH
 //! destination.
 //!
-//! `deploy build` prints the image reference and the release. It does not touch
+//! `swapdock build` prints the image reference and the release. It does not touch
 //! the registry: building is not deploying, and conflating them is how a bad
 //! build becomes a bad release without anyone deciding.
 

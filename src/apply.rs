@@ -588,12 +588,12 @@ exit 2
             // A relative journal would put the fake's marker file in the
             // working directory instead of the temp dir.
             debug_assert!(self.journal.is_absolute(), "journal must be absolute");
-            let log = TraceLog::open(self.dir.path().join("deploy.jsonl")).unwrap();
+            let log = TraceLog::open(self.dir.path().join("swapdock.jsonl")).unwrap();
             let mut run = Run::start(
                 log,
                 RunMode::Live,
                 Some("test".into()),
-                &["deploy".to_string()],
+                &["swapdock".to_string()],
                 Redactor::new(),
             )
             .unwrap();
@@ -781,12 +781,12 @@ exit 2
     #[test]
     fn dry_run_touches_nothing_and_spawns_nothing() {
         let h = Harness::new();
-        let log = TraceLog::open(h.dir.path().join("deploy.jsonl")).unwrap();
+        let log = TraceLog::open(h.dir.path().join("swapdock.jsonl")).unwrap();
         let mut run = Run::start(
             log,
             RunMode::DryRun,
             None,
-            &["deploy".into()],
+            &["swapdock".into()],
             Redactor::new(),
         )
         .unwrap();
@@ -799,7 +799,7 @@ exit 2
         assert!(!h.paths.staging().exists(), "no staging file");
         assert!(!h.dir.path().join("journal").exists(), "nginx never ran");
 
-        let read = TraceLog::read(h.dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(h.dir.path().join("swapdock.jsonl")).unwrap();
         assert!(
             read.events.iter().any(|e| matches!(
                 e,
@@ -818,7 +818,7 @@ exit 2
         apply(&mut run, NEW, &h.paths).unwrap();
         run.finish(RunStatus::Ok).unwrap();
 
-        let read = TraceLog::read(h.dir.path().join("deploy.jsonl")).unwrap();
+        let read = TraceLog::read(h.dir.path().join("swapdock.jsonl")).unwrap();
         let steps: Vec<&str> = read
             .events
             .iter()

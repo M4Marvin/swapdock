@@ -2,7 +2,7 @@
 //!
 //! Back-end ports are derived from a slot rather than found by scanning for a
 //! free port. Scanning races: two concurrent deploys can pick the same port, and
-//! a deploy that dies mid-flight leaves an orphan holding one that a later deploy
+//! a swapdock that dies mid-flight leaves an orphan holding one that a later swapdock
 //! then reuses. Deriving makes collision impossible by construction.
 //!
 //! Each app owns two back ports for life:
@@ -14,7 +14,7 @@
 //! slot 13 ->  9026, 9027
 //! ```
 //!
-//! A deploy uses whichever port of the pair is not live, so the two are blue and
+//! A swapdock uses whichever port of the pair is not live, so the two are blue and
 //! green and alternate forever.
 
 use std::ops::RangeInclusive;
@@ -52,7 +52,7 @@ pub fn pair(slot: u8) -> Result<(u16, u16), PortError> {
 
 /// The port of `slot`'s pair that is not `current`.
 ///
-/// This is how a deploy picks its target: give it the live port, get the other.
+/// This is how a swapdock picks its target: give it the live port, get the other.
 pub fn other(slot: u8, current: u16) -> Result<u16, PortError> {
     let (a, b) = pair(slot)?;
     match current {

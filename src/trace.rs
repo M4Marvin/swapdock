@@ -1,12 +1,12 @@
 //! The append-only run log.
 //!
 //! One file, JSON Lines, one object per line. Never rewritten, never rotated
-//! in place. That gives three properties the deploy tool depends on:
+//! in place. That gives three properties the swapdock tool depends on:
 //!
 //! * **Traceable** — every subprocess lands here with its argv, exit code and
 //!   duration, in order, tagged with the run that caused it.
 //! * **Resumable** — the last step recorded for a run id is where a crashed
-//!   deploy picks up, so recovery reads the log instead of guessing.
+//!   swapdock picks up, so recovery reads the log instead of guessing.
 //! * **Observable** — `grep <run_id>` reconstructs a run; `grep '"status":"error"'`
 //!   finds every failure across all history.
 //!
@@ -204,7 +204,7 @@ impl TraceLog {
         Ok(Read { events, damaged })
     }
 
-    /// Finds where a run stopped, for `deploy resume`.
+    /// Finds where a run stopped, for `swapdock resume`.
     pub fn resume_point(
         path: impl AsRef<Path>,
         run_id: &RunId,
@@ -452,13 +452,13 @@ mod tests {
     }
 
     fn start_run(dir: &TempDir, mode: RunMode) -> (Run, PathBuf) {
-        let path = dir.path().join("nested/deploy.jsonl");
+        let path = dir.path().join("nested/swapdock.jsonl");
         let log = TraceLog::open(&path).expect("open log");
         let run = Run::start(
             log,
             mode,
             Some("portfolio".into()),
-            &argv_of(&["deploy", "up", "portfolio"]),
+            &argv_of(&["swapdock", "up", "portfolio"]),
             Redactor::new(),
         )
         .expect("start run");
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn appends_rather_than_truncating() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("deploy.jsonl");
+        let path = dir.path().join("swapdock.jsonl");
 
         for _ in 0..3 {
             let log = TraceLog::open(&path).unwrap();
@@ -528,7 +528,7 @@ mod tests {
                 log,
                 RunMode::Live,
                 None,
-                &argv_of(&["deploy"]),
+                &argv_of(&["swapdock"]),
                 Redactor::new(),
             )
             .unwrap();
@@ -570,13 +570,13 @@ mod tests {
     #[test]
     fn resume_point_reports_the_last_step_of_that_run() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("deploy.jsonl");
+        let path = dir.path().join("swapdock.jsonl");
 
         let mut first = Run::start(
             TraceLog::open(&path).unwrap(),
             RunMode::Live,
             Some("portfolio".into()),
-            &argv_of(&["deploy"]),
+            &argv_of(&["swapdock"]),
             Redactor::new(),
         )
         .unwrap();
@@ -595,7 +595,7 @@ mod tests {
             TraceLog::open(&path).unwrap(),
             RunMode::Live,
             Some("charts".into()),
-            &argv_of(&["deploy"]),
+            &argv_of(&["swapdock"]),
             Redactor::new(),
         )
         .unwrap();
@@ -618,13 +618,13 @@ mod tests {
     #[test]
     fn a_completed_run_reports_its_terminal_status() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("deploy.jsonl");
+        let path = dir.path().join("swapdock.jsonl");
 
         let mut run = Run::start(
             TraceLog::open(&path).unwrap(),
             RunMode::Live,
             None,
-            &argv_of(&["deploy"]),
+            &argv_of(&["swapdock"]),
             Redactor::new(),
         )
         .unwrap();
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn no_secret_reaches_the_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("deploy.jsonl");
+        let path = dir.path().join("swapdock.jsonl");
         let mut redactor = Redactor::new();
         redactor.register("ghp_abcdefghijklmnop1234567890");
 
@@ -655,7 +655,7 @@ mod tests {
             TraceLog::open(&path).unwrap(),
             RunMode::Live,
             None,
-            &argv_of(&["deploy", "login"]),
+            &argv_of(&["swapdock", "login"]),
             redactor,
         )
         .unwrap();
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn timestamps_in_the_log_sort_as_times() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("deploy.jsonl");
+        let path = dir.path().join("swapdock.jsonl");
         let (mut run, _) = start_run(&dir, RunMode::Live);
         let argv = argv_of(&["true"]);
         for seq in 1..=3 {
