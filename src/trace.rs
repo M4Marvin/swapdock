@@ -143,12 +143,22 @@ pub struct TraceLog {
 
 impl TraceLog {
     /// Opens (or creates) the log for appending.
+    ///
+    /// New files are created world-readable. The log is safe to share because
+    /// secrets are redacted before anything is written; relying on root's umask
+    /// instead left the file unreadable to the operator who needs `show`.
+    /// Existing files keep their mode: opening never rechmods.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o644)
+            .open(&path)?;
         Ok(Self { path, file })
     }
 
@@ -482,6 +492,30 @@ mod tests {
             serde_json::from_str::<TraceEvent>(line)
                 .unwrap_or_else(|e| panic!("line must be valid JSON: {line} ({e})"));
         }
+    }
+
+    #[test]
+    fn new_log_files_are_world_readable() {
+        // The operator runs show/runs unprivileged against a log that root
+        // writes. Redaction (not file mode) is what keeps secrets out of it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("deploy.jsonl");
+        let _ = TraceLog::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "new log files must be readable, got {mode:o}");
+    }
+
+    #[test]
+    fn opening_never_rechmods_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("deploy.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = TraceLog::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing modes must be left alone");
     }
 
     #[test]
