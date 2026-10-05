@@ -1,25 +1,19 @@
-tunnel: ffd206b8-f950-4b32-bdaa-81e414ee7546
-credentials-file: /home/marv/.cloudflared/ffd206b8-f950-4b32-bdaa-81e414ee7546.json
+# Example tunnel config. The tunnel id is fictional; replace it with yours.
+# swapdock only reads the hostname-to-port routes below.
+tunnel: 11111111-2222-3333-4444-555555555555
+credentials-file: /home/user/.cloudflared/11111111-2222-3333-4444-555555555555.json
 
 ingress:
-  - hostname: m4marvin.com
+  - hostname: example.com
     service: http://localhost:8001
-  - hostname: chat.m4marvin.com
+  - hostname: shop.example.com
     service: http://localhost:8002
-  - hostname: chats.m4marvin.com
-    service: http://localhost:8007
-  - hostname: git.m4marvin.com
+  - hostname: www.shop.example.com
+    service: http://localhost:8002
+  - hostname: docs.example.com
     service: http://localhost:8003
-  - hostname: vault.m4marvin.com
+  - hostname: git.example.com
     service: http://localhost:8004
-  - hostname: status.m4marvin.com
+  - hostname: chat.example.com
     service: http://localhost:8005
-  - hostname: charts.m4marvin.com
-    service: http://localhost:8006
-  - hostname: files.m4marvin.com
-    service: http://localhost:8009
-  - hostname: morphotechdata.com
-    service: http://localhost:8012
-  - hostname: www.morphotechdata.com
-    service: http://localhost:8012
   - service: http_status:404

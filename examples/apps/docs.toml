@@ -1,0 +1,13 @@
+name = "docs"
+kind = "static"
+strategy = "swap"
+hostnames = ["docs.example.com"]
+listen = ["127.0.0.1"]
+front_port = 8003
+slot = 2
+writes_state = false
+root = "/srv/www/docs/current"
+compose_dir = "/srv/example/compose"
+compose_svc = "docs"
+env_name = "DOCS_PORT"
+branch = "main"

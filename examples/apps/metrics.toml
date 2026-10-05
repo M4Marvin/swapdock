@@ -1,0 +1,16 @@
+# Not routed through the tunnel: internal only, on the private address.
+name = "metrics"
+kind = "container"
+strategy = "replace"
+hostnames = []
+listen = ["192.0.2.10"]
+front_port = 8006
+slot = 5
+writes_state = true
+image_repo = "example-metrics"
+build_host = "local"
+health_url = "http://127.0.0.1:9090/-/healthy"
+compose_dir = "/srv/example/compose"
+compose_svc = "metrics"
+env_name = "METRICS_PORT"
+branch = "main"

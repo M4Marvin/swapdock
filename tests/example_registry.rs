@@ -1,14 +1,15 @@
-//! Tests against the real registry in `examples/`.
+//! Tests against the fictional estate in `examples/`.
 //!
-//! The unit tests prove the logic. These prove the *data* — the 13 apps actually
-//! running on the swapdock host, cross-checked against the tunnel config that is
-//! actually in use. That turns "the validator works" into "the validator agrees
-//! with production", and catches a hand-edited registry file immediately.
+//! The unit tests prove the logic. These prove the *shape* — six apps covering
+//! every supported configuration (swap, replace with state, static files, a
+//! dual-homed service, an unrouted internal), cross-checked against a matching
+//! tunnel config. A newcomer reads these as documentation; a broken example
+//! fails the build instead of misleading them.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use swapdock::registry::{self, App};
+use swapdock::registry::{self, App, Kind};
 use swapdock::render;
 use swapdock::tunnel;
 use swapdock::validator::{self, TunnelRoutes};
@@ -19,21 +20,14 @@ fn examples(sub: &str) -> PathBuf {
         .join(sub)
 }
 
-/// The real apps, with the ports the tunnel sends them to.
+/// The fictional apps, with the ports the tunnel sends them to.
 const EXPECTED_APPS: &[(&str, u16)] = &[
-    ("portfolio", 8001),
-    ("morphotech", 8012),
-    ("charts", 8006),
-    ("forgejo", 8003),
-    ("vaultwarden", 8004),
-    ("kuma", 8005),
-    ("copyparty", 8009),
-    ("chat", 8002),
-    ("chats", 8007),
-    ("beszel", 8008),
-    ("zeroclaw", 42617),
-    ("ui", 8011),
-    ("api", 8010),
+    ("site", 8001),
+    ("shop", 8002),
+    ("docs", 8003),
+    ("git", 8004),
+    ("chat", 8005),
+    ("metrics", 8006),
 ];
 
 fn load() -> registry::Loaded {
@@ -55,6 +49,11 @@ fn the_example_registry_loads_without_a_single_problem() {
         loaded.problems
     );
     assert_eq!(loaded.apps.len(), EXPECTED_APPS.len(), "app count changed");
+    let mut names: Vec<&str> = loaded.apps.iter().map(|a| a.name.as_str()).collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = EXPECTED_APPS.iter().map(|(n, _)| *n).collect();
+    expected.sort_unstable();
+    assert_eq!(names, expected, "estate membership changed");
 }
 
 #[test]
@@ -99,11 +98,11 @@ fn the_front_ports_match_the_live_tunnel_config() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 10, "the tunnel routes 10 hostnames");
+    assert_eq!(checked, 6, "the tunnel routes 6 hostnames");
 }
 
 #[test]
-fn no_tunnel_route_is_orphaned_in_the_real_data() {
+fn no_tunnel_route_is_orphaned_in_the_example_data() {
     let apps = load().sorted();
     let problems = validator::validate(&apps, &routes());
     let orphans: Vec<&str> = problems
@@ -130,7 +129,7 @@ fn the_real_registry_has_no_errors() {
     validator::sort_problems(&mut problems);
 
     let (errors, warnings) = validator::counts(&problems);
-    assert_eq!(errors, 0, "real registry has errors: {problems:#?}");
+    assert_eq!(errors, 0, "example registry has errors: {problems:#?}");
     // Apps with no hostname yet are the only thing tolerated here.
     assert!(
         problems
@@ -138,7 +137,7 @@ fn the_real_registry_has_no_errors() {
             .all(|p| p.severity == registry::Severity::Warning),
         "unexpected warnings: {problems:#?}"
     );
-    assert_eq!(warnings, 4, "the four apps with no hostname yet");
+    assert_eq!(warnings, 1, "only metrics has no hostname yet");
 }
 
 #[test]
@@ -146,7 +145,7 @@ fn every_slot_is_distinct() {
     let apps = load().sorted();
     let slots: BTreeSet<u8> = apps.iter().map(|a| a.slot).collect();
     assert_eq!(slots.len(), apps.len(), "two apps share a slot");
-    assert_eq!(*slots.iter().next_back().unwrap(), 12, "slots 0..=12");
+    assert_eq!(*slots.iter().next_back().unwrap(), 5, "slots 0..=5");
 }
 
 #[test]
@@ -168,43 +167,41 @@ fn every_stateful_app_uses_replace() {
 #[test]
 fn only_the_stateless_apps_are_swapped() {
     let loaded = load();
-    let swapped: Vec<&str> = loaded
+    let mut swapped: Vec<&str> = loaded
         .apps
         .iter()
         .filter(|a| a.strategy == registry::Strategy::Swap)
         .map(|a| a.name.as_str())
         .collect();
-    assert_eq!(
-        swapped,
-        ["morphotech", "portfolio"],
-        "swap candidates changed"
-    );
+    swapped.sort_unstable();
+    assert_eq!(swapped, ["docs", "site"], "swap candidates changed");
 }
 
 #[test]
-fn chat_binds_loopback_and_the_tailnet() {
+fn chat_binds_loopback_and_the_private_net() {
+    // 192.0.2.10 is TEST-NET-1 (RFC 5737): documentation-only, never routed.
     let apps = load().sorted();
     let chat = apps.iter().find(|a| a.name == "chat").expect("chat");
     assert_eq!(
         chat.listen_addrs(),
-        vec!["127.0.0.1".to_string(), "100.80.96.4".to_string()],
-        "chat must stay reachable over the tailnet"
+        vec!["127.0.0.1".to_string(), "192.0.2.10".to_string()],
+        "chat must stay reachable on the private address"
     );
 }
 
 #[test]
-fn beszel_is_tailnet_only() {
+fn metrics_is_private_only() {
     let apps = load().sorted();
-    let beszel = apps.iter().find(|a| a.name == "beszel").expect("beszel");
-    assert_eq!(beszel.listen_addrs(), vec!["100.80.96.4".to_string()]);
+    let metrics = apps.iter().find(|a| a.name == "metrics").expect("metrics");
+    assert_eq!(metrics.listen_addrs(), vec!["192.0.2.10".to_string()]);
     assert!(
-        beszel.hostnames.is_empty(),
-        "beszel is not routed through the tunnel"
+        metrics.hostnames.is_empty(),
+        "metrics is not routed through the tunnel"
     );
 }
 
 #[test]
-fn rendering_the_real_registry_is_deterministic() {
+fn rendering_the_example_registry_is_deterministic() {
     let apps = load().sorted();
     let first = render::render(&apps);
     let second = render::render(&load().sorted());
@@ -218,9 +215,10 @@ fn rendering_the_real_registry_is_deterministic() {
 
 #[test]
 fn nothing_is_fronted_yet_so_no_listener_is_emitted() {
-    // Today every container still publishes its own front port, so nginx cannot
-    // bind any of them. Rendering blocks for all of them would be a config that
-    // fails to load.
+    // The example estate starts unmigrated: every container still publishes its
+    // own front port, so nginx cannot bind any of them. Rendering blocks for
+    // all of them would be a config that fails to load. Static apps have no
+    // port at all, so docs is the one block that does render.
     let apps = load().sorted();
     assert!(
         apps.iter().all(|a: &App| a.live_port.is_none()),
@@ -228,9 +226,17 @@ fn nothing_is_fronted_yet_so_no_listener_is_emitted() {
     );
 
     let out = render::render(&apps);
-    assert!(!out.contains("server {"), "{out}");
-    assert!(!out.contains("listen "), "{out}");
-    assert_eq!(out.matches("# not yet fronted").count(), apps.len());
+    let containers: Vec<&App> = apps
+        .iter()
+        .filter(|a| a.kind == registry::Kind::Container)
+        .collect();
+    assert_eq!(out.matches("server {").count(), 1, "only docs renders: {out}");
+    assert!(out.contains("root /srv/www/docs/current;"), "{out}");
+    assert_eq!(
+        out.matches("# not yet fronted").count(),
+        containers.len(),
+        "{out}"
+    );
 }
 
 #[test]
@@ -239,17 +245,17 @@ fn a_migrated_app_renders_a_block_pointing_at_its_back_port() {
     let mut app = loaded
         .apps
         .into_iter()
-        .find(|a| a.name == "portfolio")
-        .expect("portfolio");
-    app.live_port = Some(9001);
-    app.old_port = Some(9000);
-    app.release = Some("9c1f2ab".into());
+        .find(|a| a.name == "site")
+        .expect("site");
+    app.live_port = Some(9000);
+    app.old_port = Some(9001);
+    app.release = Some("abc1234".into());
 
     let out = render::render(&[app]);
     assert!(out.contains("listen 127.0.0.1:8001;"), "{out}");
-    assert!(out.contains("proxy_pass http://127.0.0.1:9001;"), "{out}");
-    assert!(out.contains("server_name m4marvin.com;"), "{out}");
-    assert!(out.contains("release 9c1f2ab"), "{out}");
+    assert!(out.contains("proxy_pass http://127.0.0.1:9000;"), "{out}");
+    assert!(out.contains("server_name example.com;"), "{out}");
+    assert!(out.contains("release abc1234"), "{out}");
     assert!(!out.contains("not yet fronted"), "{out}");
 }
 

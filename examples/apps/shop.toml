@@ -1,0 +1,17 @@
+name = "shop"
+kind = "container"
+strategy = "replace"
+hostnames = ["shop.example.com", "www.shop.example.com"]
+listen = ["127.0.0.1"]
+front_port = 8002
+slot = 1
+writes_state = true
+image_repo = "example-shop"
+build_host = "local"
+health_url = "http://127.0.0.1:3000/api/health"
+compose_dir = "/srv/example/compose"
+compose_svc = "shop"
+env_name = "SHOP_PORT"
+git_remote = "example-org/shop"
+branch = "main"
+repo = "/srv/example/shop"

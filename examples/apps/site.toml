@@ -1,0 +1,17 @@
+name = "site"
+kind = "container"
+strategy = "swap"
+hostnames = ["example.com"]
+listen = ["127.0.0.1"]
+front_port = 8001
+slot = 0
+writes_state = false
+image_repo = "example-site"
+build_host = "local"
+health_url = "http://127.0.0.1/"
+compose_dir = "/srv/example/compose"
+compose_svc = "site"
+env_name = "SITE_PORT"
+git_remote = "example-org/site"
+branch = "main"
+repo = "/srv/example/site"
