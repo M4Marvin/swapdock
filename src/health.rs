@@ -184,7 +184,7 @@ fn wait_healthy(run: &mut Run, step_prefix: &str, container: &str) -> Result<(),
     }
 }
 
-/// GETs `path` on `port` until it returns 2xx or 3xx.
+/// GETs `path` on `port` until it returns 2xx.
 fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), HealthError> {
     let url = format!("http://127.0.0.1:{port}{path}");
     // Intentional initial value, shown if no poll ever completes: the assignment
@@ -195,7 +195,7 @@ fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), 
 
     for attempt in 1..=PROBE_ATTEMPTS {
         match http_status("127.0.0.1", port, path) {
-            Ok(code) if (200..400).contains(&code) => {
+            Ok(code) if (200..300).contains(&code) => {
                 let seq = run.next_seq();
                 run.record_step(
                     crate::trace::StepRecord::new(
@@ -212,6 +212,9 @@ fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), 
                 )
                 .map_err(|e| HealthError::Exec(ExecError::Trace(e)))?;
                 return Ok(());
+            }
+            Ok(code) if (300..400).contains(&code) => {
+                last = format!("HTTP {code} redirect; a health endpoint must answer directly, without one")
             }
             Ok(code) => last = format!("HTTP {code}"),
             Err(e) => last = e,
