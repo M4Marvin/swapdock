@@ -139,11 +139,15 @@ fn render_app(out: &mut String, app: &App) {
         out.push_str("# so nginx cannot bind it yet. First-run path:\n");
         match app.strategy {
             crate::registry::Strategy::Swap => {
-                out.push_str("#   swapdock up <name> --release <sha>: starts the green container,\n");
+                out.push_str(
+                    "#   swapdock up <name> --release <sha>: starts the green container,\n",
+                );
                 out.push_str("#   health-gates it, then steps nginx in front of it.\n");
             }
             crate::registry::Strategy::Replace => {
-                out.push_str("#   replace apps cannot self-adopt: point compose's port mapping at\n");
+                out.push_str(
+                    "#   replace apps cannot self-adopt: point compose's port mapping at\n",
+                );
                 out.push_str("#   this app's slot pair, restart the container, then record\n");
                 out.push_str("#   release and live_port in the registry, then `swapdock apply`.\n");
             }
