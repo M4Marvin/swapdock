@@ -58,7 +58,7 @@ pub fn render(apps: &[App]) -> String {
     out.push_str("# Regenerating is safe. This file holds no hand edits.\n");
     out.push_str("#\n");
     out.push_str("# Include this file from inside `http {}`; the log_format, the\n");
-    out.push_str("# Upgrade map and client_max_body_size live in conf.d/swapdock-http.conf.\n");
+    out.push_str("# Upgrade map and client_max_body_size live in conf.d/00-swapdock-http.conf.\n");
 
     if sorted.is_empty() {
         out.push_str("#\n# No apps in the registry.\n");
@@ -634,7 +634,7 @@ mod tests {
 # Regenerating is safe. This file holds no hand edits.
 #
 # Include this file from inside `http {}`; the log_format, the
-# Upgrade map and client_max_body_size live in conf.d/swapdock-http.conf.
+# Upgrade map and client_max_body_size live in conf.d/00-swapdock-http.conf.
 #
 # apps: charts, portfolio
 

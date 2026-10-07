@@ -52,7 +52,7 @@ chmod 0755 /srv/swapdock /srv/swapdock/apps /srv/swapdock/green /var/log/swapdoc
 echo "registry files: $(ls /srv/swapdock/apps/*.toml | wc -l)"
 
 say "install hand-written nginx files"
-for f in snippets/proxy-common.conf conf.d/swapdock-http.conf; do
+for f in snippets/proxy-common.conf conf.d/00-swapdock-http.conf; do
     src="$DIST/nginx/$(basename "$f")"
     dst="/etc/nginx/$f"
     if test -e "$dst"; then

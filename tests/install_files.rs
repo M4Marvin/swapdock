@@ -39,7 +39,7 @@ fn hand_written_nginx_files_pass_nginx_t() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
 
-    for name in ["swapdock-http.conf", "proxy-common.conf"] {
+    for name in ["00-swapdock-http.conf", "proxy-common.conf"] {
         let src = install_dir().join("nginx").join(name);
         assert!(src.exists(), "missing install/nginx/{name}");
         std::fs::copy(src, root.join(name)).unwrap();
@@ -48,7 +48,7 @@ fn hand_written_nginx_files_pass_nginx_t() {
         std::fs::create_dir(root.join(sub)).unwrap();
     }
 
-    // Mirrors how the host uses them: swapdock-http.conf at http level,
+    // Mirrors how the host uses them: 00-swapdock-http.conf at http level,
     // proxy-common.conf inside a location block.
     std::fs::write(
         root.join("nginx.conf"),
@@ -60,7 +60,7 @@ fn hand_written_nginx_files_pass_nginx_t() {
              fastcgi_temp_path {root}/fc;\n  \
              uwsgi_temp_path {root}/uw;\n  \
              scgi_temp_path {root}/sc;\n  \
-             include {root}/swapdock-http.conf;\n  \
+             include {root}/00-swapdock-http.conf;\n  \
              server {{\n    \
              listen 127.0.0.1:18999;\n    \
              location / {{\n      \
