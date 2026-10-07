@@ -169,6 +169,14 @@ end-to-end strategies against real containers, and a test that fails the build
 if any module besides `exec.rs` spawns a process. The `examples/` estate is
 covered by tests too, so the documentation cannot drift from the validator.
 
+## Ops notes
+
+- Old release tags stay in the server's image store (`charon:<previous-sha>`,
+  `charon:rollback-pre-…`). Prune them periodically; nothing in swapdock
+  deletes images yet.
+- The registry files are owned by the deploy user. Swapdock rewrites them
+  in place as root but preserves their mode and owner.
+
 ## License
 
 MIT — see [LICENSE-MIT](LICENSE-MIT).
