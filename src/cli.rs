@@ -205,6 +205,15 @@ pub enum Command {
         #[command(flatten)]
         paths: DeployPaths,
     },
+
+    /// Serve the HTTP API instead of one-shot CLI commands.
+    Serve {
+        /// Address to bind, e.g. 127.0.0.1:8088.
+        #[arg(long, default_value = "127.0.0.1:8088", value_name = "ADDR")]
+        bind: String,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
 }
 
 impl Cli {
@@ -259,8 +268,31 @@ impl Command {
                 since,
                 access_log,
             } => verify_app(cli, app, since, access_log),
+            Command::Serve { bind, paths } => serve(cli, bind, paths),
         }
     }
+}
+
+/// `swapdock serve` — the same operations over HTTP. Everything else about the
+/// CLI (paths, dry-run, the run log) already lives on `Cli`, so the server
+/// just forwards it.
+fn serve(cli: &Cli, bind: &str, paths: &DeployPaths) -> anyhow::Result<()> {
+    // The async runtime exists only for the HTTP listener; the handlers block
+    // on their own threads, so nothing inside the runtime needs to be Send.
+    let rt = tokio::runtime::Runtime::new()?;
+    let state = crate::api::ServerState {
+        registry: cli.registry.clone(),
+        trace: cli.trace.clone(),
+        tunnel_config: cli.tunnel_config.clone(),
+        target: paths.target.clone(),
+        main_config: paths.main_config.clone(),
+        pid_file: paths.pid_file.clone(),
+        nginx_bin: paths.nginx_bin.clone(),
+        state_dir: paths.state_dir.clone(),
+        lock_dir: paths.lock_dir.clone(),
+        drain_secs: paths.drain_secs,
+    };
+    rt.block_on(crate::api::serve(state, bind))
 }
 
 fn mode(cli: &Cli) -> RunMode {
@@ -902,7 +934,7 @@ fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()
 
 /// The template `init` writes. Every field is explained where it is used, so a
 /// first registry file teaches the format instead of just filling it.
-fn init_template(name: &str, kind: &str) -> anyhow::Result<String> {
+pub fn init_template(name: &str, kind: &str) -> anyhow::Result<String> {
     if !crate::registry::is_valid_slug(name) {
         anyhow::bail!("{name:?} is not a valid app name: lowercase letters, digits and dashes");
     }

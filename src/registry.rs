@@ -72,7 +72,8 @@ pub enum ImageRegistry {
 }
 
 /// How serious a finding is. Any `Error` makes the command exit non-zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Warning,
     Error,
@@ -91,7 +92,7 @@ impl fmt::Display for Severity {
 ///
 /// `code` is a stable kebab-case slug so findings can be grepped, matched in
 /// tests, and referred to in documentation without depending on wording.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Problem {
     pub severity: Severity,
     pub code: &'static str,

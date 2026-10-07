@@ -28,7 +28,7 @@ use crate::time::parse_rfc3339;
 pub const DEFAULT_ACCESS_LOG: &str = "/var/log/nginx/front-door.access.log";
 
 /// One parsed access-log line.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Entry {
     pub ts_ms: i64,
     pub host: String,
@@ -76,7 +76,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
 }
 
 /// What one upstream did in the window.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UpstreamInfo {
     pub first_ms: i64,
     pub last_ms: i64,
@@ -85,7 +85,7 @@ pub struct UpstreamInfo {
 }
 
 /// The verdict for one app over one window.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct Report {
     /// Lines read, including ones for other hosts.
     pub lines: u64,
@@ -101,7 +101,7 @@ pub struct Report {
 }
 
 /// The moment traffic moved from one upstream to another.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Flip {
     pub at_ms: i64,
     pub from: String,

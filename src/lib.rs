@@ -18,6 +18,7 @@
 //! * [`verify`] — the access-log verdict: failures, upstreams, the flip instant.
 //! * [`builder`] — local, SSH and no-op builders behind one resolution order.
 
+pub mod api;
 pub mod apply;
 pub mod builder;
 pub mod cli;
