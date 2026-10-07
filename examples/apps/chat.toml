@@ -7,6 +7,7 @@ front_port = 8005
 slot = 4
 writes_state = true
 image_repo = "example-chat"
+registry = "local"
 build_host = "local"
 health_url = "http://127.0.0.1:3000/"
 compose_dir = "/srv/example/compose"

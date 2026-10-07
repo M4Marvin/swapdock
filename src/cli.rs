@@ -934,6 +934,9 @@ slot = 0
 writes_state = false
 # Image name; the release tag is appended (repo:release). Omit for static apps.
 image_repo = "{name}"
+# Where images live. "local" when they are built and kept on this host and
+# nothing is pushed or pulled. Defaults to ghcr when omitted.
+registry = "local"
 # Where releases are built: "local" or an SSH destination.
 build_host = "local"
 # Commit currently running. Never "latest": a moving tag has no rollback target.

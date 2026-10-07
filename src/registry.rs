@@ -477,6 +477,14 @@ impl App {
                     )),
                     Some(_) => {}
                 }
+                if self.registry.is_none() {
+                    out.push(Problem::warning(
+                        "registry-unset",
+                        Some(name),
+                        "registry defaults to ghcr: builds push and deploys pull. \
+                         Set registry = \"local\" when images never leave this host",
+                    ));
+                }
                 match &self.health_url {
                     None => out.push(Problem::error(
                         "health-url-missing",
@@ -822,7 +830,7 @@ pub(crate) mod tests {
             old_port: Some(9001),
             writes_state: false,
             image_repo: Some("apps-portfolio".into()),
-            registry: None,
+            registry: Some(ImageRegistry::Local),
             release: Some("9c1f2ab".into()),
             old_release: Some("4d8e0f1".into()),
             build_host: Some("local".into()),
@@ -925,7 +933,10 @@ pub(crate) mod tests {
         assert_eq!(app.image_registry(), ImageRegistry::Ghcr);
         assert_eq!(app.git_branch(), "main");
         assert!(app.release.is_none());
-        assert!(app.problems().is_empty(), "{:?}", app.problems());
+        let problems = app.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].code, "registry-unset");
+        assert_eq!(problems[0].severity, Severity::Warning);
     }
 
     // ---- deny_unknown_fields ----

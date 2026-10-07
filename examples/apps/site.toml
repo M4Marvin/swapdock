@@ -7,6 +7,7 @@ front_port = 8001
 slot = 0
 writes_state = false
 image_repo = "example-site"
+registry = "local"
 build_host = "local"
 health_url = "http://127.0.0.1/"
 compose_dir = "/srv/example/compose"

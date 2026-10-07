@@ -214,7 +214,9 @@ fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), 
                 return Ok(());
             }
             Ok(code) if (300..400).contains(&code) => {
-                last = format!("HTTP {code} redirect; a health endpoint must answer directly, without one")
+                last = format!(
+                    "HTTP {code} redirect; a health endpoint must answer directly, without one"
+                )
             }
             Ok(code) => last = format!("HTTP {code}"),
             Err(e) => last = e,
