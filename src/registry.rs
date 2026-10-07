@@ -674,6 +674,23 @@ pub fn save_app(dir: &Path, app: &App) -> std::io::Result<()> {
         let file = std::fs::File::open(&staging)?;
         file.sync_all()?;
     }
+    // swapdock usually runs as root (the sudoers entry is what allows
+    // `apply` to reload nginx). A staging-file rename would then reset the
+    // registry file to root ownership and the daemon's umask — the operator
+    // loses edit access. Copy the existing file's mode and uid/gid forward
+    // so a rewrite changes content, never access.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&target) {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &staging,
+            std::fs::Permissions::from_mode(meta.mode() & 0o777),
+        );
+        // chown needs privilege; as an unprivileged user the existing
+        // owner already survives the rename, so ignore failures.
+        let _ = std::os::unix::fs::chown(&staging, Some(meta.uid()), Some(meta.gid()));
+    }
     std::fs::rename(&staging, &target)?;
 
     // Prove the write: parse the file back and compare.
@@ -1401,6 +1418,24 @@ pub(crate) mod tests {
         let back: App = toml::from_str(&raw).unwrap();
         assert_eq!(back, app);
         assert!(!dir.path().join(".portfolio.toml.staging").exists());
+    }
+
+    #[test]
+    fn save_app_preserves_the_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let mut app = sample();
+        app.advance("d34db33".into(), 9001);
+        save_app(dir.path(), &app).unwrap();
+
+        let path = dir.path().join("portfolio.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        app.advance("b00b1e5".into(), 9000);
+        save_app(dir.path(), &app).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "rewrite must keep the operator's mode");
     }
 
     #[test]
