@@ -262,7 +262,12 @@ impl App {
     pub fn advance(&mut self, release: String, new_live_port: u16) {
         self.old_release = self.release.take();
         self.release = Some(release);
-        self.old_port = self.live_port;
+        // Only the port that is being replaced is kept as the rollback target.
+        // For replace the port stays, and recording it as its own old_port
+        // would make the estate fail validation (live-equals-old).
+        if self.live_port != Some(new_live_port) {
+            self.old_port = self.live_port;
+        }
         self.live_port = Some(new_live_port);
     }
 
@@ -1353,6 +1358,21 @@ pub(crate) mod tests {
         assert_eq!(app.old_release.as_deref(), Some("9c1f2ab"));
         assert_eq!(app.live_port, Some(9001));
         assert_eq!(app.old_port, Some(9000));
+        assert!(app.problems().is_empty(), "{:?}", app.problems());
+    }
+
+    #[test]
+    fn advance_with_an_unchanged_port_keeps_old_port_clear() {
+        // replace deploys keep the same port; old_port must not become a
+        // copy of live_port, which fails validation as live-equals-old.
+        let mut app = sample();
+        app.strategy = Strategy::Replace;
+        app.writes_state = true;
+        app.slot = 7;
+        app.live_port = Some(9014);
+        app.old_port = None;
+        app.advance("b04926f".into(), 9014);
+        assert_eq!(app.old_port, None);
         assert!(app.problems().is_empty(), "{:?}", app.problems());
     }
 
