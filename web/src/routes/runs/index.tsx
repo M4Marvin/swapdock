@@ -1,7 +1,9 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
-import { api, formatStatus, type RunSummary } from '../../api'
+import { useQuery } from '@tanstack/react-query'
+import { api, formatStatus } from '../../api'
+import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
   TableBody,
@@ -16,27 +18,25 @@ export const Route = createFileRoute('/runs/')({
 })
 
 function Runs() {
-  const [runs, setRuns] = useState<RunSummary[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    const controller = new AbortController()
-    api.runs(50, controller.signal).then(
-      (r) => {
-        if (!controller.signal.aborted) setRuns(r)
-      },
-      (e) => {
-        if (!controller.signal.aborted) setError(String(e))
-      },
-    )
-    return () => controller.abort()
-  }, [])
+  const runsQuery = useQuery({
+    queryKey: queryKeys.runs,
+    queryFn: ({ signal }) => api.runs(50, signal),
+  })
+  const runs = runsQuery.data
 
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-semibold">Runs</h1>
-      {error && <p className="text-destructive">{error}</p>}
-      {!runs && !error && <p className="text-muted-foreground">Loading…</p>}
+      {runsQuery.isError && (
+        <p className="text-destructive">{String(runsQuery.error)}</p>
+      )}
+      {runsQuery.isPending && (
+        <div className="space-y-2">
+          <Skeleton className="h-6 w-full" />
+          <Skeleton className="h-6 w-full" />
+          <Skeleton className="h-6 w-2/3" />
+        </div>
+      )}
       {runs && runs.length === 0 && (
         <p className="text-muted-foreground">No runs recorded yet.</p>
       )}

@@ -1,5 +1,7 @@
 import { Link } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import {
   api,
   cfg,
@@ -11,6 +13,7 @@ import {
   type RunStream,
   type TraceEvent,
 } from '../api'
+import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -120,17 +123,30 @@ export function Pipeline({
   /** Called after a successful deploy, so the page can re-read the registry. */
   onDeployed?: () => void
 }) {
+  const queryClient = useQueryClient()
   const [release, setRelease] = useState('')
-  const [git, setGit] = useState<AppGit | null>(null)
-  const [gitError, setGitError] = useState<string | null>(null)
-  const [images, setImages] = useState<AppImage[]>([])
-  const [imagesError, setImagesError] = useState<string | null>(null)
-  const [transferTarget, setTransferTarget] = useState<string | null>(null)
   const [stages, setStages] = useState<Record<Stage, StageInfo>>({
     build: EMPTY_STAGE,
     transfer: EMPTY_STAGE,
     deploy: EMPTY_STAGE,
   })
+
+  const gitQuery = useQuery({
+    queryKey: queryKeys.git(app.name),
+    queryFn: ({ signal }) => api.appGit(app.name, signal),
+  })
+  const imagesQuery = useQuery({
+    queryKey: queryKeys.images(app.name),
+    queryFn: ({ signal }) => api.appImages(app.name, signal),
+  })
+  const configQuery = useQuery({
+    queryKey: queryKeys.config,
+    queryFn: () => cfg(),
+  })
+
+  const git: AppGit | null = gitQuery.data ?? null
+  const images: AppImage[] = imagesQuery.data?.images ?? []
+  const transferTarget = configQuery.data?.transferTarget ?? null
 
   const streams = useRef<Record<Stage, RunStream | null>>({
     build: null,
@@ -144,46 +160,42 @@ export function Pipeline({
   }
 
   useEffect(() => {
-    const controller = new AbortController()
-    setGit(null)
-    setGitError(null)
-    setImages([])
-    setImagesError(null)
     setStages({ build: EMPTY_STAGE, transfer: EMPTY_STAGE, deploy: EMPTY_STAGE })
     setRelease('')
     closeStreams()
-
-    api.appGit(app.name, controller.signal).then(
-      (g) => {
-        if (controller.signal.aborted) return
-        setGit(g)
-        if (g.remote_sha) setRelease((cur) => cur || g.remote_sha!)
-      },
-      (e) => {
-        if (!controller.signal.aborted) setGitError(String(e))
-      },
-    )
-    api.appImages(app.name, controller.signal).then(
-      (r) => {
-        if (!controller.signal.aborted) setImages(r.images)
-      },
-      (e) => {
-        if (!controller.signal.aborted) setImagesError(String(e))
-      },
-    )
-    cfg().then(
-      (c) => {
-        if (!controller.signal.aborted) setTransferTarget(c.transferTarget)
-      },
-      () => undefined,
-    )
-
-    return () => {
-      controller.abort()
-      closeStreams()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [app.name])
+
+  // Seed the release field from the remote ref once the checkout state loads,
+  // without clobbering a value the user has already typed.
+  useEffect(() => {
+    const remote = gitQuery.data?.remote_sha
+    if (remote) setRelease((cur) => cur || remote)
+  }, [gitQuery.data])
+
+  useEffect(() => {
+    return () => closeStreams()
+  }, [])
+
+  const buildMutation = useMutation({
+    mutationFn: (vars: { release: string }) =>
+      api.build(app.name, vars.release),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+    },
+  })
+  const transferMutation = useMutation({
+    mutationFn: (vars: { release: string; target: string }) =>
+      api.transfer(app.name, vars.release, vars.target),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+    },
+  })
+
+  const releaseValue = release.trim()
+  const releaseInvalid =
+    releaseValue === '' || !RELEASE_RE.test(releaseValue)
+  const imageRef =
+    app.image_repo && releaseValue ? `${app.image_repo}:${releaseValue}` : null
 
   /** POST a stage's run, then tail it, enabling the next stage on `ok`. */
   const start = (stage: Stage, fn: () => Promise<{ run_id: string }>) => {
@@ -197,6 +209,7 @@ export function Pipeline({
           ...cur,
           [stage]: { ...cur[stage], runId: run_id },
         }))
+        queryClient.invalidateQueries({ queryKey: queryKeys.runs })
         const stream = openRunEvents(
           run_id,
           {
@@ -212,9 +225,26 @@ export function Pipeline({
                 ...cur,
                 [stage]: { ...cur[stage], state: 'failed', error: message },
               }))
+              toast.error(`${stage} failed`, { description: message })
             },
             onEnd: (status) => {
               const ok = isOk(status)
+              if (ok) {
+                if (stage === 'build' && imageRef) {
+                  toast.success(`build ok: ${imageRef}`)
+                  queryClient.invalidateQueries({
+                    queryKey: queryKeys.images(app.name),
+                  })
+                }
+                if (stage === 'transfer') toast.success('transfer ok')
+                if (stage === 'deploy') {
+                  toast.success('deploy ok')
+                  onDeployed?.()
+                }
+              } else {
+                const detail = status ? `ended: ${status}` : 'stream closed'
+                toast.error(`${stage} failed`, { description: detail })
+              }
               setStages((cur) => ({
                 ...cur,
                 [stage]: {
@@ -222,11 +252,9 @@ export function Pipeline({
                   state: ok ? 'ok' : 'failed',
                   error: ok
                     ? null
-                    : (cur[stage].error ??
-                      (status ? `ended: ${status}` : 'stream closed')),
+                    : (cur[stage].error ?? (status ? `ended: ${status}` : 'stream closed')),
                 },
               }))
-              if (ok && stage === 'deploy') onDeployed?.()
             },
           },
           stage === 'deploy' ? 'deploy' : 'build',
@@ -235,6 +263,7 @@ export function Pipeline({
         streams.current[stage] = stream
       },
       (e) => {
+        toast.error(`${stage} failed`, { description: String(e) })
         setStages((cur) => ({
           ...cur,
           [stage]: { ...cur[stage], state: 'failed', error: String(e) },
@@ -243,11 +272,6 @@ export function Pipeline({
     )
   }
 
-  const releaseValue = release.trim()
-  const releaseInvalid =
-    releaseValue === '' || !RELEASE_RE.test(releaseValue)
-  const imageRef =
-    app.image_repo && releaseValue ? `${app.image_repo}:${releaseValue}` : null
   const imageExists =
     imageRef != null && images.some((i) => i.ref === imageRef)
   const buildOk = stages.build.state === 'ok'
@@ -299,7 +323,7 @@ export function Pipeline({
               {git.head_sha ? ` · head ${git.head_sha}` : ''}
               {git.dirty ? ' · dirty' : ''}
             </p>
-          ) : gitError ? (
+          ) : gitQuery.isError ? (
             <p className="pb-1 text-xs text-muted-foreground">
               source state unavailable
             </p>
@@ -333,7 +357,7 @@ export function Pipeline({
                     disabled={releaseInvalid || info.state === 'active'}
                     onClick={() =>
                       start('build', () =>
-                        api.build(app.name, releaseValue),
+                        buildMutation.mutateAsync({ release: releaseValue }),
                       )
                     }
                   >
@@ -352,11 +376,10 @@ export function Pipeline({
                     }
                     onClick={() =>
                       start('transfer', () =>
-                        api.transfer(
-                          app.name,
-                          releaseValue,
-                          transferTarget ?? '',
-                        ),
+                        transferMutation.mutateAsync({
+                          release: releaseValue,
+                          target: transferTarget ?? '',
+                        }),
                       )
                     }
                   >
@@ -383,7 +406,7 @@ export function Pipeline({
                   image {imageRef} already present on the build server
                 </p>
               )}
-              {stage === 'build' && imagesError && (
+              {stage === 'build' && imagesQuery.isError && (
                 <p className="text-xs text-muted-foreground">
                   image list unavailable
                 </p>

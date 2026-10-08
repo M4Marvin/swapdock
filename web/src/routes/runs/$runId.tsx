@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   ApiError,
   api,
@@ -8,6 +9,7 @@ import {
   type RunStream,
   type TraceEvent,
 } from '../../api'
+import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -78,11 +80,27 @@ function RunDetail() {
   const [error, setError] = useState<string | null>(null)
   const [phase, setPhase] = useState<Phase>('loading')
 
+  // Ask whether the run exists (and is over) before opening a stream, so an
+  // unknown or already-finished run does not hold a connection open. The
+  // stream itself stays a custom EventSource; this is only the pre-check.
+  const resumeQuery = useQuery({
+    queryKey: queryKeys.run(runId),
+    queryFn: ({ signal }) => api.resume(runId, signal),
+    retry: 0,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  })
+
   useEffect(() => {
     setEvents([])
     setEnded(null)
     setError(null)
     setPhase('loading')
+  }, [runId])
+
+  useEffect(() => {
+    if (resumeQuery.status === 'pending') return
+
     const controller = new AbortController()
     let stream: RunStream | null = null
     let idle: ReturnType<typeof setTimeout> | null = null
@@ -136,50 +154,51 @@ function RunDetail() {
       }
     }
 
-    // Ask whether the run exists (and is over) before opening a stream, so an
-    // unknown or already-finished run does not hold a connection open.
-    api.resume(runId, controller.signal).then(
-      (res) => {
+    // `/resume` only knows about runs that recorded a step; fall back to the
+    // full trace so a zero-step run is not mistaken for a missing one.
+    const fallbackToTrace = async () => {
+      try {
+        const past = await api.run(runId, controller.signal)
         if (controller.signal.aborted) return
-        if (res.ended != null) {
-          void loadHistory(res.ended)
+        const end = past.find((ev) => ev.event === 'run_end')
+        if (end) {
+          setEvents(past)
+          finish(end.status ?? 'stream closed')
         } else {
           startStream()
         }
-      },
-      async (e) => {
+      } catch {
         if (controller.signal.aborted) return
-        // `/resume` only knows about runs that recorded a step; fall back to
-        // the full trace so a zero-step run is not mistaken for a missing one.
-        if (e instanceof ApiError && e.status === 404) {
-          try {
-            const past = await api.run(runId, controller.signal)
-            if (controller.signal.aborted) return
-            const end = past.find((ev) => ev.event === 'run_end')
-            if (end) {
-              setEvents(past)
-              finish(end.status ?? 'stream closed')
-            } else {
-              startStream()
-            }
-          } catch {
-            if (controller.signal.aborted) return
-            setPhase('error')
-            setError('run not found')
-          }
-          return
-        }
+        setPhase('error')
+        setError('run not found')
+      }
+    }
+
+    if (resumeQuery.status === 'success') {
+      if (resumeQuery.data.ended != null) {
+        void loadHistory(resumeQuery.data.ended)
+      } else {
+        startStream()
+      }
+    } else {
+      const e = resumeQuery.error
+      if (e instanceof ApiError && e.status === 404) {
+        void fallbackToTrace()
+      } else {
         setPhase('error')
         setError(String(e))
-      },
-    )
+      }
+    }
 
     return () => {
       controller.abort()
       clearIdle()
       stream?.close()
     }
-  }, [runId])
+    // Only re-run when the run changes or the pre-check resolves; a background
+    // refetch of the same key must not tear down a live stream.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, resumeQuery.status])
 
   const start = events.find((e) => e.event === 'run_start')
   const end = events.find((e) => e.event === 'run_end')

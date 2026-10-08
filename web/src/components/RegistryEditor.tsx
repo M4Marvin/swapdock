@@ -1,9 +1,15 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { useForm, useStore, type AnyFieldApi } from '@tanstack/react-form'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { z } from 'zod'
 import { TriangleAlert } from 'lucide-react'
 import { api, type App } from '../api'
+import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Card,
   CardContent,
@@ -18,37 +24,114 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+} from '@/components/ui/field'
 
-/**
- * A draft of every editable App field, with numbers and lists kept as strings
- * so a half-typed value never becomes `NaN` and the caret does not jump.
- */
-interface Draft {
-  strategy: string
-  hostnames: string
-  listen: string
-  front_port: string
-  slot: string
-  live_port: string
-  old_port: string
-  writes_state: boolean
-  image_repo: string
-  registry: string
-  build_host: string
-  release: string
-  old_release: string
-  health_url: string
-  compose_dir: string
-  compose_svc: string
-  env_name: string
-  git_remote: string
-  branch: string
-  repo: string
-  root: string
-  build_repo: string
+// ---------------------------------------------------------------------------
+// schema
+// ---------------------------------------------------------------------------
+
+/** A required whole number in a range; the draft keeps it as a string. */
+function requiredInt(min: number, max: number, message: string) {
+  return z.string().refine((v) => {
+    if (v.trim() === '') return false
+    const n = Number(v)
+    return Number.isInteger(n) && n >= min && n <= max
+  }, message)
 }
 
-type DraftErrors = Partial<Record<keyof Draft, string>>
+/** An optional whole number in a range; empty string means "unset". */
+function optionalInt(min: number, max: number, message: string) {
+  return z.string().refine((v) => {
+    if (v.trim() === '') return true
+    const n = Number(v)
+    return Number.isInteger(n) && n >= min && n <= max
+  }, message)
+}
+
+const PORT_MESSAGE = 'must be a port between 1 and 65535'
+
+/**
+ * Client-side mirror of the server's App constraints.
+ *
+ * Numeric fields stay strings in the draft so a half-typed value never becomes
+ * `NaN`; the refinements enforce the same shape the API would.
+ */
+const draftSchema = z
+  .object({
+    strategy: z
+      .string()
+      .refine(
+        (v: string): boolean => v === 'swap' || v === 'replace',
+        'must be "swap" or "replace"',
+      ),
+    hostnames: z.string(),
+    listen: z.string(),
+    front_port: requiredInt(1, 65535, PORT_MESSAGE),
+    slot: requiredInt(0, 127, 'must be a slot between 0 and 127'),
+    live_port: optionalInt(1, 65535, PORT_MESSAGE),
+    old_port: optionalInt(1, 65535, PORT_MESSAGE),
+    writes_state: z.boolean(),
+    image_repo: z.string(),
+    registry: z
+      .string()
+      .refine(
+        (v) => v === '' || ['ghcr', 'docker-hub', 'local'].includes(v),
+        'one of ghcr, docker-hub, local',
+      ),
+    build_host: z.string(),
+    release: z.string(),
+    old_release: z.string(),
+    health_url: z
+      .string()
+      .refine(
+        (v) => v === '' || v.startsWith('http'),
+        'must start with http:// or https://',
+      ),
+    compose_dir: z.string(),
+    compose_svc: z.string(),
+    env_name: z
+      .string()
+      .refine(
+        (v) => v === '' || /^[A-Z][A-Z0-9_]*$/.test(v),
+        'must be uppercase, e.g. CHAT_PORT',
+      ),
+    git_remote: z.string(),
+    branch: z.string(),
+    repo: z.string(),
+    root: z.string(),
+    build_repo: z.string(),
+  })
+  // A front port doubles as a back-end port only if it collides with this
+  // app's own live/old port; cross-app collisions need the whole registry.
+  .superRefine((d, ctx) => {
+    const front = Number(d.front_port)
+    if (!Number.isInteger(front)) return
+    if (d.live_port.trim() !== '' && front === Number(d.live_port)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['front_port'],
+        message: `front port also used as live port (${front})`,
+      })
+    } else if (d.old_port.trim() !== '' && front === Number(d.old_port)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['front_port'],
+        message: `front port also used as old port (${front})`,
+      })
+    }
+  })
+
+type Draft = z.infer<typeof draftSchema>
+
+// ---------------------------------------------------------------------------
+// draft <-> App
+// ---------------------------------------------------------------------------
 
 function toDraft(app: App): Draft {
   return {
@@ -75,78 +158,6 @@ function toDraft(app: App): Draft {
     root: app.root ?? '',
     build_repo: app.build_repo ?? '',
   }
-}
-
-/** Validates the draft client-side; empty string means "no error". */
-function validateDraft(d: Draft): DraftErrors {
-  const errors: DraftErrors = {}
-
-  if (d.strategy !== 'swap' && d.strategy !== 'replace') {
-    errors.strategy = 'must be "swap" or "replace"'
-  }
-
-  const port = (raw: string, key: keyof Draft, required: boolean) => {
-    const v = raw.trim()
-    if (v === '') {
-      if (required) errors[key] = 'required'
-      return
-    }
-    const n = Number(v)
-    if (!Number.isInteger(n) || n < 1 || n > 65535) {
-      errors[key] = 'must be a port between 1 and 65535'
-    }
-  }
-  port(d.front_port, 'front_port', true)
-  port(d.live_port, 'live_port', false)
-  port(d.old_port, 'old_port', false)
-
-  const slot = d.slot.trim()
-  if (slot === '') {
-    errors.slot = 'required'
-  } else {
-    const n = Number(slot)
-    if (!Number.isInteger(n) || n < 0 || n > 127) {
-      errors.slot = 'must be a slot between 0 and 127'
-    }
-  }
-
-  // A front port doubles as a back-end port only if it collides with this
-  // app's own live/old port; cross-app collisions need the whole registry.
-  const front = Number(d.front_port)
-  const live = Number(d.live_port)
-  const old = Number(d.old_port)
-  if (Number.isInteger(front)) {
-    if (d.live_port.trim() !== '' && front === live) {
-      errors.front_port = `front port also used as live port (${front})`
-    } else if (d.old_port.trim() !== '' && front === old) {
-      errors.front_port = `front port also used as old port (${front})`
-    }
-  }
-
-  const health = d.health_url.trim()
-  if (health !== '' && !/^https?:\/\//.test(health)) {
-    errors.health_url = 'must start with http:// or https://'
-  }
-
-  const env = d.env_name.trim()
-  if (env === '') {
-    errors.env_name = 'required'
-  } else if (!/^[A-Z][A-Z0-9_]*$/.test(env)) {
-    errors.env_name = 'must be uppercase, e.g. CHAT_PORT'
-  }
-
-  if (d.compose_dir.trim() === '') errors.compose_dir = 'required'
-  if (d.compose_svc.trim() === '') errors.compose_svc = 'required'
-
-  const registry = d.registry.trim()
-  if (
-    registry !== '' &&
-    !['ghcr', 'docker-hub', 'local'].includes(registry)
-  ) {
-    errors.registry = 'one of ghcr, docker-hub, local'
-  }
-
-  return errors
 }
 
 function splitList(raw: string): string[] {
@@ -244,21 +255,45 @@ function toToml(app: App, d: Draft): string {
   return out.join('\n') + '\n'
 }
 
-function Field({
+// ---------------------------------------------------------------------------
+// field renderer
+// ---------------------------------------------------------------------------
+
+/** One text/number field, wired to a TanStack Form field and shadcn Field. */
+function FieldInput({
+  field,
   label,
-  error,
-  children,
+  placeholder,
+  description,
+  mono,
+  type,
 }: {
+  field: AnyFieldApi
   label: string
-  error?: string
-  children: ReactNode
+  placeholder?: string
+  description?: ReactNode
+  mono?: boolean
+  type?: 'text' | 'number'
 }) {
+  const isInvalid = field.state.meta.isTouched && !field.state.meta.isValid
   return (
-    <div className="flex flex-col gap-1">
-      <label className="text-xs text-muted-foreground">{label}</label>
-      {children}
-      {error && <p className="text-xs text-destructive">{error}</p>}
-    </div>
+    <Field data-invalid={isInvalid}>
+      <FieldLabel htmlFor={field.name}>{label}</FieldLabel>
+      <Input
+        id={field.name}
+        name={field.name}
+        type={type}
+        value={(field.state.value as string) ?? ''}
+        onBlur={field.handleBlur}
+        onChange={(e) => field.handleChange(e.target.value)}
+        aria-invalid={isInvalid}
+        placeholder={placeholder}
+        className={mono ? 'font-mono' : undefined}
+        autoComplete="off"
+      />
+      {description && <FieldDescription>{description}</FieldDescription>}
+      {isInvalid && <FieldError errors={field.state.meta.errors} />}
+    </Field>
   )
 }
 
@@ -267,64 +302,72 @@ function Field({
  *
  * Validates the draft in the browser and saves through
  * `PUT /api/apps/{name}`, which refuses estates with errors and keeps a
- * `.bak` of the previous file. **Revert to saved** re-reads the registry.
+ * `.bak` of the previous file. Fields that deploys own (strategy, ports,
+ * release chain) live behind the danger-zone dialog, but share the same form.
  */
 export function RegistryEditor({ app }: { app: App }) {
-  const [draft, setDraft] = useState<Draft>(() => toDraft(app))
-  const [saved, setSaved] = useState<Draft>(() => toDraft(app))
-  const [reverting, setReverting] = useState(false)
-  const [revertError, setRevertError] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState<string | null>(null)
-  const [saveOk, setSaveOk] = useState(false)
-  const [copied, setCopied] = useState(false)
+  const queryClient = useQueryClient()
   const [dangerOpen, setDangerOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
 
+  const saveMutation = useMutation({
+    mutationFn: (payload: App) => api.updateApp(app.name, payload),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+      toast.success('Registry saved', {
+        description: `saved, .bak created${result.backup ? ` (${result.backup})` : ''}`,
+      })
+    },
+    onError: (error) => {
+      toast.error('Registry save failed', {
+        description: error instanceof Error ? error.message : String(error),
+      })
+    },
+  })
+
+  const form = useForm({
+    defaultValues: toDraft(app),
+    validators: {
+      onChange: draftSchema,
+      onSubmit: draftSchema,
+    },
+    onSubmit: async ({ value }) => {
+      try {
+        await saveMutation.mutateAsync(fromDraft(app, value))
+        // Adopt the saved values as the new baseline for Reset / dirty state.
+        form.reset(value)
+        setDangerOpen(false)
+      } catch {
+        // Surfaced by saveMutation.error in the dialog banner.
+      }
+    },
+  })
+
+  const values = useStore(form.store, (s) => s.values)
+  const isDirty = useStore(form.store, (s) => s.isDirty)
+  const errorCount = useStore(
+    form.store,
+    (s) =>
+      Object.values(s.fieldMeta).filter(
+        (m) => m && m.errors && m.errors.length > 0,
+      ).length,
+  )
+
+  // Adopt server-side changes (e.g. a deploy rewrote the release) when there
+  // are no unsaved edits; never clobber an in-progress draft.
   useEffect(() => {
-    const d = toDraft(app)
-    setDraft(d)
-    setSaved(d)
-  }, [app])
+    if (!isDirty) form.reset(toDraft(app))
+  }, [app, isDirty, form])
 
-  const errors = validateDraft(draft)
-  const dirty = JSON.stringify(draft) !== JSON.stringify(saved)
-  const errorCount = Object.keys(errors).length
+  const saving = saveMutation.isPending
+  const saveError = saveMutation.error
+    ? saveMutation.error instanceof Error
+      ? saveMutation.error.message
+      : String(saveMutation.error)
+    : null
 
-  const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
-    setDraft((cur) => ({ ...cur, [key]: value }))
-
-  const revert = async () => {
-    setReverting(true)
-    setRevertError(null)
-    try {
-      const entry = await api.app(app.name)
-      const d = toDraft(entry.app)
-      setDraft(d)
-      setSaved(d)
-    } catch (e) {
-      setRevertError(String(e))
-    } finally {
-      setReverting(false)
-    }
-  }
-
-  const tomlText = toToml(app, draft)
-
-  const save = async () => {
-    if (errorCount > 0) return
-    setSaving(true)
-    setSaveError(null)
-    setSaveOk(false)
-    try {
-      await api.updateApp(app.name, fromDraft(app, draft))
-      setSaved({ ...draft })
-      setSaveOk(true)
-    } catch (e) {
-      setSaveError(String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
+  const tomlText = toToml(app, values)
 
   const copy = async () => {
     try {
@@ -342,164 +385,138 @@ export function RegistryEditor({ app }: { app: App }) {
         <CardTitle>Registry editor</CardTitle>
         <p className="text-sm text-muted-foreground">
           Field errors block saving; the server re-validates the whole estate
-          and refuses on any error, keeping a <span className="font-mono">.bak</span> of
-          the previous file.
+          and refuses on any error, keeping a{' '}
+          <span className="font-mono">.bak</span> of the previous file.
         </p>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={errorCount > 0 ? 'destructive' : 'outline'}>
-            {errorCount} field error{errorCount === 1 ? '' : 's'}
-          </Badge>
-          {dirty && <Badge variant="secondary">unsaved changes</Badge>}
-          {saveOk && !dirty && <Badge>saved</Badge>}
-          <span className="flex-1" />
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={reverting}
-            onClick={revert}
-          >
-            {reverting ? 'Reverting…' : 'Revert to saved'}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setDangerOpen(true)}
-            className="border-destructive/50 text-destructive hover:bg-destructive/10 hover:text-destructive"
-          >
-            <TriangleAlert className="size-4" />
-            Danger zone
-          </Button>
-          <Button
-            size="sm"
-            disabled={saving || !dirty || errorCount > 0}
-            onClick={save}
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </Button>
-          <Button variant="outline" size="sm" onClick={copy}>
-            {copied ? 'Copied' : 'Copy as TOML'}
-          </Button>
-        </div>
+        <form
+          id="registry-form"
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault()
+            form.handleSubmit()
+          }}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={errorCount > 0 ? 'destructive' : 'outline'}>
+              {errorCount} field error{errorCount === 1 ? '' : 's'}
+            </Badge>
+            {isDirty && <Badge variant="secondary">unsaved changes</Badge>}
+            {saveMutation.isSuccess && !isDirty && <Badge>saved</Badge>}
+            <span className="flex-1" />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                form.reset()
+                saveMutation.reset()
+              }}
+            >
+              Reset
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setDangerOpen(true)}
+              className="border-destructive/50 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              <TriangleAlert className="size-4" />
+              Danger zone
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={copy}>
+              {copied ? 'Copied' : 'Copy as TOML'}
+            </Button>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={saving || !isDirty || errorCount > 0}
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
 
-        {saveError && (
-          <p className="text-sm text-destructive">{saveError}</p>
-        )}
+          {saveError && !dangerOpen && (
+            <p className="text-sm text-destructive">{saveError}</p>
+          )}
 
-        {revertError && (
-          <p className="text-sm text-destructive">{revertError}</p>
-        )}
+          <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
+            <span className="pt-1.5 text-muted-foreground">name</span>
+            <span className="pt-1.5 font-mono">{app.name}</span>
+            <span className="pt-1.5 text-muted-foreground">kind</span>
+            <span className="pt-1.5 font-mono">{app.kind}</span>
+          </div>
 
-        <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
-          <span className="pt-1.5 text-muted-foreground">name</span>
-          <span className="pt-1.5 font-mono">{app.name}</span>
-          <span className="pt-1.5 text-muted-foreground">kind</span>
-          <span className="pt-1.5 font-mono">{app.kind}</span>
-        </div>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <form.Field name="registry">
+              {(field) => (
+                <FieldInput
+                  field={field}
+                  label="registry"
+                  placeholder="ghcr / docker-hub / local"
+                />
+              )}
+            </form.Field>
+            <form.Field name="hostnames">
+              {(field) => (
+                <FieldInput field={field} label="hostnames (comma-separated)" placeholder="a.example, b.example" />
+              )}
+            </form.Field>
+            <form.Field name="listen">
+              {(field) => (
+                <FieldInput field={field} label="listen (comma-separated)" placeholder="0.0.0.0:8080" />
+              )}
+            </form.Field>
+            <form.Field name="image_repo">
+              {(field) => <FieldInput field={field} label="image_repo" mono />}
+            </form.Field>
+            <form.Field name="build_host">
+              {(field) => <FieldInput field={field} label="build_host" />}
+            </form.Field>
+            <form.Field name="health_url">
+              {(field) => (
+                <FieldInput field={field} label="health_url" mono placeholder="https://…" />
+              )}
+            </form.Field>
+            <form.Field name="env_name">
+              {(field) => (
+                <FieldInput field={field} label="env_name" mono placeholder="CHAT_PORT" />
+              )}
+            </form.Field>
+            <form.Field name="compose_dir">
+              {(field) => <FieldInput field={field} label="compose_dir" mono />}
+            </form.Field>
+            <form.Field name="compose_svc">
+              {(field) => <FieldInput field={field} label="compose_svc" mono />}
+            </form.Field>
+            <form.Field name="root">
+              {(field) => <FieldInput field={field} label="root" mono />}
+            </form.Field>
+            <form.Field name="git_remote">
+              {(field) => <FieldInput field={field} label="git_remote" />}
+            </form.Field>
+            <form.Field name="branch">
+              {(field) => <FieldInput field={field} label="branch" />}
+            </form.Field>
+            <form.Field name="repo">
+              {(field) => <FieldInput field={field} label="repo" mono />}
+            </form.Field>
+            <form.Field name="build_repo">
+              {(field) => <FieldInput field={field} label="build_repo" mono />}
+            </form.Field>
+          </div>
 
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="registry" error={errors.registry}>
-            <Input
-              value={draft.registry}
-              onChange={(e) => set('registry', e.target.value)}
-              placeholder="ghcr / docker-hub / local"
-              aria-invalid={errors.registry != null}
-            />
-          </Field>
-          <Field label="hostnames (comma-separated)">
-            <Input
-              value={draft.hostnames}
-              onChange={(e) => set('hostnames', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="listen (comma-separated)">
-            <Input
-              value={draft.listen}
-              onChange={(e) => set('listen', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="image_repo">
-            <Input
-              value={draft.image_repo}
-              onChange={(e) => set('image_repo', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="build_host">
-            <Input
-              value={draft.build_host}
-              onChange={(e) => set('build_host', e.target.value)}
-            />
-          </Field>
-          <Field label="health_url" error={errors.health_url}>
-            <Input
-              value={draft.health_url}
-              onChange={(e) => set('health_url', e.target.value)}
-              className="font-mono"
-              aria-invalid={errors.health_url != null}
-            />
-          </Field>
-          <Field label="env_name" error={errors.env_name}>
-            <Input
-              value={draft.env_name}
-              onChange={(e) => set('env_name', e.target.value)}
-              className="font-mono"
-              aria-invalid={errors.env_name != null}
-            />
-          </Field>
-          <Field label="compose_dir" error={errors.compose_dir}>
-            <Input
-              value={draft.compose_dir}
-              onChange={(e) => set('compose_dir', e.target.value)}
-              className="font-mono"
-              aria-invalid={errors.compose_dir != null}
-            />
-          </Field>
-          <Field label="compose_svc" error={errors.compose_svc}>
-            <Input
-              value={draft.compose_svc}
-              onChange={(e) => set('compose_svc', e.target.value)}
-              className="font-mono"
-              aria-invalid={errors.compose_svc != null}
-            />
-          </Field>
-          <Field label="root">
-            <Input
-              value={draft.root}
-              onChange={(e) => set('root', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="git_remote">
-            <Input
-              value={draft.git_remote}
-              onChange={(e) => set('git_remote', e.target.value)}
-            />
-          </Field>
-          <Field label="branch">
-            <Input
-              value={draft.branch}
-              onChange={(e) => set('branch', e.target.value)}
-            />
-          </Field>
-          <Field label="repo">
-            <Input
-              value={draft.repo}
-              onChange={(e) => set('repo', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="build_repo">
-            <Input
-              value={draft.build_repo}
-              onChange={(e) => set('build_repo', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-        </div>
+          <details className="text-xs">
+            <summary className="cursor-pointer select-none text-muted-foreground">
+              Draft TOML
+            </summary>
+            <pre className="mt-2 overflow-x-auto rounded-lg border bg-muted/40 p-3 font-mono">
+              {tomlText}
+            </pre>
+          </details>
+        </form>
 
         <Dialog open={dangerOpen} onOpenChange={setDangerOpen}>
           <DialogContent className="max-w-2xl">
@@ -515,103 +532,118 @@ export function RegistryEditor({ app }: { app: App }) {
                 brick rollbacks. Change them only if you know why.
               </DialogDescription>
             </DialogHeader>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="strategy" error={errors.strategy}>
-                <Input
-                  value={draft.strategy}
-                  onChange={(e) => set('strategy', e.target.value)}
-                  aria-invalid={errors.strategy != null}
-                />
-              </Field>
-              <div className="flex items-center gap-2">
-                <input
-                  id="writes_state"
-                  type="checkbox"
-                  checked={draft.writes_state}
-                  onChange={(e) => set('writes_state', e.target.checked)}
-                  className="size-4 accent-primary"
-                />
-                <label htmlFor="writes_state" className="text-sm">
-                  writes_state
-                </label>
-                <span className="text-xs text-muted-foreground">
-                  forbids the swap strategy
-                </span>
+            <form
+              id="registry-danger-form"
+              className="space-y-4"
+              onSubmit={(e) => {
+                e.preventDefault()
+                form.handleSubmit()
+              }}
+            >
+              <div className="grid gap-4 sm:grid-cols-2">
+                <form.Field name="strategy">
+                  {(field) => (
+                    <FieldInput field={field} label="strategy" placeholder="swap / replace" />
+                  )}
+                </form.Field>
+                <form.Field name="writes_state">
+                  {(field) => {
+                    const isInvalid =
+                      field.state.meta.isTouched && !field.state.meta.isValid
+                    return (
+                      <Field orientation="horizontal" data-invalid={isInvalid}>
+                        <Checkbox
+                          id={field.name}
+                          name={field.name}
+                          checked={field.state.value}
+                          onCheckedChange={(checked) =>
+                            field.handleChange(checked)
+                          }
+                          aria-invalid={isInvalid}
+                        />
+                        <FieldContent>
+                          <FieldLabel
+                            htmlFor={field.name}
+                            className="font-normal"
+                          >
+                            writes_state
+                          </FieldLabel>
+                          <FieldDescription>
+                            forbids the swap strategy
+                          </FieldDescription>
+                        </FieldContent>
+                        {isInvalid && (
+                          <FieldError errors={field.state.meta.errors} />
+                        )}
+                      </Field>
+                    )
+                  }}
+                </form.Field>
+                <form.Field name="front_port">
+                  {(field) => (
+                    <FieldInput field={field} label="front_port" type="number" />
+                  )}
+                </form.Field>
+                <form.Field name="slot">
+                  {(field) => (
+                    <FieldInput field={field} label="slot" type="number" />
+                  )}
+                </form.Field>
+                <form.Field name="live_port">
+                  {(field) => (
+                    <FieldInput field={field} label="live_port" type="number" />
+                  )}
+                </form.Field>
+                <form.Field name="old_port">
+                  {(field) => (
+                    <FieldInput field={field} label="old_port" type="number" />
+                  )}
+                </form.Field>
+                <form.Field name="release">
+                  {(field) => (
+                    <FieldInput field={field} label="release" mono />
+                  )}
+                </form.Field>
+                <form.Field name="old_release">
+                  {(field) => (
+                    <FieldInput field={field} label="old_release" mono />
+                  )}
+                </form.Field>
               </div>
-              <Field label="front_port" error={errors.front_port}>
-                <Input
-                  type="number"
-                  value={draft.front_port}
-                  onChange={(e) => set('front_port', e.target.value)}
-                  aria-invalid={errors.front_port != null}
-                />
-              </Field>
-              <Field label="slot" error={errors.slot}>
-                <Input
-                  type="number"
-                  value={draft.slot}
-                  onChange={(e) => set('slot', e.target.value)}
-                  aria-invalid={errors.slot != null}
-                />
-              </Field>
-              <Field label="live_port" error={errors.live_port}>
-                <Input
-                  type="number"
-                  value={draft.live_port}
-                  onChange={(e) => set('live_port', e.target.value)}
-                  aria-invalid={errors.live_port != null}
-                />
-              </Field>
-              <Field label="old_port" error={errors.old_port}>
-                <Input
-                  type="number"
-                  value={draft.old_port}
-                  onChange={(e) => set('old_port', e.target.value)}
-                  aria-invalid={errors.old_port != null}
-                />
-              </Field>
-              <Field label="release">
-                <Input
-                  value={draft.release}
-                  onChange={(e) => set('release', e.target.value)}
-                  className="font-mono"
-                />
-              </Field>
-              <Field label="old_release">
-                <Input
-                  value={draft.old_release}
-                  onChange={(e) => set('old_release', e.target.value)}
-                  className="font-mono"
-                />
-              </Field>
-            </div>
-            <DialogFooter>
-              <div className="flex w-full flex-wrap items-center gap-2">
-                {dirty && <Badge variant="secondary">unsaved changes</Badge>}
-                <span className="flex-1" />
-                <Button
-                  size="sm"
-                  disabled={saving || !dirty || errorCount > 0}
-                  onClick={save}
+
+              {saveError && (
+                <div
+                  role="alert"
+                  className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
                 >
-                  {saving ? 'Saving…' : 'Save'}
-                </Button>
-              </div>
-            </DialogFooter>
-            {saveError && (
-              <p className="text-sm text-destructive">{saveError}</p>
-            )}
+                  {saveError}
+                </div>
+              )}
+
+              <DialogFooter>
+                <div className="flex w-full flex-wrap items-center gap-2">
+                  {isDirty && <Badge variant="secondary">unsaved changes</Badge>}
+                  <span className="flex-1" />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDangerOpen(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={saving || !isDirty || errorCount > 0}
+                  >
+                    {saving ? 'Saving…' : 'Save'}
+                  </Button>
+                </div>
+              </DialogFooter>
+            </form>
           </DialogContent>
         </Dialog>
-
-        <details className="text-xs">
-          <summary className="cursor-pointer select-none text-muted-foreground">
-            Draft TOML
-          </summary>
-          <pre className="mt-2 overflow-x-auto rounded-lg border bg-muted/40 p-3 font-mono">
-            {tomlText}
-          </pre>
-        </details>
       </CardContent>
     </Card>
   )

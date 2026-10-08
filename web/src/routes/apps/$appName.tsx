@@ -1,13 +1,18 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useForm } from '@tanstack/react-form'
+import { toast } from 'sonner'
+import { z } from 'zod'
 import {
   api,
-  type AppEntry,
-  type AppStatus,
-  type VerifyReport,
+  type App,
+  type AppLatest,
 } from '../../api'
+import { queryKeys } from '@/lib/query-keys'
 import { Pipeline } from '@/components/Pipeline'
 import { RegistryEditor } from '@/components/RegistryEditor'
+import { StatusPill } from '@/components/StatusPill'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -17,6 +22,19 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  Field,
+  FieldError,
+  FieldLabel,
+} from '@/components/ui/field'
 
 export const Route = createFileRoute('/apps/$appName')({
   component: AppDetail,
@@ -27,135 +45,256 @@ function formatMs(ms: number): string {
   return Number.isNaN(d.getTime()) ? String(ms) : d.toLocaleString()
 }
 
-function isUp(status: AppStatus): boolean {
-  if (status.up === true) return true
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+/** A release is a commit SHA: optional prefix digits then 4-64 hex chars. */
+const RELEASE_RE = /^\d*[0-9a-fA-F]{4,64}$/
+
+const deploySchema = z.object({
+  release: z
+    .string()
+    .refine(
+      (v) => v === '' || RELEASE_RE.test(v),
+      'must be a commit SHA (hex, 4-64 chars), or empty for the latest',
+    ),
+})
+
+/** Shows an "update available" chip when the upstream ref moved ahead. */
+function LatestChip({
+  release,
+  latest,
+}: {
+  release: string | null
+  latest: AppLatest | undefined
+}) {
+  const remote = latest?.release
+  if (!remote || (release != null && release === remote)) return null
   return (
-    typeof status.status === 'number' &&
-    status.status >= 200 &&
-    status.status < 300
+    <Badge variant="secondary" title={latest?.source}>
+      update available: {remote}
+    </Badge>
   )
 }
 
-function StatusPill({
-  status,
-  livePort,
+/**
+ * Deploy one release. The release field is validated by the same zod schema
+ * the pipeline uses; an empty value deploys whatever the app resolves to.
+ */
+function DeployDialog({
+  app,
+  open,
+  onOpenChange,
 }: {
-  status: AppStatus | 'error' | null
-  livePort: number | null
+  app: App
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }) {
-  // No live port means nothing was ever deployed: not the same as "down".
-  if (livePort == null) {
-    return (
-      <Badge variant="outline" className="text-muted-foreground">
-        not deployed
-      </Badge>
-    )
-  }
-  if (status === null || status === 'error') {
-    return <Badge variant="outline">unknown</Badge>
-  }
-  const code = typeof status.status === 'number' ? ` ${status.status}` : ''
-  return isUp(status) ? (
-    <Badge
-      variant="outline"
-      className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-    >
-      up{code}
-    </Badge>
-  ) : (
-    <Badge variant="destructive">down{code}</Badge>
+  const queryClient = useQueryClient()
+
+  const deployMutation = useMutation({
+    mutationFn: (release: string) =>
+      api.deploy(app.name, release.trim() || undefined),
+    onSuccess: ({ run_id }) => {
+      toast.success(`deploy started: ${run_id}`)
+      queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      queryClient.invalidateQueries({ queryKey: queryKeys.appStatus(app.name) })
+    },
+    onError: (error) => {
+      toast.error('deploy failed', { description: errorText(error) })
+    },
+  })
+
+  const form = useForm({
+    defaultValues: { release: app.release ?? '' },
+    validators: { onChange: deploySchema, onSubmit: deploySchema },
+    onSubmit: async ({ value }) => {
+      try {
+        await deployMutation.mutateAsync(value.release)
+        onOpenChange(false)
+      } catch {
+        // Surfaced from deployMutation.error next to the field.
+      }
+    },
+  })
+
+  // Start each open from the app's current release and clear stale errors.
+  const wasOpen = useRef(false)
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      form.reset({ release: app.release ?? '' })
+      deployMutation.reset()
+    }
+    wasOpen.current = open
+  }, [open, app.release, form, deployMutation])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Deploy {app.name}</DialogTitle>
+          <DialogDescription>
+            Start a deploy run for a release. Leave the field empty to deploy
+            the app's current upstream ref.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          id="deploy-form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            form.handleSubmit()
+          }}
+        >
+          <form.Field name="release">
+            {(field) => {
+              const isInvalid =
+                field.state.meta.isTouched && !field.state.meta.isValid
+              return (
+                <Field data-invalid={isInvalid}>
+                  <FieldLabel htmlFor={field.name}>release</FieldLabel>
+                  <Input
+                    id={field.name}
+                    name={field.name}
+                    value={field.state.value}
+                    onBlur={field.handleBlur}
+                    onChange={(e) => field.handleChange(e.target.value)}
+                    aria-invalid={isInvalid}
+                    placeholder="commit sha (or empty)"
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                  {isInvalid && <FieldError errors={field.state.meta.errors} />}
+                </Field>
+              )
+            }}
+          </form.Field>
+        </form>
+
+        {deployMutation.isError && (
+          <FieldError>{errorText(deployMutation.error)}</FieldError>
+        )}
+
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="deploy-form"
+            disabled={deployMutation.isPending}
+          >
+            {deployMutation.isPending ? 'Deploying…' : 'Deploy'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
 function AppDetail() {
   const { appName } = Route.useParams()
-  const [entry, setEntry] = useState<AppEntry | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [status, setStatus] = useState<AppStatus | 'error' | null>(null)
+  const queryClient = useQueryClient()
   const [since, setSince] = useState('')
-  const [verify, setVerify] = useState<VerifyReport | null>(null)
-  const [verifyError, setVerifyError] = useState<string | null>(null)
-  const [verifyBusy, setVerifyBusy] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [actionError, setActionError] = useState<string | null>(null)
+  const [deployOpen, setDeployOpen] = useState(false)
   const [lastRun, setLastRun] = useState<string | null>(null)
-  // Bumped after a successful deploy so the registry is re-read.
-  const [nonce, setNonce] = useState(0)
+  // The window the verify query is keyed on; only committed by the Check
+  // button so typing does not wipe the results already on screen.
+  const [querySince, setQuerySince] = useState('')
 
-  useEffect(() => {
-    const controller = new AbortController()
-    setError(null)
-    setStatus(null)
-    setVerify(null)
-    setVerifyError(null)
-    setActionError(null)
-    api.app(appName, controller.signal).then(
-      (e) => {
-        if (controller.signal.aborted) return
-        setEntry(e)
-        // Only probe when there is a live port; otherwise the UI shows
-        // "not deployed" without a request.
-        if (e.app.live_port != null) {
-          api.appStatus(appName, controller.signal).then(
-            (s) => {
-              if (!controller.signal.aborted) setStatus(s)
-            },
-            () => {
-              if (!controller.signal.aborted) setStatus('error')
-            },
-          )
-        }
-      },
-      (e) => {
-        if (!controller.signal.aborted) setError(String(e))
-      },
-    )
-    return () => controller.abort()
-  }, [appName, nonce])
+  const appQuery = useQuery({
+    queryKey: queryKeys.app(appName),
+    queryFn: ({ signal }) => api.app(appName, signal),
+  })
 
-  const act = async (fn: () => Promise<{ run_id: string }>) => {
-    setBusy(true)
-    setActionError(null)
-    try {
-      const { run_id } = await fn()
+  const latestQuery = useQuery({
+    queryKey: queryKeys.latest(appName),
+    queryFn: ({ signal }) => api.appLatest(appName, signal),
+    enabled: appQuery.data?.app.live_port != null,
+  })
+
+  // Verify is operator-triggered; the query stays idle until a since value is
+  // committed.
+  const verifyQuery = useQuery({
+    queryKey: queryKeys.verify(appName, querySince),
+    queryFn: ({ signal }) => api.verify(appName, querySince, signal),
+    enabled: querySince !== '',
+    retry: false,
+  })
+
+  const checkVerify = () => {
+    if (querySince === since) void verifyQuery.refetch()
+    else setQuerySince(since)
+  }
+
+  const rollbackMutation = useMutation({
+    mutationFn: () => api.rollback(appName),
+    onSuccess: ({ run_id }) => {
       setLastRun(run_id)
-    } catch (e) {
-      setActionError(String(e))
-    } finally {
-      setBusy(false)
-    }
+      queryClient.invalidateQueries({ queryKey: queryKeys.app(appName) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      toast.success(`rollback started: ${run_id}`)
+    },
+    onError: (error) => {
+      toast.error('rollback failed', { description: errorText(error) })
+    },
+  })
+
+  const syncMutation = useMutation({
+    mutationFn: () => api.sync(appName),
+    onSuccess: ({ run_id }) => {
+      setLastRun(run_id)
+      queryClient.invalidateQueries({ queryKey: queryKeys.app(appName) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      toast.success(`sync started: ${run_id}`)
+    },
+    onError: (error) => {
+      toast.error('sync failed', { description: errorText(error) })
+    },
+  })
+
+  const busy = rollbackMutation.isPending || syncMutation.isPending
+  const actionError = rollbackMutation.error ?? syncMutation.error
+  const verify = verifyQuery.data
+
+  if (appQuery.isError && !appQuery.data) {
+    return <p className="text-destructive">{String(appQuery.error)}</p>
   }
+  if (!appQuery.data) return <p className="text-muted-foreground">Loading…</p>
 
-  const checkVerify = async () => {
-    if (!since) return
-    setVerifyBusy(true)
-    setVerifyError(null)
-    try {
-      setVerify(await api.verify(appName, since))
-    } catch (e) {
-      setVerify(null)
-      setVerifyError(String(e))
-    } finally {
-      setVerifyBusy(false)
-    }
-  }
-
-  if (error && !entry) return <p className="text-destructive">{error}</p>
-  if (!entry) return <p className="text-muted-foreground">Loading…</p>
-
-  const { app, problems } = entry
+  const { app, problems } = appQuery.data
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-xl font-semibold">{app.name}</h1>
-        <StatusPill status={status} livePort={app.live_port} />
+        <StatusPill name={app.name} livePort={app.live_port} showCode />
         <Badge variant="secondary">{app.kind}</Badge>
+        <LatestChip release={app.release} latest={latestQuery.data} />
+        <span className="flex-1" />
+        <Button onClick={() => setDeployOpen(true)}>Deploy…</Button>
       </div>
 
-      <Pipeline app={app} onDeployed={() => setNonce((n) => n + 1)} />
+      <Pipeline
+        app={app}
+        onDeployed={() => {
+          queryClient.invalidateQueries({ queryKey: queryKeys.app(appName) })
+          queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.appStatus(appName),
+          })
+        }}
+      />
 
-      <RegistryEditor app={app} />
+      <RegistryEditor key={app.name} app={app} />
 
       {problems.length > 0 && (
         <Card>
@@ -185,14 +324,14 @@ function AppDetail() {
           <Button
             variant="outline"
             disabled={busy}
-            onClick={() => act(() => api.rollback(app.name))}
+            onClick={() => rollbackMutation.mutate()}
           >
             Rollback
           </Button>
           <Button
             variant="outline"
             disabled={busy}
-            onClick={() => act(() => api.sync(app.name))}
+            onClick={() => syncMutation.mutate()}
           >
             Sync
           </Button>
@@ -206,7 +345,9 @@ function AppDetail() {
             </Link>
           )}
           {actionError && (
-            <p className="w-full text-sm text-destructive">{actionError}</p>
+            <p className="w-full text-sm text-destructive">
+              {errorText(actionError)}
+            </p>
           )}
         </CardContent>
       </Card>
@@ -225,14 +366,16 @@ function AppDetail() {
             />
             <Button
               variant="outline"
-              disabled={!since || verifyBusy}
+              disabled={!since || verifyQuery.isFetching}
               onClick={checkVerify}
             >
-              {verifyBusy ? 'Checking…' : 'Check'}
+              {verifyQuery.isFetching ? 'Checking…' : 'Check'}
             </Button>
           </div>
 
-          {verifyError && <p className="text-destructive">{verifyError}</p>}
+          {verifyQuery.isError && (
+            <p className="text-destructive">{String(verifyQuery.error)}</p>
+          )}
 
           {verify && (
             <div className="space-y-4">
@@ -322,6 +465,12 @@ function AppDetail() {
           )}
         </CardContent>
       </Card>
+
+      <DeployDialog
+        app={app}
+        open={deployOpen}
+        onOpenChange={setDeployOpen}
+      />
     </div>
   )
 }
