@@ -1,3 +1,0 @@
-[      22ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=17e6b03b:15804
-[   39330ms] [LOG] [vite] server connection lost. Polling for restart... @ http://localhost:5173/@vite/client:1081
-[   39332ms] [ERROR] Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING @ http://localhost:5173/events?run=deadbeefdeadbeefdeadbeefdead:0
