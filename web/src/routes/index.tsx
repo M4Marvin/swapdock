@@ -4,8 +4,10 @@ import {
   api,
   formatStatus,
   type AppEntry,
+  type AppLatest,
   type AppStatus,
   type RunSummary,
+  type VerifyReport,
 } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -30,6 +32,8 @@ export const Route = createFileRoute('/')({
 })
 
 type StatusEntry = AppStatus | 'error'
+type LatestEntry = AppLatest | 'error'
+type VerifyEntry = VerifyReport | 'error'
 
 /** How long a health-probe verdict is reused before it is fetched again. */
 const STATUS_TTL_MS = 15_000
@@ -40,6 +44,11 @@ const statusCache = new Map<string, { at: number; status: StatusEntry }>()
 function formatTime(iso: string): string {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
+}
+
+function formatMs(ms: number): string {
+  const d = new Date(ms)
+  return Number.isNaN(d.getTime()) ? String(ms) : d.toLocaleTimeString()
 }
 
 /** The API computes `up`, but fall back to the 2xx code when it is absent. */
@@ -81,6 +90,76 @@ function StatusBadge({
   )
 }
 
+/** Compares the deployed release with what `origin/<branch>` resolves to. */
+function UpdateChip({
+  release,
+  latest,
+  livePort,
+}: {
+  release: string | null
+  latest: LatestEntry | undefined
+  livePort: number | null
+}) {
+  if (livePort == null) {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        not deployed
+      </Badge>
+    )
+  }
+  if (latest === undefined)
+    return <Skeleton className="h-5 w-24 rounded-4xl" />
+  if (latest === 'error')
+    return <span className="text-xs text-muted-foreground">—</span>
+  const remote = latest.release
+  if (!remote) {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        no ref
+      </Badge>
+    )
+  }
+  if (release != null && release === remote) {
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
+      >
+        up to date
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="secondary" title={latest.source}>
+      update available: {remote}
+    </Badge>
+  )
+}
+
+/** Requests / 5xx / traffic-flip for the last verify window. */
+function VerifyCell({ report }: { report: VerifyEntry | undefined }) {
+  if (report === undefined) {
+    return <Skeleton className="h-5 w-24 rounded-4xl" />
+  }
+  // A missing access log or an unreadable one is not an error to show.
+  if (report === 'error') return null
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-xs">
+      <Badge variant="outline">{report.requests} req</Badge>
+      {report.errors_5xx > 0 && (
+        <Badge variant="destructive">{report.errors_5xx} 5xx</Badge>
+      )}
+      {report.flip ? (
+        <span className="text-muted-foreground">
+          flip {formatMs(report.flip.at_ms)}
+        </span>
+      ) : (
+        <span className="text-muted-foreground">no flip</span>
+      )}
+    </div>
+  )
+}
+
 function Index() {
   const [apps, setApps] = useState<AppEntry[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -90,7 +169,10 @@ function Index() {
     warnings: number
   } | null>(null)
   const [statuses, setStatuses] = useState<Record<string, StatusEntry>>({})
-  const [lastRuns, setLastRuns] = useState<Record<string, RunSummary>>({})
+  const [latest, setLatest] = useState<Record<string, LatestEntry>>({})
+  const [runsByApp, setRunsByApp] = useState<Record<string, RunSummary[]>>({})
+  const [runsReady, setRunsReady] = useState(false)
+  const [verify, setVerify] = useState<Record<string, VerifyEntry>>({})
 
   useEffect(() => {
     const controller = new AbortController()
@@ -152,24 +234,69 @@ function Index() {
     return () => controller.abort()
   }, [apps])
 
-  // Run summaries now carry their app, so the latest run per app is just the
-  // first one seen in the newest-first list — no per-run detail fetch needed.
+  // What each app's upstream ref resolves to, for the pending-update chip.
   useEffect(() => {
     if (!apps || apps.length === 0) return
     const controller = new AbortController()
+    Promise.allSettled(
+      apps.map(({ app }) => api.appLatest(app.name, controller.signal)),
+    ).then((results) => {
+      if (controller.signal.aborted) return
+      const map: Record<string, LatestEntry> = {}
+      results.forEach((r, i) => {
+        map[apps[i].app.name] = r.status === 'fulfilled' ? r.value : 'error'
+      })
+      setLatest(map)
+    })
+    return () => controller.abort()
+  }, [apps])
+
+  // Run summaries carry their app; keep the newest three per app. Newest-first
+  // order means the first three seen are the three most recent.
+  useEffect(() => {
+    if (!apps || apps.length === 0) return
+    const controller = new AbortController()
+    setRunsReady(false)
     api.runs(50, controller.signal).then(
       (runs) => {
         if (controller.signal.aborted) return
-        const map: Record<string, RunSummary> = {}
+        const map: Record<string, RunSummary[]> = {}
         for (const run of runs) {
-          if (run.app && !map[run.app]) map[run.app] = run
+          if (!run.app) continue
+          const list = map[run.app] ?? (map[run.app] = [])
+          if (list.length < 3) list.push(run)
         }
-        setLastRuns(map)
+        setRunsByApp(map)
+        setRunsReady(true)
       },
-      () => undefined,
+      () => {
+        if (!controller.signal.aborted) setRunsReady(true)
+      },
     )
     return () => controller.abort()
   }, [apps])
+
+  // Verify each app since its most recent run (or an hour ago when there is no
+  // run). A failure — missing or unreadable access log — renders nothing.
+  useEffect(() => {
+    if (!apps || apps.length === 0 || !runsReady) return
+    const controller = new AbortController()
+    const fallback = new Date(Date.now() - 3_600_000).toISOString()
+    Promise.allSettled(
+      apps.map(({ app }) => {
+        const since = runsByApp[app.name]?.[0]?.run_id ?? fallback
+        return api.verify(app.name, since, controller.signal)
+      }),
+    ).then((results) => {
+      if (controller.signal.aborted) return
+      const map: Record<string, VerifyEntry> = {}
+      results.forEach((r, i) => {
+        map[apps[i].app.name] = r.status === 'fulfilled' ? r.value : 'error'
+      })
+      setVerify(map)
+    })
+    return () => controller.abort()
+  }, [apps, runsReady, runsByApp])
 
   return (
     <div className="space-y-6">
@@ -215,16 +342,19 @@ function Index() {
                   <TableHead>Kind</TableHead>
                   <TableHead>Strategy</TableHead>
                   <TableHead>Release</TableHead>
+                  <TableHead>Update</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Live port</TableHead>
-                  <TableHead>Hostnames</TableHead>
                   <TableHead>Last deploy</TableHead>
+                  <TableHead>Recent runs</TableHead>
+                  <TableHead>Verify</TableHead>
                   <TableHead className="pr-6">Issues</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {apps.map(({ app, problems }) => {
-                  const run = lastRuns[app.name]
+                  const runs = runsByApp[app.name] ?? []
+                  const newest = runs[0]
                   return (
                     <TableRow key={app.name}>
                       <TableCell className="pl-6">
@@ -242,40 +372,75 @@ function Index() {
                         {app.release ?? '—'}
                       </TableCell>
                       <TableCell>
+                        <UpdateChip
+                          release={app.release}
+                          latest={latest[app.name]}
+                          livePort={app.live_port}
+                        />
+                      </TableCell>
+                      <TableCell>
                         <StatusBadge
                           status={statuses[app.name]}
                           livePort={app.live_port}
                         />
                       </TableCell>
                       <TableCell>{app.live_port ?? '—'}</TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {app.hostnames.join(', ') || '—'}
-                      </TableCell>
                       <TableCell>
-                        {run ? (
+                        {newest ? (
                           <Link
                             to="/runs/$runId"
-                            params={{ runId: run.run_id }}
-                            title={run.run_id}
+                            params={{ runId: newest.run_id }}
+                            title={newest.run_id}
                             className="inline-flex items-center gap-2 underline-offset-4 hover:underline"
                           >
                             <span className="font-mono text-xs">
-                              {run.run_id.slice(0, 8)}
+                              {newest.run_id.slice(0, 8)}
                             </span>
                             <span className="text-muted-foreground">
-                              {formatTime(run.started)}
+                              {formatTime(newest.started)}
                             </span>
                             <Badge
                               variant={
-                                run.non_ok > 0 ? 'destructive' : 'outline'
+                                newest.non_ok > 0 ? 'destructive' : 'outline'
                               }
                             >
-                              {formatStatus(run.status)}
+                              {formatStatus(newest.status)}
                             </Badge>
                           </Link>
                         ) : (
                           <span className="text-muted-foreground">—</span>
                         )}
+                      </TableCell>
+                      <TableCell>
+                        {runs.length === 0 ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          <div className="flex flex-col gap-1">
+                            {runs.map((run) => (
+                              <Link
+                                key={run.run_id}
+                                to="/runs/$runId"
+                                params={{ runId: run.run_id }}
+                                title={run.run_id}
+                                className="inline-flex items-center gap-2 underline-offset-4 hover:underline"
+                              >
+                                <span className="font-mono text-xs">
+                                  {run.run_id.slice(0, 8)}
+                                </span>
+                                <Badge
+                                  variant={
+                                    run.non_ok > 0 ? 'destructive' : 'outline'
+                                  }
+                                >
+                                  {formatStatus(run.status)}
+                                </Badge>
+                              </Link>
+                            ))}
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <VerifyCell report={verify[app.name]} />
                       </TableCell>
                       <TableCell className="pr-6">
                         {problems.length === 0 ? (

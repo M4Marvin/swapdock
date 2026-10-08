@@ -3,10 +3,11 @@ import { useEffect, useState } from 'react'
 import {
   api,
   type AppEntry,
-  type AppLatest,
   type AppStatus,
   type VerifyReport,
 } from '../../api'
+import { Pipeline } from '@/components/Pipeline'
+import { RegistryEditor } from '@/components/RegistryEditor'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -16,30 +17,10 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 
 export const Route = createFileRoute('/apps/$appName')({
   component: AppDetail,
 })
-
-/** The deploy strategy, spelled out for someone who has not read the code. */
-function strategyHint(strategy: string): string {
-  switch (strategy) {
-    case 'replace':
-      return 'stop, swap on the same port, health-gate'
-    case 'swap':
-      return 'start alongside, health-gate, nginx swaps traffic'
-    default:
-      return strategy
-  }
-}
 
 function formatMs(ms: number): string {
   const d = new Date(ms)
@@ -53,16 +34,6 @@ function isUp(status: AppStatus): boolean {
     status.status >= 200 &&
     status.status < 300
   )
-}
-
-/** A release is a commit SHA: hex, 4-64 chars. Empty means "recorded". */
-const RELEASE_RE = /^[0-9a-fA-F]{4,64}$/
-const RELEASE_ERROR = 'must be a commit SHA (hex, 4-64 chars)'
-
-function releaseError(value: string): string | null {
-  const v = value.trim()
-  if (v === '' || RELEASE_RE.test(v)) return null
-  return RELEASE_ERROR
 }
 
 function StatusPill({
@@ -101,34 +72,23 @@ function AppDetail() {
   const [entry, setEntry] = useState<AppEntry | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<AppStatus | 'error' | null>(null)
-  const [latest, setLatest] = useState<AppLatest | null>(null)
-  const [latestError, setLatestError] = useState<string | null>(null)
-  const [release, setRelease] = useState('')
   const [since, setSince] = useState('')
   const [verify, setVerify] = useState<VerifyReport | null>(null)
   const [verifyError, setVerifyError] = useState<string | null>(null)
   const [verifyBusy, setVerifyBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [deployError, setDeployError] = useState<string | null>(null)
   const [lastRun, setLastRun] = useState<string | null>(null)
-  const [deployOpen, setDeployOpen] = useState(false)
-  const [target, setTarget] = useState('')
+  // Bumped after a successful deploy so the registry is re-read.
+  const [nonce, setNonce] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
-    setEntry(null)
     setError(null)
     setStatus(null)
-    setLatest(null)
-    setLatestError(null)
     setVerify(null)
     setVerifyError(null)
-    setLastRun(null)
-    setRelease('')
-    setTarget('')
     setActionError(null)
-    setDeployError(null)
     api.app(appName, controller.signal).then(
       (e) => {
         if (controller.signal.aborted) return
@@ -150,18 +110,8 @@ function AppDetail() {
         if (!controller.signal.aborted) setError(String(e))
       },
     )
-    api.appLatest(appName, controller.signal).then(
-      (l) => {
-        if (controller.signal.aborted) return
-        setLatest(l)
-        if (l.release) setTarget(l.release)
-      },
-      (e) => {
-        if (!controller.signal.aborted) setLatestError(String(e))
-      },
-    )
     return () => controller.abort()
-  }, [appName])
+  }, [appName, nonce])
 
   const act = async (fn: () => Promise<{ run_id: string }>) => {
     setBusy(true)
@@ -171,21 +121,6 @@ function AppDetail() {
       setLastRun(run_id)
     } catch (e) {
       setActionError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const confirmDeploy = async () => {
-    if (releaseError(target) != null) return
-    setBusy(true)
-    setDeployError(null)
-    try {
-      const { run_id } = await api.deploy(appName, target.trim() || undefined)
-      setLastRun(run_id)
-      setDeployOpen(false)
-    } catch (e) {
-      setDeployError(String(e))
     } finally {
       setBusy(false)
     }
@@ -209,8 +144,6 @@ function AppDetail() {
   if (!entry) return <p className="text-muted-foreground">Loading…</p>
 
   const { app, problems } = entry
-  const releaseInvalid = releaseError(release)
-  const targetInvalid = releaseError(target)
 
   return (
     <div className="space-y-6">
@@ -220,37 +153,9 @@ function AppDetail() {
         <Badge variant="secondary">{app.kind}</Badge>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Registry</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-8 gap-y-1 text-sm">
-            <dt className="text-muted-foreground">kind / strategy</dt>
-            <dd>
-              {app.kind} / {app.strategy}
-            </dd>
-            <dt className="text-muted-foreground">release</dt>
-            <dd className="font-mono">{app.release ?? '—'}</dd>
-            <dt className="text-muted-foreground">old release</dt>
-            <dd className="font-mono">{app.old_release ?? '—'}</dd>
-            <dt className="text-muted-foreground">live / old port</dt>
-            <dd>
-              {app.live_port ?? '—'} / {app.old_port ?? '—'}
-            </dd>
-            <dt className="text-muted-foreground">front port</dt>
-            <dd>{app.front_port}</dd>
-            <dt className="text-muted-foreground">hostnames</dt>
-            <dd>{app.hostnames.join(', ') || '—'}</dd>
-            <dt className="text-muted-foreground">image</dt>
-            <dd className="font-mono">{app.image_repo ?? '—'}</dd>
-            <dt className="text-muted-foreground">build host</dt>
-            <dd>{app.build_host ?? 'local'}</dd>
-            <dt className="text-muted-foreground">health</dt>
-            <dd className="font-mono">{app.health_url ?? '—'}</dd>
-          </dl>
-        </CardContent>
-      </Card>
+      <Pipeline app={app} onDeployed={() => setNonce((n) => n + 1)} />
+
+      <RegistryEditor app={app} />
 
       {problems.length > 0 && (
         <Card>
@@ -274,39 +179,9 @@ function AppDetail() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Actions</CardTitle>
+          <CardTitle>Rollback / sync</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-wrap items-start gap-2">
-          <Button
-            disabled={busy}
-            onClick={() => {
-              setDeployError(null)
-              setDeployOpen(true)
-            }}
-          >
-            Deploy…
-          </Button>
-          <div className="flex flex-col gap-1">
-            <Input
-              placeholder="release (default: recorded)"
-              value={release}
-              onChange={(e) => setRelease(e.target.value)}
-              className="w-64 font-mono"
-              aria-invalid={releaseInvalid != null}
-            />
-            {releaseInvalid && (
-              <p className="text-xs text-destructive">{releaseInvalid}</p>
-            )}
-          </div>
-          <Button
-            variant="outline"
-            disabled={busy || releaseInvalid != null}
-            onClick={() =>
-              act(() => api.build(app.name, release.trim() || undefined))
-            }
-          >
-            Build
-          </Button>
           <Button
             variant="outline"
             disabled={busy}
@@ -447,89 +322,6 @@ function AppDetail() {
           )}
         </CardContent>
       </Card>
-
-      <Dialog
-        open={deployOpen}
-        onOpenChange={(open) => {
-          if (!busy) setDeployOpen(open)
-        }}
-      >
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Deploy {app.name}</DialogTitle>
-            <DialogDescription>
-              {strategyHint(app.strategy)}.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4 text-sm">
-            <div className="grid grid-cols-[auto_1fr] items-start gap-x-4 gap-y-3">
-              <span className="pt-2 text-muted-foreground">
-                Current release
-              </span>
-              <span className="pt-2 font-mono">{app.release ?? '—'}</span>
-              <span className="pt-2 text-muted-foreground">Target release</span>
-              <div className="space-y-1">
-                <Input
-                  value={target}
-                  onChange={(e) => setTarget(e.target.value)}
-                  placeholder="release sha"
-                  className="font-mono"
-                  aria-invalid={targetInvalid != null}
-                />
-                {targetInvalid && (
-                  <p className="text-xs text-destructive">{targetInvalid}</p>
-                )}
-                {latestError && (
-                  <p className="text-xs text-muted-foreground">
-                    could not suggest latest: {latestError}
-                  </p>
-                )}
-              </div>
-            </div>
-            {latest?.source && (
-              <p className="text-xs text-muted-foreground">
-                target pre-filled from <span className="font-mono">
-                  {latest.source}
-                </span>
-                {latest.release ? (
-                  <>
-                    {' '}
-                    at <span className="font-mono">{latest.release}</span>
-                  </>
-                ) : null}
-              </p>
-            )}
-
-            <div>
-              <p className="text-muted-foreground">Strategy</p>
-              <p>{strategyHint(app.strategy)}</p>
-            </div>
-
-            <div>
-              <p className="text-muted-foreground">Health gate</p>
-              <p className="font-mono">{app.health_url ?? '—'}</p>
-            </div>
-
-            {deployError && (
-              <p className="text-destructive">{deployError}</p>
-            )}
-          </div>
-
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDeployOpen(false)}
-              disabled={busy}
-            >
-              Cancel
-            </Button>
-            <Button onClick={confirmDeploy} disabled={busy || targetInvalid != null}>
-              {busy ? 'Deploying…' : 'Deploy'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }

@@ -21,6 +21,8 @@ export interface App {
   git_remote: string | null
   branch: string | null
   repo: string | null
+  root: string | null
+  build_repo: string | null
 }
 
 export interface Problem {
@@ -80,6 +82,24 @@ export interface AppLatest {
   source?: string
 }
 
+/** Source state of an app's checkout, from GET /build/apps/{name}/git. */
+export interface AppGit {
+  repo: string
+  branch: string
+  remote_sha: string | null
+  head_sha: string | null
+  dirty: boolean | null
+  error: string | null
+}
+
+/** One local image tag, from GET /build/apps/{name}/images. */
+export interface AppImage {
+  ref: string
+  tag: string
+  size: string | null
+  created: string | null
+}
+
 /** What one upstream served during a verify window. */
 export interface VerifyUpstream {
   first_ms: number
@@ -133,6 +153,72 @@ export function formatStatus(status: string): string {
   return key.charAt(0).toUpperCase() + key.slice(1)
 }
 
+// ---------------------------------------------------------------------------
+// configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Served as a static `/config.json` next to the SPA.
+ *
+ * Same-origin defaults work both through the Vite dev proxy and when the built
+ * app is served from either box. To split the build server from the deploy
+ * server, point one base at the other box, e.g.
+ *   { "buildApi": "/api", "deployApi": "http://100.80.96.4:8088/api" }
+ */
+export interface WebConfig {
+  /** Base for the build-server surface (git, images, builds, transfers). */
+  buildApi: string
+  /** Base for the deploy surface (registry, deploys, runs, verify). */
+  deployApi: string
+  /** Default `target` for a transfer (`ssh`/`taildrop` destination). */
+  transferTarget: string
+}
+
+const DEFAULT_CONFIG: WebConfig = {
+  buildApi: '/api',
+  deployApi: '/api',
+  transferTarget: 'hetzner',
+}
+
+let configPromise: Promise<WebConfig> | null = null
+
+/**
+ * Fetches `/config.json` once and caches the result.
+ *
+ * A missing or malformed file falls back to same-origin defaults rather than
+ * failing the app: the defaults are correct in the common single-box case.
+ */
+export function cfg(): Promise<WebConfig> {
+  if (!configPromise) {
+    configPromise = fetch('/config.json', { cache: 'no-cache' })
+      .then(async (r) =>
+        r.ok ? ((await r.json()) as Partial<WebConfig>) : {},
+      )
+      .catch((): Partial<WebConfig> => ({}))
+      .then((c) => ({ ...DEFAULT_CONFIG, ...c }))
+  }
+  return configPromise
+}
+
+/** Joins a configured base with a relative path, collapsing the slash. */
+function joinBase(base: string, path: string): string {
+  return `${base.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`
+}
+
+/** Resolves a build-server path under the configured `buildApi` base. */
+export async function build(path: string): Promise<string> {
+  return joinBase((await cfg()).buildApi, path)
+}
+
+/** Resolves a deploy-server path under the configured `deployApi` base. */
+export async function deploy(path: string): Promise<string> {
+  return joinBase((await cfg()).deployApi, path)
+}
+
+// ---------------------------------------------------------------------------
+// run streaming
+// ---------------------------------------------------------------------------
+
 /** A live tail of one run's trace. */
 export interface RunStream {
   close(): void
@@ -150,21 +236,30 @@ export interface RunStreamHandlers {
   onEnd?: (status: string | null) => void
 }
 
+/** Which configured base a run's events live on. Defaults to the deploy box. */
+export type EventsApi = 'deploy' | 'build'
+
 /** Transport errors are retried this many times before giving up. */
 const MAX_RETRIES = 3
 /** Fixed delay between transport reconnect attempts. */
 const RETRY_DELAY_MS = 1000
 
 /**
- * Opens the SSE event stream for a run under `/api/events`.
+ * Opens the SSE event stream for a run under `<base>/events`.
  *
- * The server sends the trace as unnamed `message` events, an explicit `done`
- * event when the run writes its `run_end` record, and a named `error` event
- * when it cannot read the log. A transport failure is retried up to three
+ * The events endpoint is resolved through the configured base first, because a
+ * build-server run's log lives on the build box and a deploy run's on the deploy
+ * box. The server sends the trace as unnamed `message` events, an explicit
+ * `done` event when the run writes its `run_end` record, and a named `error`
+ * event when it cannot read the log. A transport failure is retried up to three
  * times; if it keeps failing, `onError` reports it and the stream ends. `onEnd`
  * fires exactly once — with the run_end status when known, otherwise null.
  */
-export function openRunEvents(id: string, handlers: RunStreamHandlers): RunStream {
+export function openRunEvents(
+  id: string,
+  handlers: RunStreamHandlers,
+  apiBase: EventsApi = 'deploy',
+): RunStream {
   const { onEvent, onError, onStatus, onEnd } = handlers
   let closed = false
   let ended = false
@@ -172,6 +267,7 @@ export function openRunEvents(id: string, handlers: RunStreamHandlers): RunStrea
   let retries = 0
   let es: EventSource | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let eventsUrl: string | null = null
 
   const finish = (status: string | null) => {
     if (ended) return
@@ -187,8 +283,8 @@ export function openRunEvents(id: string, handlers: RunStreamHandlers): RunStrea
   }
 
   const connect = () => {
-    if (closed) return
-    es = new EventSource(`/api/events?run=${encodeURIComponent(id)}`)
+    if (closed || eventsUrl == null) return
+    es = new EventSource(eventsUrl)
 
     es.onopen = () => {
       retries = 0
@@ -237,7 +333,21 @@ export function openRunEvents(id: string, handlers: RunStreamHandlers): RunStrea
     }
   }
 
-  connect()
+  // Resolve the events URL through the configured base before connecting; a
+  // close() during resolution cancels the pending connection.
+  const resolve = apiBase === 'build' ? build : deploy
+  resolve(`events?run=${encodeURIComponent(id)}`).then(
+    (url) => {
+      if (closed) return
+      eventsUrl = url
+      connect()
+    },
+    () => {
+      if (closed) return
+      onError?.('could not resolve the events endpoint')
+      finish(null)
+    },
+  )
 
   return {
     close() {
@@ -251,6 +361,10 @@ export function openRunEvents(id: string, handlers: RunStreamHandlers): RunStrea
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
 
 /** An HTTP response that was not ok, carrying the server's status and message. */
 export class ApiError extends Error {
@@ -296,58 +410,123 @@ async function post<T>(
   return json as T
 }
 
+async function put<T>(
+  url: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  })
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const problems = (json as { problems?: { code?: string }[] }).problems
+    const suffix =
+      problems && problems.length > 0
+        ? `: ${problems.map((p) => p.code ?? '?').join(', ')}`
+        : ''
+    throw new ApiError(
+      res.status,
+      ((json as { error?: string }).error ?? `${res.status}`) + suffix,
+    )
+  }
+  return json as T
+}
+
+const enc = encodeURIComponent
+
+export interface UpdateAppResult {
+  ok: boolean
+  backup: string
+}
+
 export const api = {
-  health: (signal?: AbortSignal) =>
-    get<{ status: string }>('/api/health', signal),
-  apps: (signal?: AbortSignal) => get<AppEntry[]>('/api/apps', signal),
-  app: (name: string, signal?: AbortSignal) =>
-    get<AppEntry>(`/api/apps/${encodeURIComponent(name)}`, signal),
-  validate: (signal?: AbortSignal) =>
-    fetch('/api/validate', { method: 'POST', signal }).then(async (r) => ({
-      status: r.status,
-      body: await r.json(),
-    })),
-  render: (app?: string, signal?: AbortSignal) =>
-    fetch(`/api/render${app ? `?app=${encodeURIComponent(app)}` : ''}`, {
-      signal,
-    }).then((r) => r.text()),
-  deploy: (name: string, release?: string, signal?: AbortSignal) =>
+  health: async (signal?: AbortSignal) =>
+    get<{ status: string }>(await deploy('health'), signal),
+  apps: async (signal?: AbortSignal) =>
+    get<AppEntry[]>(await deploy('apps'), signal),
+  app: async (name: string, signal?: AbortSignal) =>
+    get<AppEntry>(await deploy(`apps/${enc(name)}`), signal),
+  validate: async (signal?: AbortSignal) => {
+    const res = await fetch(await deploy('validate'), { method: 'POST', signal })
+    return { status: res.status, body: await res.json() }
+  },
+  render: async (app?: string, signal?: AbortSignal) =>
+    (
+      await fetch(
+        await deploy(`render${app ? `?app=${enc(app)}` : ''}`),
+        { signal },
+      )
+    ).text(),
+  deploy: async (name: string, release?: string, signal?: AbortSignal) =>
     post<{ run_id: string }>(
-      `/api/apps/${encodeURIComponent(name)}/deploys`,
+      await deploy(`apps/${enc(name)}/deploys`),
       { release },
       signal,
     ),
-  rollback: (name: string, signal?: AbortSignal) =>
+  rollback: async (name: string, signal?: AbortSignal) =>
     post<{ run_id: string }>(
-      `/api/apps/${encodeURIComponent(name)}/rollback`,
+      await deploy(`apps/${enc(name)}/rollback`),
       {},
       signal,
     ),
-  build: (name: string, release?: string, signal?: AbortSignal) =>
+  // Build actions go to the build server: this is the same handler as the
+  // legacy `/apps/{name}/build`, surfaced at the build-server path.
+  build: async (name: string, release?: string, signal?: AbortSignal) =>
     post<{ run_id: string }>(
-      `/api/apps/${encodeURIComponent(name)}/build`,
+      await build(`build/apps/${enc(name)}/builds`),
       { release },
       signal,
     ),
-  sync: (name: string, signal?: AbortSignal) =>
+  sync: async (name: string, signal?: AbortSignal) =>
     post<{ run_id: string }>(
-      `/api/apps/${encodeURIComponent(name)}/sync`,
+      await deploy(`apps/${enc(name)}/sync`),
       {},
       signal,
     ),
-  verify: (name: string, since: string, signal?: AbortSignal) =>
+  verify: async (name: string, since: string, signal?: AbortSignal) =>
     get<VerifyReport>(
-      `/api/apps/${encodeURIComponent(name)}/verify?since=${encodeURIComponent(since)}`,
+      await deploy(
+        `apps/${enc(name)}/verify?since=${enc(since)}`,
+      ),
       signal,
     ),
-  runs: (limit = 50, signal?: AbortSignal) =>
-    get<RunSummary[]>(`/api/runs?limit=${limit}`, signal),
-  run: (id: string, signal?: AbortSignal) =>
-    get<TraceEvent[]>(`/api/runs/${encodeURIComponent(id)}`, signal),
-  appStatus: (name: string, signal?: AbortSignal) =>
-    get<AppStatus>(`/api/apps/${encodeURIComponent(name)}/status`, signal),
-  appLatest: (name: string, signal?: AbortSignal) =>
-    get<AppLatest>(`/api/apps/${encodeURIComponent(name)}/latest`, signal),
-  resume: (id: string, signal?: AbortSignal) =>
-    get<ResumeInfo>(`/api/runs/${encodeURIComponent(id)}/resume`, signal),
+  runs: async (limit = 50, signal?: AbortSignal) =>
+    get<RunSummary[]>(await deploy(`runs?limit=${limit}`), signal),
+  run: async (id: string, signal?: AbortSignal) =>
+    get<TraceEvent[]>(await deploy(`runs/${enc(id)}`), signal),
+  resume: async (id: string, signal?: AbortSignal) =>
+    get<ResumeInfo>(await deploy(`runs/${enc(id)}/resume`), signal),
+  appStatus: async (name: string, signal?: AbortSignal) =>
+    get<AppStatus>(await deploy(`apps/${enc(name)}/status`), signal),
+  appLatest: async (name: string, signal?: AbortSignal) =>
+    get<AppLatest>(await deploy(`apps/${enc(name)}/latest`), signal),
+  // Build-server reads.
+  appGit: async (name: string, signal?: AbortSignal) =>
+    get<AppGit>(await build(`build/apps/${enc(name)}/git`), signal),
+  appImages: async (name: string, signal?: AbortSignal) =>
+    get<{ images: AppImage[] }>(
+      await build(`build/apps/${enc(name)}/images`),
+      signal,
+    ),
+  transfer: async (
+    name: string,
+    release: string,
+    target: string,
+    signal?: AbortSignal,
+  ) =>
+    post<{ run_id: string }>(
+      await build(`build/apps/${enc(name)}/transfers`),
+      { release, target },
+      signal,
+    ),
+  updateApp: async (name: string, app: App, signal?: AbortSignal) =>
+    put<UpdateAppResult>(
+      await deploy(`apps/${enc(name)}`),
+      app,
+      signal,
+    ),
 }

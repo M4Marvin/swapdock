@@ -1,32 +1,61 @@
-# React + TypeScript + Vite
+# swapdock web
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React + TypeScript + Vite SPA for the swapdock API, with TanStack Router
+file-based routes under `src/routes/` and shadcn/ui components in
+`src/components/ui/`.
 
-Currently, two official plugins are available:
+## Configuration
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Runtime-only settings live in the static `public/config.json`, fetched once by
+`src/api.ts`:
 
-## React Compiler
+```json
+{ "buildApi": "/api", "deployApi": "/api", "transferTarget": "hetzner" }
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+`buildApi` is the base for the build-server surface (git, images, builds,
+transfers); `deployApi` is the base for everything else (registry, deploys,
+rollback, runs, status, latest, verify). Same-origin defaults work through the
+Vite dev proxy and when the app is served from either box.
 
-## Expanding the Oxlint configuration
+### Split-box deploys
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+To run the SPA against a build server and a deploy server on different
+machines, edit `config.json` and point one base at the other box — no rebuild
+required:
 
 ```json
 {
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+  "buildApi": "/api",
+  "deployApi": "http://100.80.96.4:8088/api",
+  "transferTarget": "hetzner"
 }
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Run events (`EventSource`) are opened on whichever base owns the run: build and
+transfer runs stream from `buildApi`, deploy runs from `deployApi`.
+
+## Pipeline
+
+The app page shows a Build → Transfer → Deploy pipeline. Each stage POSTs its
+run and tails it over SSE, revealing the next stage when its predecessor ends
+`ok`. A transfer is also offered when the target image is already present in
+the build server's image list.
+
+## Commands
+
+```sh
+pnpm install
+pnpm dev       # Vite dev server, proxies /api to 127.0.0.1:8088
+pnpm exec tsc -b
+pnpm build
+```
+
+## Backend gaps
+
+- **Registry editing** has no `PUT /api/apps/{name}` endpoint. The registry
+  editor validates the draft client-side and offers Revert (re-read) and
+  Copy as TOML (paste into the app's `.toml`); it never writes to the server.
+- **Deploy-side image check**: there is no deploy-server images endpoint, so
+  the Deploy stage is enabled when the transfer run ends `ok` (the server has
+  already verified the image with `docker inspect` on the target).

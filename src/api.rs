@@ -89,7 +89,7 @@ fn api_router() -> Router<Shared> {
     Router::new()
         .route("/health", get(health))
         .route("/apps", get(list_apps).post(init_app))
-        .route("/apps/{name}", get(show_app))
+        .route("/apps/{name}", get(show_app).put(update_app))
         .route("/apps/{name}/status", get(app_status))
         .route("/apps/{name}/latest", get(app_latest))
         .route("/apps/{name}/deploys", post(deploy_app))
@@ -198,6 +198,77 @@ async fn show_app(State(state): State<Shared>, Path(name): Path<String>) -> impl
                 .into_response(),
             None => error_response(StatusCode::NOT_FOUND, &format!("no app named {name:?}")),
         },
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Replaces one app's registry file. Refuses when the resulting estate has
+/// errors, so a bad edit cannot brick `validate`. Keeps a `.bak` of the
+/// previous file for revert; `save_app` preserves its mode and owner.
+async fn update_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(app): Json<App>,
+) -> impl IntoResponse {
+    if app.name != name {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("path name {name:?} does not match body name {:?}", app.name),
+        );
+    }
+    let loaded = match load(&state) {
+        Ok(l) => l,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if !loaded.apps.iter().any(|a| a.name == name) {
+        return error_response(StatusCode::NOT_FOUND, &format!("no app named {name:?}"));
+    }
+    let mut apps: Vec<App> = loaded
+        .apps
+        .iter()
+        .map(|a| {
+            if a.name == name {
+                app.clone()
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Same checks `validate` runs: per-app plus cross-app plus tunnel.
+    // Load-time (parse) problems carry over; app problems are recomputed
+    // from the staged apps inside collect_problems.
+    let staged = Loaded {
+        apps,
+        problems: loaded.problems.clone(),
+    };
+    let problems = collect_problems(&state, &staged);
+    let (errors, _) = validator::counts(&problems);
+    if errors > 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("{errors} error(s) in the edited registry; nothing was saved"),
+                "errors": errors,
+                "problems": problems,
+            })),
+        )
+            .into_response();
+    }
+
+    // Rollback copy before the write.
+    let target = state.registry.join(format!("{name}.toml"));
+    let backup = state.registry.join(format!("{name}.toml.bak"));
+    if let Ok(raw) = std::fs::read(&target) {
+        let _ = std::fs::write(&backup, raw);
+    }
+    match crate::registry::save_app(&state.registry, &app) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "backup": backup.display().to_string()})),
+        )
+            .into_response(),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1435,7 +1506,30 @@ mod tests {
         (status, json)
     }
 
-    /// Drives one JSON POST through the router and decodes the response body.
+    /// Drives one JSON PUT through the router and decodes the response body.
+    async fn put_json(
+        state: ServerState,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
     async fn post_json(
         state: ServerState,
         uri: &str,
@@ -1683,6 +1777,40 @@ mod tests {
     }
 
     // ---- latest ----
+
+    #[tokio::test]
+    async fn update_app_saves_a_clean_edit_and_keeps_a_backup() {
+        let (state, _dir) = test_state();
+        let (status, before) = get_json(state.clone(), "/apps/blog").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut edited = before["app"].clone();
+        edited["hostnames"] = serde_json::json!(["blog.example.com", "www.blog.example.com"]);
+
+        let (status, out) = put_json(state.clone(), "/apps/blog", edited).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["ok"], true);
+
+        let (status, after) = get_json(state.clone(), "/apps/blog").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            after["app"]["hostnames"],
+            serde_json::json!(["blog.example.com", "www.blog.example.com"])
+        );
+        assert!(state.registry.join("blog.toml.bak").exists());
+    }
+
+    #[tokio::test]
+    async fn update_app_refuses_an_edit_with_errors() {
+        let (state, _dir) = test_state();
+        let (status, before) = get_json(state.clone(), "/apps/blog").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut edited = before["app"].clone();
+        edited["front_port"] = serde_json::json!(9002);
+
+        let (status, out) = put_json(state, "/apps/blog", edited).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+        assert!(out["errors"].as_u64().unwrap_or(0) > 0);
+    }
 
     #[tokio::test]
     async fn latest_without_a_repo_is_a_conflict() {

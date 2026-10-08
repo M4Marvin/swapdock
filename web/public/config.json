@@ -1,0 +1,5 @@
+{
+  "buildApi": "/api",
+  "deployApi": "/api",
+  "transferTarget": "hetzner"
+}
