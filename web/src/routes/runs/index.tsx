@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { api, type RunSummary } from '../../api'
+import { api, formatStatus, type RunSummary } from '../../api'
+import { Badge } from '@/components/ui/badge'
 import {
   Table,
   TableBody,
@@ -19,7 +20,16 @@ function Runs() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    api.runs().then(setRuns, (e) => setError(String(e)))
+    const controller = new AbortController()
+    api.runs(50, controller.signal).then(
+      (r) => {
+        if (!controller.signal.aborted) setRuns(r)
+      },
+      (e) => {
+        if (!controller.signal.aborted) setError(String(e))
+      },
+    )
+    return () => controller.abort()
   }, [])
 
   return (
@@ -35,6 +45,7 @@ function Runs() {
           <TableHeader>
             <TableRow>
               <TableHead>Run</TableHead>
+              <TableHead>App</TableHead>
               <TableHead>Started</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Steps</TableHead>
@@ -49,8 +60,15 @@ function Runs() {
                     {run.run_id.slice(0, 12)}
                   </Link>
                 </TableCell>
+                <TableCell>
+                  {run.app ?? <span className="text-muted-foreground">—</span>}
+                </TableCell>
                 <TableCell>{run.started}</TableCell>
-                <TableCell>{run.status}</TableCell>
+                <TableCell>
+                  <Badge variant={run.non_ok > 0 ? 'destructive' : 'outline'}>
+                    {formatStatus(run.status)}
+                  </Badge>
+                </TableCell>
                 <TableCell>{run.steps}</TableCell>
                 <TableCell>{run.non_ok || '—'}</TableCell>
               </TableRow>

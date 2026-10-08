@@ -16,13 +16,11 @@ export default defineConfig({
     },
   },
   server: {
+    // Everything the frontend talks to lives under /api, so a single proxy
+    // entry covers it and the SPA's own routes (/, /apps/..., /runs/...) are
+    // left for Vite to serve, keeping deep links working in dev.
     proxy: {
-      '/health': 'http://127.0.0.1:8088',
-      '/apps': 'http://127.0.0.1:8088',
-      '/validate': 'http://127.0.0.1:8088',
-      '/render': 'http://127.0.0.1:8088',
-      '/apply': 'http://127.0.0.1:8088',
-      '/runs': 'http://127.0.0.1:8088',
+      '/api': 'http://127.0.0.1:8088',
     },
   },
 })
