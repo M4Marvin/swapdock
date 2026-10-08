@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { TriangleAlert } from 'lucide-react'
 import { api, type App } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -9,6 +10,14 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 
 /**
  * A draft of every editable App field, with numbers and lists kept as strings
@@ -269,6 +278,7 @@ export function RegistryEditor({ app }: { app: App }) {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saveOk, setSaveOk] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [dangerOpen, setDangerOpen] = useState(false)
 
   useEffect(() => {
     const d = toDraft(app)
@@ -353,6 +363,15 @@ export function RegistryEditor({ app }: { app: App }) {
             {reverting ? 'Reverting…' : 'Revert to saved'}
           </Button>
           <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setDangerOpen(true)}
+            className="border-destructive/50 text-destructive hover:bg-destructive/10 hover:text-destructive"
+          >
+            <TriangleAlert className="size-4" />
+            Danger zone
+          </Button>
+          <Button
             size="sm"
             disabled={saving || !dirty || errorCount > 0}
             onClick={save}
@@ -380,45 +399,6 @@ export function RegistryEditor({ app }: { app: App }) {
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="strategy" error={errors.strategy}>
-            <Input
-              value={draft.strategy}
-              onChange={(e) => set('strategy', e.target.value)}
-              aria-invalid={errors.strategy != null}
-            />
-          </Field>
-          <Field label="front_port" error={errors.front_port}>
-            <Input
-              type="number"
-              value={draft.front_port}
-              onChange={(e) => set('front_port', e.target.value)}
-              aria-invalid={errors.front_port != null}
-            />
-          </Field>
-          <Field label="slot" error={errors.slot}>
-            <Input
-              type="number"
-              value={draft.slot}
-              onChange={(e) => set('slot', e.target.value)}
-              aria-invalid={errors.slot != null}
-            />
-          </Field>
-          <Field label="live_port" error={errors.live_port}>
-            <Input
-              type="number"
-              value={draft.live_port}
-              onChange={(e) => set('live_port', e.target.value)}
-              aria-invalid={errors.live_port != null}
-            />
-          </Field>
-          <Field label="old_port" error={errors.old_port}>
-            <Input
-              type="number"
-              value={draft.old_port}
-              onChange={(e) => set('old_port', e.target.value)}
-              aria-invalid={errors.old_port != null}
-            />
-          </Field>
           <Field label="registry" error={errors.registry}>
             <Input
               value={draft.registry}
@@ -445,20 +425,6 @@ export function RegistryEditor({ app }: { app: App }) {
             <Input
               value={draft.image_repo}
               onChange={(e) => set('image_repo', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="release">
-            <Input
-              value={draft.release}
-              onChange={(e) => set('release', e.target.value)}
-              className="font-mono"
-            />
-          </Field>
-          <Field label="old_release">
-            <Input
-              value={draft.old_release}
-              onChange={(e) => set('old_release', e.target.value)}
               className="font-mono"
             />
           </Field>
@@ -535,21 +501,108 @@ export function RegistryEditor({ app }: { app: App }) {
           </Field>
         </div>
 
-        <div className="flex items-center gap-2">
-          <input
-            id="writes_state"
-            type="checkbox"
-            checked={draft.writes_state}
-            onChange={(e) => set('writes_state', e.target.checked)}
-            className="size-4 accent-primary"
-          />
-          <label htmlFor="writes_state" className="text-sm">
-            writes_state
-          </label>
-          <span className="text-xs text-muted-foreground">
-            app keeps shared local state; forbids the swap strategy
-          </span>
-        </div>
+        <Dialog open={dangerOpen} onOpenChange={setDangerOpen}>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-destructive">
+                <TriangleAlert className="size-5" />
+                Danger zone
+              </DialogTitle>
+              <DialogDescription>
+                These values are managed by deploys or shared across the whole
+                estate. A wrong port, slot, or strategy can take down this app
+                — or every app behind nginx. Hand-editing the release chain can
+                brick rollbacks. Change them only if you know why.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="strategy" error={errors.strategy}>
+                <Input
+                  value={draft.strategy}
+                  onChange={(e) => set('strategy', e.target.value)}
+                  aria-invalid={errors.strategy != null}
+                />
+              </Field>
+              <div className="flex items-center gap-2">
+                <input
+                  id="writes_state"
+                  type="checkbox"
+                  checked={draft.writes_state}
+                  onChange={(e) => set('writes_state', e.target.checked)}
+                  className="size-4 accent-primary"
+                />
+                <label htmlFor="writes_state" className="text-sm">
+                  writes_state
+                </label>
+                <span className="text-xs text-muted-foreground">
+                  forbids the swap strategy
+                </span>
+              </div>
+              <Field label="front_port" error={errors.front_port}>
+                <Input
+                  type="number"
+                  value={draft.front_port}
+                  onChange={(e) => set('front_port', e.target.value)}
+                  aria-invalid={errors.front_port != null}
+                />
+              </Field>
+              <Field label="slot" error={errors.slot}>
+                <Input
+                  type="number"
+                  value={draft.slot}
+                  onChange={(e) => set('slot', e.target.value)}
+                  aria-invalid={errors.slot != null}
+                />
+              </Field>
+              <Field label="live_port" error={errors.live_port}>
+                <Input
+                  type="number"
+                  value={draft.live_port}
+                  onChange={(e) => set('live_port', e.target.value)}
+                  aria-invalid={errors.live_port != null}
+                />
+              </Field>
+              <Field label="old_port" error={errors.old_port}>
+                <Input
+                  type="number"
+                  value={draft.old_port}
+                  onChange={(e) => set('old_port', e.target.value)}
+                  aria-invalid={errors.old_port != null}
+                />
+              </Field>
+              <Field label="release">
+                <Input
+                  value={draft.release}
+                  onChange={(e) => set('release', e.target.value)}
+                  className="font-mono"
+                />
+              </Field>
+              <Field label="old_release">
+                <Input
+                  value={draft.old_release}
+                  onChange={(e) => set('old_release', e.target.value)}
+                  className="font-mono"
+                />
+              </Field>
+            </div>
+            <DialogFooter>
+              <div className="flex w-full flex-wrap items-center gap-2">
+                {dirty && <Badge variant="secondary">unsaved changes</Badge>}
+                <span className="flex-1" />
+                <Button
+                  size="sm"
+                  disabled={saving || !dirty || errorCount > 0}
+                  onClick={save}
+                >
+                  {saving ? 'Saving…' : 'Save'}
+                </Button>
+              </div>
+            </DialogFooter>
+            {saveError && (
+              <p className="text-sm text-destructive">{saveError}</p>
+            )}
+          </DialogContent>
+        </Dialog>
 
         <details className="text-xs">
           <summary className="cursor-pointer select-none text-muted-foreground">
