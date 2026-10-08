@@ -257,7 +257,7 @@ async fn app_latest(State(state): State<Shared>, Path(name): Path<String>) -> im
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    let Some(repo) = app.repo.clone() else {
+    let Some(repo) = app.build_repo.clone().or(app.repo.clone()) else {
         return error_response(
             StatusCode::CONFLICT,
             &format!(
@@ -684,7 +684,7 @@ async fn app_git(State(state): State<Shared>, Path(name): Path<String>) -> impl 
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    let Some(repo) = app.repo.clone() else {
+    let Some(repo) = app.build_repo.clone().or(app.repo.clone()) else {
         return error_response(StatusCode::CONFLICT, "no repo recorded");
     };
     let branch = app.git_branch().to_string();

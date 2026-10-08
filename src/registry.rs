@@ -207,6 +207,13 @@ pub struct App {
     /// source lives elsewhere or is vendored.
     #[serde(default)]
     pub repo: Option<PathBuf>,
+
+    /// Checkout path on the build host, when it differs from `repo` (which
+    /// describes the deploy host). Used by the build-server endpoints
+    /// (`/build/.../git`, release resolution) so the build machine can answer
+    /// from its own checkout. Falls back to `repo` when absent.
+    #[serde(default)]
+    pub build_repo: Option<PathBuf>,
 }
 
 impl App {
@@ -866,6 +873,7 @@ pub(crate) mod tests {
             git_remote: Some("ExampleOrg/main-site".into()),
             branch: Some("master".into()),
             repo: Some(PathBuf::from("/home/marv/apps/main-site")),
+            build_repo: None,
         }
     }
 

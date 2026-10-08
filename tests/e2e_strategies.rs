@@ -135,6 +135,7 @@ impl Estate {
             git_remote: None,
             branch: None,
             repo: None,
+            build_repo: None,
         };
         registry::save_app(&self.registry_dir(), &app).unwrap();
         app
@@ -492,6 +493,7 @@ fn sync_clones_fetches_and_fast_forwards() {
         git_remote: None,
         branch: Some("main".into()),
         repo: None,
+        build_repo: None,
     };
     // Pre-clone from a file URL: no network, same semantics. sync must then
     // fast-forward (short-form git_remote is GitHub-only, so it stays unset).
@@ -593,6 +595,7 @@ fn build_local_clones_checks_out_and_builds() {
         git_remote: Some(format!("file://{}", origin.display())),
         branch: Some("main".into()),
         repo: None,
+        build_repo: None,
     };
 
     let log = swapdock::TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
