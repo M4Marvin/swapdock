@@ -1,0 +1,74 @@
+- generic [active] [ref=f4e1]:
+  - generic [ref=f4e3]:
+    - banner [ref=f4e4]:
+      - strong [ref=f4e5]: swapdock
+      - navigation [ref=f4e6]:
+        - link [ref=f4e235] [cursor=pointer]:
+          - /url: /
+          - text: Apps
+        - link [ref=f4e236] [cursor=pointer]:
+          - /url: /runs
+          - text: Runs
+    - main [ref=f4e9]:
+      - generic [ref=f4e192]:
+        - generic [ref=f4e193]:
+          - heading [level=1] [ref=f4e237]: app1
+          - generic [ref=f4e195]: down
+          - generic [ref=f4e196]: container
+        - generic [ref=f4e197]:
+          - generic [ref=f4e198]: Registry
+          - generic [ref=f4e201]:
+            - term [ref=f4e202]: kind / strategy
+            - definition [ref=f4e203]: container / replace
+            - term [ref=f4e204]: release
+            - definition [ref=f4e205]: —
+            - term [ref=f4e206]: old release
+            - definition [ref=f4e207]: —
+            - term [ref=f4e208]: live / old port
+            - definition [ref=f4e209]: — / —
+            - term [ref=f4e210]: front port
+            - definition [ref=f4e211]: "8101"
+            - term [ref=f4e212]: hostnames
+            - definition [ref=f4e213]: app1.example.com
+            - term [ref=f4e214]: image
+            - definition [ref=f4e215]: example-app1
+            - term [ref=f4e216]: build host
+            - definition [ref=f4e217]: local
+            - term [ref=f4e218]: health
+            - definition [ref=f4e219]: http://127.0.0.1:3000/
+        - generic [ref=f4e220]:
+          - generic [ref=f4e221]: Actions
+          - generic [ref=f4e223]:
+            - button [ref=f4e238]: Deploy…
+            - textbox [ref=f4e239]:
+              - /placeholder: "release (default: recorded)"
+            - button [ref=f4e240]: Build
+            - button [ref=f4e241]: Rollback
+            - button [ref=f4e242]: Sync
+        - generic [ref=f4e229]:
+          - generic [ref=f4e230]: Verify access log
+          - generic [ref=f4e233]:
+            - textbox [ref=f4e243]:
+              - /placeholder: "since: RFC3339 timestamp or run id"
+            - button [disabled]: Check
+  - dialog [ref=f4e247]:
+    - generic [ref=f4e248]:
+      - heading "Deploy app1" [level=2] [ref=f4e249]
+      - paragraph [ref=f4e250]: stop, swap on the same port, health-gate.
+    - generic [ref=f4e251]:
+      - generic [ref=f4e252]:
+        - generic [ref=f4e253]: Current release
+        - generic [ref=f4e254]: —
+        - generic [ref=f4e255]: Target release
+        - textbox "release sha" [ref=f4e256]
+      - generic [ref=f4e257]:
+        - paragraph [ref=f4e258]: Strategy
+        - paragraph [ref=f4e259]: stop, swap on the same port, health-gate
+      - generic [ref=f4e260]:
+        - paragraph [ref=f4e261]: Health gate
+        - paragraph [ref=f4e262]: http://127.0.0.1:3000/
+      - paragraph [ref=f4e269]: "Error: no release to swapdock: pass --release, or record one with a previous swapdock"
+    - generic [ref=f4e263]:
+      - button "Cancel" [ref=f4e264]
+      - button "Deploy" [ref=f4e265]
+    - button "Close" [ref=f4e266]

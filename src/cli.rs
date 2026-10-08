@@ -295,6 +295,7 @@ fn serve(cli: &Cli, bind: &str, paths: &DeployPaths) -> anyhow::Result<()> {
         state_dir: paths.state_dir.clone(),
         lock_dir: paths.lock_dir.clone(),
         drain_secs: paths.drain_secs,
+        transfer_dir: std::env::temp_dir().join("swapdock-transfer"),
     };
     rt.block_on(crate::api::serve(state, bind))
 }

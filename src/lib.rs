@@ -36,6 +36,7 @@ pub mod registry;
 pub mod render;
 pub mod time;
 pub mod trace;
+pub mod transfer;
 pub mod tunnel;
 pub mod validator;
 pub mod verify;

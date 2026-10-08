@@ -1,0 +1,48 @@
+- generic [ref=f4e3]:
+  - banner [ref=f4e4]:
+    - strong [ref=f4e5]: swapdock
+    - navigation [ref=f4e6]:
+      - link "Apps" [ref=f4e7] [cursor=pointer]:
+        - /url: /
+      - link "Runs" [ref=f4e8] [cursor=pointer]:
+        - /url: /runs
+  - main [ref=f4e9]:
+    - generic [ref=f4e192]:
+      - generic [ref=f4e193]:
+        - heading "app1" [level=1] [ref=f4e194]
+        - generic [ref=f4e195]: down
+        - generic [ref=f4e196]: container
+      - generic [ref=f4e197]:
+        - generic [ref=f4e198]: Registry
+        - generic [ref=f4e201]:
+          - term [ref=f4e202]: kind / strategy
+          - definition [ref=f4e203]: container / replace
+          - term [ref=f4e204]: release
+          - definition [ref=f4e205]: —
+          - term [ref=f4e206]: old release
+          - definition [ref=f4e207]: —
+          - term [ref=f4e208]: live / old port
+          - definition [ref=f4e209]: — / —
+          - term [ref=f4e210]: front port
+          - definition [ref=f4e211]: "8101"
+          - term [ref=f4e212]: hostnames
+          - definition [ref=f4e213]: app1.example.com
+          - term [ref=f4e214]: image
+          - definition [ref=f4e215]: example-app1
+          - term [ref=f4e216]: build host
+          - definition [ref=f4e217]: local
+          - term [ref=f4e218]: health
+          - definition [ref=f4e219]: http://127.0.0.1:3000/
+      - generic [ref=f4e220]:
+        - generic [ref=f4e221]: Actions
+        - generic [ref=f4e223]:
+          - button "Deploy…" [ref=f4e224]
+          - 'textbox "release (default: recorded)" [ref=f4e225]'
+          - button "Build" [ref=f4e226]
+          - button "Rollback" [ref=f4e227]
+          - button "Sync" [ref=f4e228]
+      - generic [ref=f4e229]:
+        - generic [ref=f4e230]: Verify access log
+        - generic [ref=f4e233]:
+          - 'textbox "since: RFC3339 timestamp or run id" [ref=f4e234]'
+          - button "Check" [disabled]

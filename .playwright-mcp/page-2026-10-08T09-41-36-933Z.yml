@@ -1,0 +1,181 @@
+- generic [ref=f5e3]:
+  - banner [ref=f5e4]:
+    - strong [ref=f5e5]: swapdock
+    - navigation [ref=f5e6]:
+      - link "Apps" [ref=f5e7] [cursor=pointer]:
+        - /url: /
+      - link "Runs" [ref=f5e8] [cursor=pointer]:
+        - /url: /runs
+  - main [ref=f5e9]:
+    - generic [ref=f5e10]:
+      - generic [ref=f5e11]:
+        - heading "Apps" [level=1] [ref=f5e12]
+        - generic [ref=f5e18]:
+          - generic [ref=f5e19]: 0 errors
+          - generic [ref=f5e20]: 1 warnings
+      - generic [ref=f5e21]:
+        - generic [ref=f5e22]:
+          - generic [ref=f5e23]: Registry
+          - generic [ref=f5e24]: 12 apps
+        - table [ref=f5e28]:
+          - rowgroup [ref=f5e29]:
+            - row [ref=f5e30]:
+              - columnheader "Name" [ref=f5e31]
+              - columnheader "Kind" [ref=f5e32]
+              - columnheader "Strategy" [ref=f5e33]
+              - columnheader "Release" [ref=f5e34]
+              - columnheader "Status" [ref=f5e35]
+              - columnheader "Live port" [ref=f5e36]
+              - columnheader "Hostnames" [ref=f5e37]
+              - columnheader "Last deploy" [ref=f5e38]
+              - columnheader "Issues" [ref=f5e39]
+          - rowgroup [ref=f5e40]:
+            - row [ref=f5e41]:
+              - cell [ref=f5e42]:
+                - link "app1" [ref=f5e43] [cursor=pointer]:
+                  - /url: /apps/app1
+              - cell "container" [ref=f5e44]
+              - cell "replace" [ref=f5e45]
+              - cell "—" [ref=f5e46]
+              - cell "down" [ref=f5e47]
+              - cell "—" [ref=f5e49]
+              - cell "app1.example.com" [ref=f5e50]
+              - cell [ref=f5e51]:
+                - link "1a11ae36 08/10/2026, 15:11:12 Failed" [ref=f5e52] [cursor=pointer]:
+                  - /url: /runs/1a11ae363fa1d5ce2f8b03f2ef6
+                  - generic [ref=f5e53]: 1a11ae36
+                  - generic [ref=f5e54]: 08/10/2026, 15:11:12
+                  - generic [ref=f5e55]: Failed
+              - cell "0" [ref=f5e56]
+            - row [ref=f5e58]:
+              - cell [ref=f5e59]:
+                - link "app10" [ref=f5e60] [cursor=pointer]:
+                  - /url: /apps/app10
+              - cell "container" [ref=f5e61]
+              - cell "replace" [ref=f5e62]
+              - cell "—" [ref=f5e63]
+              - cell "down" [ref=f5e64]
+              - cell "—" [ref=f5e66]
+              - cell "app10.example.com" [ref=f5e67]
+              - cell "—" [ref=f5e68]
+              - cell "0" [ref=f5e69]
+            - row [ref=f5e71]:
+              - cell [ref=f5e72]:
+                - link "app11" [ref=f5e73] [cursor=pointer]:
+                  - /url: /apps/app11
+              - cell "container" [ref=f5e74]
+              - cell "replace" [ref=f5e75]
+              - cell "—" [ref=f5e76]
+              - cell "down" [ref=f5e77]
+              - cell "—" [ref=f5e79]
+              - cell "app11.example.com" [ref=f5e80]
+              - cell "—" [ref=f5e81]
+              - cell "0" [ref=f5e82]
+            - row [ref=f5e84]:
+              - cell [ref=f5e85]:
+                - link "app12" [ref=f5e86] [cursor=pointer]:
+                  - /url: /apps/app12
+              - cell "container" [ref=f5e87]
+              - cell "replace" [ref=f5e88]
+              - cell "—" [ref=f5e89]
+              - cell "down" [ref=f5e90]
+              - cell "—" [ref=f5e92]
+              - cell "app12.example.com" [ref=f5e93]
+              - cell "—" [ref=f5e94]
+              - cell "0" [ref=f5e95]
+            - row [ref=f5e97]:
+              - cell [ref=f5e98]:
+                - link "app2" [ref=f5e99] [cursor=pointer]:
+                  - /url: /apps/app2
+              - cell "container" [ref=f5e100]
+              - cell "replace" [ref=f5e101]
+              - cell "—" [ref=f5e102]
+              - cell "down" [ref=f5e103]
+              - cell "—" [ref=f5e105]
+              - cell "app2.example.com" [ref=f5e106]
+              - cell "—" [ref=f5e107]
+              - cell "0" [ref=f5e108]
+            - row [ref=f5e110]:
+              - cell [ref=f5e111]:
+                - link "app3" [ref=f5e112] [cursor=pointer]:
+                  - /url: /apps/app3
+              - cell "container" [ref=f5e113]
+              - cell "replace" [ref=f5e114]
+              - cell "—" [ref=f5e115]
+              - cell "down" [ref=f5e116]
+              - cell "—" [ref=f5e118]
+              - cell "app3.example.com" [ref=f5e119]
+              - cell "—" [ref=f5e120]
+              - cell "0" [ref=f5e121]
+            - row [ref=f5e123]:
+              - cell [ref=f5e124]:
+                - link "app4" [ref=f5e125] [cursor=pointer]:
+                  - /url: /apps/app4
+              - cell "container" [ref=f5e126]
+              - cell "replace" [ref=f5e127]
+              - cell "—" [ref=f5e128]
+              - cell "down" [ref=f5e129]
+              - cell "—" [ref=f5e131]
+              - cell "app4.example.com" [ref=f5e132]
+              - cell "—" [ref=f5e133]
+              - cell "0" [ref=f5e134]
+            - row [ref=f5e136]:
+              - cell [ref=f5e137]:
+                - link "app5" [ref=f5e138] [cursor=pointer]:
+                  - /url: /apps/app5
+              - cell "container" [ref=f5e139]
+              - cell "replace" [ref=f5e140]
+              - cell "—" [ref=f5e141]
+              - cell "down" [ref=f5e142]
+              - cell "—" [ref=f5e144]
+              - cell "app5.example.com" [ref=f5e145]
+              - cell "—" [ref=f5e146]
+              - cell "0" [ref=f5e147]
+            - row [ref=f5e149]:
+              - cell [ref=f5e150]:
+                - link "app6" [ref=f5e151] [cursor=pointer]:
+                  - /url: /apps/app6
+              - cell "container" [ref=f5e152]
+              - cell "replace" [ref=f5e153]
+              - cell "—" [ref=f5e154]
+              - cell "down" [ref=f5e155]
+              - cell "—" [ref=f5e157]
+              - cell "app6.example.com" [ref=f5e158]
+              - cell "—" [ref=f5e159]
+              - cell "0" [ref=f5e160]
+            - row [ref=f5e162]:
+              - cell [ref=f5e163]:
+                - link "app7" [ref=f5e164] [cursor=pointer]:
+                  - /url: /apps/app7
+              - cell "container" [ref=f5e165]
+              - cell "replace" [ref=f5e166]
+              - cell "—" [ref=f5e167]
+              - cell "down" [ref=f5e168]
+              - cell "—" [ref=f5e170]
+              - cell "app7.example.com" [ref=f5e171]
+              - cell "—" [ref=f5e172]
+              - cell "0" [ref=f5e173]
+            - row [ref=f5e175]:
+              - cell [ref=f5e176]:
+                - link "app8" [ref=f5e177] [cursor=pointer]:
+                  - /url: /apps/app8
+              - cell "container" [ref=f5e178]
+              - cell "replace" [ref=f5e179]
+              - cell "—" [ref=f5e180]
+              - cell "down" [ref=f5e181]
+              - cell "—" [ref=f5e183]
+              - cell "app8.example.com" [ref=f5e184]
+              - cell "—" [ref=f5e185]
+              - cell "0" [ref=f5e186]
+            - row [ref=f5e188]:
+              - cell [ref=f5e189]:
+                - link "app9" [ref=f5e190] [cursor=pointer]:
+                  - /url: /apps/app9
+              - cell "container" [ref=f5e191]
+              - cell "replace" [ref=f5e192]
+              - cell "—" [ref=f5e193]
+              - cell "down" [ref=f5e194]
+              - cell "—" [ref=f5e196]
+              - cell "app9.example.com" [ref=f5e197]
+              - cell "—" [ref=f5e198]
+              - cell "0" [ref=f5e199]

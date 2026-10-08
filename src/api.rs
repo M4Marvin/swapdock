@@ -30,7 +30,7 @@ use serde::Deserialize;
 use crate::deploy::{self, Ctx};
 use crate::registry::{App, Loaded, Problem};
 use crate::trace::{Run, RunMode, RunStatus, TraceEvent, TraceLog};
-use crate::{apply, builder, exec, git, health, validator};
+use crate::{apply, builder, exec, git, health, transfer, validator};
 
 /// How often the SSE handler re-reads the run log for new lines.
 const EVENTS_POLL: Duration = Duration::from_millis(300);
@@ -45,6 +45,14 @@ const EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// an HTTP request open indefinitely.
 const LATEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on each probe behind `/build/apps/{name}/git`. A local ref lookup
+/// or status scan is instant; the bound keeps a wedged checkout from holding an
+/// HTTP request open.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on listing images for `/build/apps/{name}/images`.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Everything the handlers need that the CLI flags used to carry.
 #[derive(Debug, Clone)]
 pub struct ServerState {
@@ -58,6 +66,8 @@ pub struct ServerState {
     pub state_dir: PathBuf,
     pub lock_dir: PathBuf,
     pub drain_secs: u64,
+    /// Where a build-server transfer stages its tarball before sending it.
+    pub transfer_dir: PathBuf,
 }
 
 type Shared = Arc<ServerState>;
@@ -87,6 +97,12 @@ fn api_router() -> Router<Shared> {
         .route("/apps/{name}/build", post(build_app))
         .route("/apps/{name}/sync", post(sync_app))
         .route("/apps/{name}/verify", get(verify_app))
+        // The build-server surface: reads about source and images, plus the
+        // build and transfer mutations. `builds` reuses the `/build` handler.
+        .route("/build/apps/{name}/git", get(app_git))
+        .route("/build/apps/{name}/images", get(app_images))
+        .route("/build/apps/{name}/builds", post(build_app))
+        .route("/build/apps/{name}/transfers", post(transfer_app))
         .route("/validate", post(validate))
         .route("/render", get(render_config))
         .route("/apply", post(apply_config))
@@ -653,6 +669,236 @@ async fn build_app(
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// build-server: source and image reads, transfers
+// ---------------------------------------------------------------------------
+
+/// `GET /build/apps/{name}/git` — the source state of an app's checkout.
+///
+/// Read-only: it resolves refs and scans status through the exec chokepoint
+/// without opening a run, so asking never pollutes the run log. Each probe is
+/// independent; one failing ref yields a null and an error string rather than
+/// failing the whole request.
+async fn app_git(State(state): State<Shared>, Path(name): Path<String>) -> impl IntoResponse {
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let Some(repo) = app.repo.clone() else {
+        return error_response(StatusCode::CONFLICT, "no repo recorded");
+    };
+    let branch = app.git_branch().to_string();
+    match tokio::task::spawn_blocking(move || probe_git(&repo, &branch)).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("git probe failed: {e}"),
+        ),
+    }
+}
+
+/// Runs the three git probes without a run log, tolerating individual failures.
+fn probe_git(repo: &std::path::Path, branch: &str) -> serde_json::Value {
+    let mut errors: Vec<String> = Vec::new();
+
+    let remote_ref = format!("origin/{branch}");
+    let remote_sha =
+        match exec::run_capture(&git::rev_parse_short(repo, &remote_ref).timeout(GIT_TIMEOUT)) {
+            Ok(o) if o.success() && !o.stdout_trimmed().is_empty() => {
+                Some(o.stdout_trimmed().to_string())
+            }
+            Ok(o) => {
+                errors.push(format!(
+                    "{remote_ref}: {}",
+                    probe_reason(o.stderr_trimmed())
+                ));
+                None
+            }
+            Err(e) => {
+                errors.push(format!("{remote_ref}: {e}"));
+                None
+            }
+        };
+
+    let head_sha = match exec::run_capture(&git::rev_parse_short(repo, "HEAD").timeout(GIT_TIMEOUT))
+    {
+        Ok(o) if o.success() && !o.stdout_trimmed().is_empty() => {
+            Some(o.stdout_trimmed().to_string())
+        }
+        Ok(o) => {
+            errors.push(format!("HEAD: {}", probe_reason(o.stderr_trimmed())));
+            None
+        }
+        Err(e) => {
+            errors.push(format!("HEAD: {e}"));
+            None
+        }
+    };
+
+    let dirty = match exec::run_capture(&git::status_porcelain(repo).timeout(GIT_TIMEOUT)) {
+        Ok(o) if o.success() => Some(!o.stdout_trimmed().is_empty()),
+        Ok(o) => {
+            errors.push(format!("status: {}", probe_reason(o.stderr_trimmed())));
+            None
+        }
+        Err(e) => {
+            errors.push(format!("status: {e}"));
+            None
+        }
+    };
+
+    serde_json::json!({
+        "repo": repo.display().to_string(),
+        "branch": branch,
+        "remote_sha": remote_sha,
+        "head_sha": head_sha,
+        "dirty": dirty,
+        "error": if errors.is_empty() { None } else { Some(errors.join("; ")) },
+    })
+}
+
+/// A non-empty probe error, or a generic line when git said nothing.
+fn probe_reason(stderr: &str) -> &str {
+    if stderr.is_empty() {
+        "did not resolve"
+    } else {
+        stderr
+    }
+}
+
+/// `GET /build/apps/{name}/images` — the local tags for an app's image repo.
+///
+/// Read-only, through the chokepoint with no run. An empty list is a valid
+/// answer: the app has simply never been built on this host.
+async fn app_images(State(state): State<Shared>, Path(name): Path<String>) -> impl IntoResponse {
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let Some(image_repo) = app.image_repo.clone() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!("{} has no image_repo recorded", app.name),
+        );
+    };
+    match tokio::task::spawn_blocking(move || list_images(&image_repo)).await {
+        Ok(Ok(images)) => {
+            (StatusCode::OK, Json(serde_json::json!({"images": images}))).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("image list failed: {e}"),
+        ),
+    }
+}
+
+/// Lists `docker images <repo>` as `{ref, tag, size, created}` records.
+fn list_images(repo: &str) -> Result<Vec<serde_json::Value>, String> {
+    let spec = exec::StepSpec::new("docker-images", "docker")
+        .args([
+            "images",
+            repo,
+            "--format",
+            "{{.Repository}}:{{.Tag}}|{{.Size}}|{{.CreatedAt}}",
+        ])
+        .timeout(IMAGE_TIMEOUT);
+    let outcome = exec::run_capture(&spec).map_err(|e| e.to_string())?;
+    if !outcome.success() {
+        return Err(format!(
+            "docker images failed: {}",
+            outcome.stderr_trimmed()
+        ));
+    }
+
+    let mut images = Vec::new();
+    for line in outcome.stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // The CreatedAt value is `YYYY-MM-DD HH:MM:SS +0000 UTC`, which has no
+        // `|`, so three fields are enough.
+        let mut fields = line.splitn(3, '|');
+        let reference = fields.next().unwrap_or("").trim();
+        if reference.is_empty() {
+            continue;
+        }
+        let size = fields.next().map(str::trim).filter(|s| !s.is_empty());
+        let created = fields.next().map(str::trim).filter(|s| !s.is_empty());
+        let tag = reference
+            .rsplit_once(':')
+            .map(|(_, t)| t)
+            .unwrap_or(reference);
+        images.push(serde_json::json!({
+            "ref": reference,
+            "tag": tag,
+            "size": size,
+            "created": created,
+        }));
+    }
+    Ok(images)
+}
+
+#[derive(Deserialize, Default)]
+struct TransferBody {
+    release: Option<String>,
+    target: Option<String>,
+}
+
+/// `POST /build/apps/{name}/transfers` — save an image and load it on `target`.
+///
+/// Validation is complete before `spawn_job` runs, so a bad release or a missing
+/// target answers 409 and opens no run.
+async fn transfer_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Option<TransferBody>>,
+) -> impl IntoResponse {
+    let body = body.unwrap_or_default();
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let Some(release) = body.release.clone() else {
+        return error_response(StatusCode::CONFLICT, "no release: pass release");
+    };
+    if !crate::registry::is_valid_release_arg(&release) {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!("invalid release {release:?}: must be a commit SHA (hex, 4-64 chars)"),
+        );
+    }
+    let Some(target) = body.target.clone().filter(|t| !t.trim().is_empty()) else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "no target: pass an ssh or taildrop destination",
+        );
+    };
+    if app.image_repo.is_none() {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!(
+                "{} has no image_repo recorded; set image_repo before transferring",
+                app.name
+            ),
+        );
+    }
+    let dir = state.transfer_dir.clone();
+    spawn_job(&state, Some(&name), false, move |run| {
+        transfer::transfer(run, &app, &release, &target, &dir)
+            .map(|outcome| {
+                serde_json::json!({
+                    "image_ref": outcome.image_ref,
+                    "target": outcome.target,
+                    "method": outcome.method,
+                })
+            })
+            .map_err(|e| e.to_string())
+    })
+    .into_response()
+}
+
 async fn sync_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
@@ -1102,6 +1348,7 @@ mod tests {
             state_dir: dir.path().join("green"),
             lock_dir: dir.path().join("lock"),
             drain_secs: 0,
+            transfer_dir: dir.path().join("transfer"),
         };
         (state, dir)
     }
@@ -1176,6 +1423,31 @@ mod tests {
                 axum::http::Request::builder()
                     .uri(uri)
                     .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Drives one JSON POST through the router and decodes the response body.
+    async fn post_json(
+        state: ServerState,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -1515,6 +1787,160 @@ mod tests {
             "a read-only query must not appear in the run log: {:?}",
             read.events
         );
+    }
+
+    // ---- build-server ----
+
+    /// Builds a one-commit repo through the chokepoint, so the test itself
+    /// honours the single-spawn rule. `None` when `git` is unavailable.
+    fn make_repo(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).ok()?;
+        let setup_log = TraceLog::open(dir.join("setup.jsonl")).unwrap();
+        let mut setup = Run::start(
+            setup_log,
+            RunMode::Live,
+            None,
+            &["git".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+        let init = crate::exec::StepSpec::new("git-init", "git")
+            .args(["init", "-q"])
+            .cwd(&repo);
+        setup.exec(&init).ok()?;
+        let commit = crate::exec::StepSpec::new("git-commit", "git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "seed",
+            ])
+            .cwd(&repo);
+        let commit = setup.exec(&commit).ok()?;
+        if !commit.success() {
+            return None;
+        }
+        setup.finish(RunStatus::Ok).unwrap();
+        Some(repo)
+    }
+
+    #[tokio::test]
+    async fn git_reports_head_sha_for_a_temp_repo() {
+        let (state, dir) = test_state();
+        let Some(repo) = make_repo(dir.path()) else {
+            eprintln!("SKIP git_reports_head_sha_for_a_temp_repo: git unavailable");
+            return;
+        };
+        point_app_at_repo(&state, &repo);
+
+        let (status, json) = get_json(state, "/api/build/apps/blog/git").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["branch"], "main");
+        assert!(
+            json["head_sha"].as_str().is_some_and(|s| !s.is_empty()),
+            "a committed repo must report a HEAD sha: {json}"
+        );
+        assert_eq!(json["dirty"], false, "{json}");
+        // There is no origin here, so the remote probe is the tolerated failure.
+        assert!(json["remote_sha"].is_null(), "{json}");
+        assert!(json["error"].as_str().is_some(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn git_without_a_repo_is_a_conflict() {
+        let (state, _dir) = test_state();
+        let (status, json) = get_json(state, "/api/build/apps/blog/git").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            json["error"].as_str().unwrap().contains("no repo"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_probe_does_not_write_a_run() {
+        let (state, dir) = test_state();
+        // Not a repo: every probe fails, but the request still answers 200 with
+        // nulls, and no run may be written either way.
+        let repo = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        point_app_at_repo(&state, &repo);
+
+        let (status, json) = get_json(state.clone(), "/api/build/apps/blog/git").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["head_sha"].is_null(), "{json}");
+
+        let read = TraceLog::read(&state.trace).unwrap();
+        assert!(
+            read.events.is_empty(),
+            "a read-only query must not appear in the run log: {:?}",
+            read.events
+        );
+    }
+
+    #[tokio::test]
+    async fn images_lists_or_skips_when_docker_is_missing() {
+        let (state, _dir) = test_state();
+        let (status, json) = get_json(state, "/api/build/apps/blog/images").await;
+        match status {
+            StatusCode::OK => assert!(json["images"].is_array(), "{json}"),
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                eprintln!("SKIP images_lists_or_skips_when_docker_is_missing: docker unavailable")
+            }
+            other => panic!("unexpected status {other}: {json}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transfers_reject_an_invalid_release_without_spawning() {
+        let (state, _dir) = test_state();
+        let (status, json) = post_json(
+            state.clone(),
+            "/api/build/apps/blog/transfers",
+            serde_json::json!({"release": "main; evil", "target": "hetzner"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            json["error"].as_str().unwrap().contains("invalid release"),
+            "{json}"
+        );
+
+        let read = TraceLog::read(&state.trace).unwrap();
+        assert!(
+            read.events.is_empty(),
+            "validation must run before a run is opened: {:?}",
+            read.events
+        );
+    }
+
+    #[tokio::test]
+    async fn build_routes_are_served_at_both_prefixes() {
+        let (state, _dir) = test_state();
+        for uri in ["/api/build/apps/blog/git", "/build/apps/blog/git"] {
+            let (status, _) = get_json(state.clone(), uri).await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{uri} must route to the handler (no repo → 409, not 404)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_route_reuses_the_build_handler() {
+        let (state, _dir) = test_state();
+        // No release recorded on the test app: the shared handler 409s, which
+        // proves the route reached it rather than 404ing.
+        let (status, _) =
+            post_json(state, "/api/build/apps/blog/builds", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     // ---- run summaries ----
