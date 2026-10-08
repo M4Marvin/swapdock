@@ -1,0 +1,12 @@
+[Unit]
+Description=swapdock deploy API (privileged)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/swapdock serve --bind 100.80.96.4:8088 --registry /srv/swapdock/apps --trace /var/log/swapdock/swapdock.jsonl
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
