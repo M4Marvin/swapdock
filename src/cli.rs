@@ -75,10 +75,14 @@ pub struct DeployPaths {
 #[command(name = "swapdock", version, about = ABOUT, long_about = None)]
 pub struct Cli {
     /// Path to the append-only run log.
+    ///
+    /// Defaults to the shared host log the installer creates and logrotate
+    /// watches, so every command — CLI or API — writes and reads one timeline.
+    /// Pass `--trace ./swapdock.jsonl` for a local, unprivileged log.
     #[arg(
         long,
         global = true,
-        default_value = "swapdock.jsonl",
+        default_value = "/var/log/swapdock/swapdock.jsonl",
         value_name = "PATH"
     )]
     pub trace: PathBuf,
@@ -1045,6 +1049,9 @@ fn build_app(
         .map(str::to_string)
         .or(app.release.clone())
         .ok_or_else(|| anyhow::anyhow!("no release: pass --release, or sync the source first"))?;
+    if !crate::registry::is_valid_release_arg(&release) {
+        anyhow::bail!("invalid release {release:?}: must be a commit SHA (hex, 4-64 chars)");
+    }
 
     let env_host = std::env::var("SWAPDOCK_BUILD_HOST").ok();
     let host = builder::resolve_host(build_host, env_host.as_deref(), &app);
@@ -1213,7 +1220,7 @@ mod tests {
     fn parses_a_bare_selftest() {
         let cli = Cli::try_parse_from(["swapdock", "selftest"]).unwrap();
         assert!(matches!(cli.command, Command::Selftest));
-        assert_eq!(cli.trace, PathBuf::from("swapdock.jsonl"));
+        assert_eq!(cli.trace, PathBuf::from("/var/log/swapdock/swapdock.jsonl"));
         assert!(!cli.dry_run);
     }
 

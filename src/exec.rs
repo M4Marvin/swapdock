@@ -290,6 +290,28 @@ impl Run {
     }
 }
 
+/// Runs one command without opening or writing a run log.
+///
+/// For read-only queries (such as resolving the latest release) that must not
+/// appear in the trace. The spawn still happens here, at the single chokepoint,
+/// so `tests/single_spawn_point.rs` still holds. A non-zero exit is a result,
+/// exactly as in [`Run::exec`].
+pub fn run_capture(spec: &StepSpec) -> Result<Outcome, ExecError> {
+    let argv = spec.full_argv();
+    let started = Instant::now();
+    match spawn_and_capture(spec) {
+        Ok((code, stdout, stderr, _, _)) => Ok(Outcome {
+            argv,
+            exit_code: Some(code),
+            stdout,
+            stderr,
+            duration: started.elapsed(),
+            timed_out: false,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// Spawns the child, drains both pipes concurrently, and enforces the timeout.
 ///
 /// The two reader threads matter. Polling `try_wait` while nobody drains the
@@ -909,5 +931,25 @@ mod tests {
         assert!(ok.success());
         assert_eq!(ok.stdout_trimmed(), "x");
         assert!(!ok.timed_out);
+    }
+
+    #[test]
+    fn run_capture_runs_without_touching_a_log() {
+        let dir = TempDir::new().unwrap();
+        let out = run_capture(&sh("echo", "echo hi")).unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout_trimmed(), "hi");
+        // The whole point: a query must not create or append to a run log.
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "run_capture must not write a trace file"
+        );
+    }
+
+    #[test]
+    fn run_capture_reports_a_non_zero_exit_as_a_result() {
+        let out = run_capture(&sh("failing", "exit 4")).unwrap();
+        assert_eq!(out.exit_code, Some(4));
+        assert!(!out.success());
     }
 }

@@ -653,6 +653,7 @@ dependencies = [
  "axum",
  "clap",
  "fs2",
+ "futures-util",
  "serde",
  "serde_json",
  "tempfile",

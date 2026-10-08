@@ -259,6 +259,13 @@ pub fn http_status_with_host(
     path: &str,
     host_header: &str,
 ) -> Result<u16, String> {
+    // The path goes onto the request line verbatim. Refuse anything that could
+    // split the request before a single byte reaches the socket.
+    if !is_safe_probe_path(path) {
+        return Err(format!(
+            "refusing unsafe health path {path:?}: CR, LF, space or control character"
+        ));
+    }
     let host = dial;
     let addr: SocketAddr = format!("{host}:{port}")
         .to_socket_addrs()
@@ -318,12 +325,43 @@ pub fn parse_status(response: &[u8]) -> Result<u16, String> {
 ///
 /// Only the path and query are kept. Host and port always come from the
 /// container being gated, so one registry value serves both blue and green.
+/// A URL with a query but no path (`http://host?x=1`) keeps the query and gains
+/// a leading `/`, because an HTTP request line needs one.
 pub fn probe_path(health_url: &str) -> String {
     let after_scheme = health_url.split("://").nth(1).unwrap_or(health_url);
-    match after_scheme.find('/') {
+    match after_scheme.find(['/', '?']) {
+        // A `?` can only start the query; the path is implicitly `/`.
+        Some(i) if after_scheme.as_bytes()[i] == b'?' => format!("/{}", &after_scheme[i..]),
         Some(i) => after_scheme[i..].to_string(),
         None => "/".to_string(),
     }
+}
+
+/// True when `path` is safe to place on a raw HTTP request line.
+///
+/// The path is registry data, but it is written verbatim into a request. A CR,
+/// LF, space or other control character would let it split the request and
+/// inject a header or a second request, so those are refused.
+pub fn is_safe_probe_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == ' ' || c.is_control())
+}
+
+/// [`probe_path`] with the header-injection check applied.
+///
+/// The API uses this so a hostile `health_url` becomes a 409 rather than a
+/// crafted request; the deploy path is additionally guarded inside
+/// [`http_status_with_host`].
+pub fn checked_probe_path(health_url: &str) -> Result<String, String> {
+    let path = probe_path(health_url);
+    if !is_safe_probe_path(&path) {
+        return Err(format!(
+            "health path {path:?} contains CR, LF, a space or a control character"
+        ));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -343,6 +381,30 @@ mod tests {
         assert_eq!(probe_path("https://host:8443/a/b?x=1&y=2"), "/a/b?x=1&y=2");
         assert_eq!(probe_path("http://127.0.0.1:8001"), "/");
         assert_eq!(probe_path("not-a-url"), "/");
+        // A query with no path still needs a leading slash.
+        assert_eq!(probe_path("http://host?x=1"), "/?x=1");
+        assert_eq!(probe_path("https://host:8443?x=1&y=2"), "/?x=1&y=2");
+    }
+
+    #[test]
+    fn checked_probe_path_rejects_header_injection() {
+        // A CRLF in the path would otherwise split the request and inject a
+        // header (or a whole second request).
+        let err = checked_probe_path("http://127.0.0.1/\r\nX-Evil: 1").unwrap_err();
+        assert!(err.contains("health path"), "{err}");
+        assert!(checked_probe_path("http://127.0.0.1/a b").is_err());
+        assert!(checked_probe_path("http://127.0.0.1/a\tb").is_err());
+        // The ordinary values still pass.
+        assert_eq!(checked_probe_path("http://127.0.0.1/up").unwrap(), "/up");
+        assert_eq!(checked_probe_path("http://host?x=1").unwrap(), "/?x=1");
+    }
+
+    #[test]
+    fn http_status_refuses_a_header_injection_path() {
+        // Port 1 is never bound: if the guard did not fire first, this would
+        // fail with a connect error instead.
+        let err = http_status("127.0.0.1", 1, "/\r\nHost: evil").unwrap_err();
+        assert!(err.contains("unsafe health path"), "{err}");
     }
 
     #[test]

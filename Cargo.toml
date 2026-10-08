@@ -20,9 +20,12 @@ thiserror = "2.0"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+# `axum::response::sse` takes a `Stream`; `stream::unfold` is the whole of what
+# this crate needs from it, so no async-stream or tokio-stream dependency.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 
 [dev-dependencies]

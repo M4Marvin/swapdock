@@ -25,6 +25,17 @@ pub fn rev_parse(dir: &Path, branch: &str) -> StepSpec {
         .args(["rev-parse", &format!("origin/{branch}")])
 }
 
+/// Resolves any ref — a remote branch or `HEAD` — to a short commit name.
+///
+/// A read-only query: it never fetches or touches the checkout, so it is safe
+/// to answer "what would we deploy?" while a run is in flight.
+pub fn rev_parse_short(dir: &Path, refspec: &str) -> StepSpec {
+    StepSpec::new("git-rev-parse-short", "git")
+        .arg("-C")
+        .arg(dir.display().to_string())
+        .args(["rev-parse", "--short", refspec])
+}
+
 /// Fast-forwards the checkout to `origin/<branch>`. Refuses when that is not a
 /// fast-forward, which is the correct behaviour for a swapdock source: history on
 /// the server must never diverge.
@@ -84,6 +95,19 @@ mod tests {
     }
 
     #[test]
+    fn rev_parse_short_asks_for_a_short_ref() {
+        let argv = rev_parse_short(&dir(), "HEAD").full_argv();
+        assert!(
+            argv.ends_with(&[
+                "rev-parse".to_string(),
+                "--short".to_string(),
+                "HEAD".to_string()
+            ]),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
     fn merge_is_fast_forward_only() {
         let argv = merge_ff_only(&dir(), "main").full_argv();
         assert!(argv.contains(&"--ff-only".to_string()), "{argv:?}");
@@ -117,6 +141,7 @@ mod tests {
     fn step_names_are_stable() {
         assert_eq!(fetch(&dir(), "b").name, "git-fetch");
         assert_eq!(rev_parse(&dir(), "b").name, "git-rev-parse");
+        assert_eq!(rev_parse_short(&dir(), "HEAD").name, "git-rev-parse-short");
         assert_eq!(merge_ff_only(&dir(), "b").name, "git-merge");
         assert_eq!(status_porcelain(&dir()).name, "git-status");
         assert_eq!(clone_branch("u", "b", &dir()).name, "git-clone");
