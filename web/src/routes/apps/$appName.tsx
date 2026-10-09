@@ -16,6 +16,8 @@ import { StatusPill } from '@/components/StatusPill'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
   CardContent,
@@ -37,8 +39,19 @@ import {
 } from '@/components/ui/field'
 
 export const Route = createFileRoute('/apps/$appName')({
-  component: AppDetail,
+  component: AppDetailRoute,
 })
+
+/**
+ * Remounts `AppDetail` when the app name changes.
+ *
+ * Verify input, the committed verify window, and the last-run link are local
+ * state; without a keyed remount they would leak from one app to the next.
+ */
+function AppDetailRoute() {
+  const { appName } = Route.useParams()
+  return <AppDetail key={appName} />
+}
 
 function formatMs(ms: number): string {
   const d = new Date(ms)
@@ -101,6 +114,7 @@ function DeployDialog({
       queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
       queryClient.invalidateQueries({ queryKey: queryKeys.apps })
       queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      queryClient.invalidateQueries({ queryKey: queryKeys.latest(app.name) })
       queryClient.invalidateQueries({ queryKey: queryKeys.appStatus(app.name) })
     },
     onError: (error) => {
@@ -203,6 +217,7 @@ function AppDetail() {
   const queryClient = useQueryClient()
   const [since, setSince] = useState('')
   const [deployOpen, setDeployOpen] = useState(false)
+  const [confirmRollback, setConfirmRollback] = useState(false)
   const [lastRun, setLastRun] = useState<string | null>(null)
   // The window the verify query is keyed on; only committed by the Check
   // button so typing does not wipe the results already on screen.
@@ -240,6 +255,7 @@ function AppDetail() {
       queryClient.invalidateQueries({ queryKey: queryKeys.app(appName) })
       queryClient.invalidateQueries({ queryKey: queryKeys.apps })
       queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      queryClient.invalidateQueries({ queryKey: queryKeys.latest(appName) })
       toast.success(`rollback started: ${run_id}`)
     },
     onError: (error) => {
@@ -254,6 +270,7 @@ function AppDetail() {
       queryClient.invalidateQueries({ queryKey: queryKeys.app(appName) })
       queryClient.invalidateQueries({ queryKey: queryKeys.apps })
       queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+      queryClient.invalidateQueries({ queryKey: queryKeys.latest(appName) })
       toast.success(`sync started: ${run_id}`)
     },
     onError: (error) => {
@@ -266,9 +283,34 @@ function AppDetail() {
   const verify = verifyQuery.data
 
   if (appQuery.isError && !appQuery.data) {
-    return <p className="text-destructive">{String(appQuery.error)}</p>
+    return (
+      <div
+        role="alert"
+        className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+      >
+        <span>Could not load {appName}: {errorText(appQuery.error)}</span>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void appQuery.refetch()}
+        >
+          Retry
+        </Button>
+        <Link to="/" className="text-sm underline-offset-4 hover:underline">
+          Back to apps
+        </Link>
+      </div>
+    )
   }
-  if (!appQuery.data) return <p className="text-muted-foreground">Loading…</p>
+  if (!appQuery.data) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-64" />
+        <Skeleton className="h-40 w-full" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
 
   const { app, problems } = appQuery.data
 
@@ -324,16 +366,16 @@ function AppDetail() {
           <Button
             variant="outline"
             disabled={busy}
-            onClick={() => rollbackMutation.mutate()}
+            onClick={() => setConfirmRollback(true)}
           >
-            Rollback
+            {rollbackMutation.isPending ? 'Rolling back…' : 'Rollback'}
           </Button>
           <Button
             variant="outline"
             disabled={busy}
             onClick={() => syncMutation.mutate()}
           >
-            Sync
+            {syncMutation.isPending ? 'Syncing…' : 'Sync'}
           </Button>
           {lastRun && (
             <Link
@@ -345,12 +387,43 @@ function AppDetail() {
             </Link>
           )}
           {actionError && (
-            <p className="w-full text-sm text-destructive">
+            <p role="alert" className="w-full text-sm text-destructive">
               {errorText(actionError)}
             </p>
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={confirmRollback} onOpenChange={setConfirmRollback}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Roll back {app.name}?</DialogTitle>
+            <DialogDescription>
+              This redeploys the app's previous release on production. It
+              cannot be undone from here; run another deploy to move forward
+              again.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setConfirmRollback(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                setConfirmRollback(false)
+                rollbackMutation.mutate()
+              }}
+            >
+              Roll back
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Card>
         <CardHeader>
@@ -358,7 +431,11 @@ function AppDetail() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap gap-2">
+            <Label htmlFor="verify-since" className="sr-only">
+              Since
+            </Label>
             <Input
+              id="verify-since"
               placeholder="since: RFC3339 timestamp or run id"
               value={since}
               onChange={(e) => setSince(e.target.value)}
@@ -374,7 +451,9 @@ function AppDetail() {
           </div>
 
           {verifyQuery.isError && (
-            <p className="text-destructive">{String(verifyQuery.error)}</p>
+            <p role="alert" className="text-destructive">
+              {errorText(verifyQuery.error)}
+            </p>
           )}
 
           {verify && (
