@@ -84,9 +84,12 @@ function Runs() {
                 </TableCell>
                 <TableCell>{formatTime(run.started)}</TableCell>
                 <TableCell>
-                  <Badge variant={run.non_ok > 0 ? 'destructive' : 'outline'}>
-                    {formatStatus(run.status)}
-                  </Badge>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge variant="outline">{formatStatus(run.status)}</Badge>
+                    {run.non_ok > 0 && (
+                      <Badge variant="destructive">{run.non_ok} non-ok</Badge>
+                    )}
+                  </div>
                 </TableCell>
                 <TableCell>{run.steps}</TableCell>
                 <TableCell>{run.non_ok || '—'}</TableCell>

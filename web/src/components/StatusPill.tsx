@@ -48,17 +48,16 @@ export function StatusPill({
   }
   if (isLoading) return <Skeleton className="h-5 w-12 rounded-4xl" />
   if (isError || data === undefined) {
-    return <Badge variant="outline">unknown</Badge>
+    return (
+      <Badge variant="warning" title="health probe failed">
+        unknown
+      </Badge>
+    )
   }
   const code =
     showCode && typeof data.status === 'number' ? ` ${data.status}` : ''
   return isUp(data) ? (
-    <Badge
-      variant="outline"
-      className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-    >
-      up{code}
-    </Badge>
+    <Badge variant="success">up{code}</Badge>
   ) : (
     <Badge variant="destructive">down{code}</Badge>
   )

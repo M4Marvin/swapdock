@@ -217,7 +217,7 @@ function RunDetail() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-baseline gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-xl font-semibold">
           Run <span className="font-mono">{runId.slice(0, 12)}</span>
         </h1>

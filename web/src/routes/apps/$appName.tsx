@@ -351,7 +351,7 @@ function AppDetail() {
                 >
                   {p.severity}
                 </Badge>{' '}
-                <span className="font-mono">{p.code}</span> — {p.message}
+                <span className="font-mono text-xs">{p.code}</span> — {p.message}
               </p>
             ))}
           </CardContent>
@@ -474,8 +474,8 @@ function AppDetail() {
               </div>
 
               {Object.keys(verify.by_status).length > 0 && (
-                <div>
-                  <p className="mb-1 text-sm text-muted-foreground">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium tracking-wide uppercase text-muted-foreground">
                     By status
                   </p>
                   <div className="flex flex-wrap gap-2">
@@ -494,8 +494,8 @@ function AppDetail() {
               )}
 
               {Object.keys(verify.upstreams).length > 0 && (
-                <div>
-                  <p className="mb-1 text-sm text-muted-foreground">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium tracking-wide uppercase text-muted-foreground">
                     Upstreams
                   </p>
                   <ul className="space-y-1 text-sm">

@@ -453,11 +453,11 @@ export function RegistryEditor({ app }: { app: App }) {
             </p>
           )}
 
-          <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
-            <span className="pt-1.5 text-muted-foreground">name</span>
-            <span className="pt-1.5 font-mono">{app.name}</span>
-            <span className="pt-1.5 text-muted-foreground">kind</span>
-            <span className="pt-1.5 font-mono">{app.kind}</span>
+          <div className="grid grid-cols-[auto_1fr] items-baseline gap-x-4 gap-y-3 text-sm">
+            <span className="text-muted-foreground">name</span>
+            <span className="font-mono">{app.name}</span>
+            <span className="text-muted-foreground">kind</span>
+            <span className="font-mono">{app.kind}</span>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -533,7 +533,7 @@ export function RegistryEditor({ app }: { app: App }) {
           <DialogContent className="max-w-2xl">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2 text-destructive">
-                <TriangleAlert className="size-5" />
+                <TriangleAlert className="size-4" />
                 Danger zone
               </DialogTitle>
               <DialogDescription>

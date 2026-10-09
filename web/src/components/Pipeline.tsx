@@ -92,7 +92,7 @@ function StateBadge({ state }: { state: StageState }) {
     default:
       return (
         <Badge variant="outline" className="text-muted-foreground">
-          idle
+          not started
         </Badge>
       )
   }
@@ -410,7 +410,7 @@ export function Pipeline({
             />
           </div>
           {releaseValue !== '' && releaseInvalid && (
-            <p id="pipeline-release-error" className="pb-1 text-xs text-destructive">
+            <p id="pipeline-release-error" className="text-xs text-destructive">
               must be a commit SHA (hex, 4-64 chars)
             </p>
           )}
@@ -425,18 +425,18 @@ export function Pipeline({
             </Button>
           )}
           {git ? (
-            <p className="pb-1 font-mono text-xs text-muted-foreground">
+            <p className="font-mono text-xs text-muted-foreground">
               {git.branch}
               {git.remote_sha ? ` · remote ${git.remote_sha}` : ''}
               {git.head_sha ? ` · head ${git.head_sha}` : ''}
               {git.dirty ? ' · dirty' : ''}
             </p>
           ) : gitQuery.isError ? (
-            <p className="pb-1 text-xs text-muted-foreground">
+            <p className="text-xs text-muted-foreground">
               source state unavailable
             </p>
           ) : (
-            <Skeleton className="mb-1 h-4 w-48" />
+            <Skeleton className="h-4 w-48" />
           )}
         </div>
 
@@ -526,7 +526,12 @@ export function Pipeline({
               )}
 
               {i < stageOrder.length - 1 && (
-                <div className="text-center text-muted-foreground">↓</div>
+                <div
+                  aria-hidden="true"
+                  className="pl-1 text-xs text-muted-foreground"
+                >
+                  ↓
+                </div>
               )}
             </div>
           )

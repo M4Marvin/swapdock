@@ -81,14 +81,7 @@ function UpdateChip({
     )
   }
   if (release != null && release === remote) {
-    return (
-      <Badge
-        variant="outline"
-        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-      >
-        up to date
-      </Badge>
-    )
+    return <Badge variant="success">up to date</Badge>
   }
   return (
     <Badge variant="secondary" title={latest.source}>
@@ -180,8 +173,8 @@ function AppRow({
       </TableCell>
       <TableCell>{app.kind}</TableCell>
       <TableCell>{app.strategy}</TableCell>
-      <TableCell className="font-mono text-xs">
-        {app.release ?? '—'}
+      <TableCell className="font-mono text-xs" title={app.release ?? undefined}>
+        {app.release ? app.release.slice(0, 12) : '—'}
       </TableCell>
       <TableCell>
         <UpdateChip
@@ -209,9 +202,10 @@ function AppRow({
             <span className="text-muted-foreground">
               {formatTime(newest.started)}
             </span>
-            <Badge variant={newest.non_ok > 0 ? 'destructive' : 'outline'}>
-              {formatStatus(newest.status)}
-            </Badge>
+            <Badge variant="outline">{formatStatus(newest.status)}</Badge>
+            {newest.non_ok > 0 && (
+              <Badge variant="destructive">{newest.non_ok} non-ok</Badge>
+            )}
           </Link>
         ) : (
           <span className="text-muted-foreground">—</span>
@@ -233,9 +227,10 @@ function AppRow({
                 <span className="font-mono text-xs">
                   {run.run_id.slice(0, 8)}
                 </span>
-                <Badge variant={run.non_ok > 0 ? 'destructive' : 'outline'}>
-                  {formatStatus(run.status)}
-                </Badge>
+                <Badge variant="outline">{formatStatus(run.status)}</Badge>
+                {run.non_ok > 0 && (
+                  <Badge variant="destructive">{run.non_ok} non-ok</Badge>
+                )}
               </Link>
             ))}
           </div>
@@ -338,8 +333,11 @@ function Index() {
       )}
 
       {appsQuery.isPending && (
-        <Card>
-          <CardContent className="space-y-2 pt-4">
+        <Card className="py-0">
+          <CardHeader className="border-b py-4">
+            <Skeleton className="h-5 w-24" />
+          </CardHeader>
+          <CardContent className="space-y-3 px-6 py-4">
             <Skeleton className="h-6 w-full" />
             <Skeleton className="h-6 w-full" />
             <Skeleton className="h-6 w-2/3" />
