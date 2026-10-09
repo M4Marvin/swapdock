@@ -315,6 +315,7 @@ export function RegistryEditor({ app }: { app: App }) {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
       queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+      queryClient.invalidateQueries({ queryKey: queryKeys.validate })
       toast.success('Registry saved', {
         description: `saved, .bak created${result.backup ? ` (${result.backup})` : ''}`,
       })
@@ -361,6 +362,11 @@ export function RegistryEditor({ app }: { app: App }) {
   }, [app, isDirty, form])
 
   const saving = saveMutation.isPending
+  const saveHint = errorCount > 0
+    ? 'fix field errors first'
+    : !isDirty
+      ? 'no changes to save'
+      : undefined
   const saveError = saveMutation.error
     ? saveMutation.error instanceof Error
       ? saveMutation.error.message
@@ -375,7 +381,9 @@ export function RegistryEditor({ app }: { app: App }) {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
     } catch {
-      // Clipboard access can be denied; the <details> block still shows it.
+      toast.error('Copy failed', {
+        description: 'Select the Draft TOML below and copy it manually.',
+      })
     }
   }
 
@@ -433,13 +441,16 @@ export function RegistryEditor({ app }: { app: App }) {
               type="submit"
               size="sm"
               disabled={saving || !isDirty || errorCount > 0}
+              title={(saving || !isDirty || errorCount > 0) ? saveHint : undefined}
             >
               {saving ? 'Saving…' : 'Save'}
             </Button>
           </div>
 
           {saveError && !dangerOpen && (
-            <p className="text-sm text-destructive">{saveError}</p>
+            <p role="alert" className="text-sm text-destructive">
+              {saveError}
+            </p>
           )}
 
           <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
@@ -636,6 +647,7 @@ export function RegistryEditor({ app }: { app: App }) {
                     type="submit"
                     size="sm"
                     disabled={saving || !isDirty || errorCount > 0}
+                    title={(saving || !isDirty || errorCount > 0) ? saveHint : undefined}
                   >
                     {saving ? 'Saving…' : 'Save'}
                   </Button>
