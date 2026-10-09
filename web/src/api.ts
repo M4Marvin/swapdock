@@ -153,6 +153,40 @@ export function formatStatus(status: string): string {
   return key.charAt(0).toUpperCase() + key.slice(1)
 }
 
+/** Coarse outcome, folding the API's statuses onto one small set. */
+export type StatusOutcome = 'ok' | 'failed' | 'dry' | 'interrupted' | 'unknown'
+
+/**
+ * Classifies a run or step status.
+ *
+ * The API serializes statuses as snake_case (`ok`, `failed`, `dry_run`,
+ * `interrupted`) but `/resume` renders them with Rust's `Debug` spelling
+ * (`Ok`, `DryRun`). Match a closed set rather than a substring, so `revoked`
+ * or `not ok` can never read as success. Step-only statuses (`error`,
+ * `timeout`) fold onto `failed`.
+ */
+export function classifyStatus(status: string | null | undefined): StatusOutcome {
+  if (status == null) return 'unknown'
+  switch (status.trim().toLowerCase().replace(/[\s-]+/g, '_')) {
+    case 'ok':
+    case 'success':
+    case 'succeeded':
+      return 'ok'
+    case 'failed':
+    case 'failure':
+    case 'error':
+    case 'timeout':
+      return 'failed'
+    case 'dry_run':
+    case 'dryrun':
+      return 'dry'
+    case 'interrupted':
+      return 'interrupted'
+    default:
+      return 'unknown'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // configuration
 // ---------------------------------------------------------------------------

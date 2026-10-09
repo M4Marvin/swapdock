@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import {
   api,
   cfg,
+  classifyStatus,
   formatStatus,
   openRunEvents,
   type App,
@@ -17,6 +18,7 @@ import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
@@ -24,11 +26,19 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 
 /** The three stages a release moves through, in order. */
 type Stage = 'build' | 'transfer' | 'deploy'
 
-type StageState = 'idle' | 'active' | 'ok' | 'failed'
+type StageState = 'idle' | 'active' | 'ok' | 'failed' | 'dry'
 
 interface StageInfo {
   state: StageState
@@ -45,15 +55,23 @@ const EMPTY_STAGE: StageInfo = {
   error: null,
 }
 
+const EMPTY_STAGES: Record<Stage, StageInfo> = {
+  build: EMPTY_STAGE,
+  transfer: EMPTY_STAGE,
+  deploy: EMPTY_STAGE,
+}
+
 /** A release is a commit SHA: hex, 4-64 chars. */
 const RELEASE_RE = /^[0-9a-fA-F]{4,64}$/
 
 /** How many recent step lines to keep visible per stage. */
 const VISIBLE_STEPS = 8
 
-/** True for the terminal statuses that mean the stage succeeded. */
-function isOk(status: string | null): boolean {
-  return status != null && /ok|succeed|dry.?run/i.test(status)
+/** Operator-facing text for a thrown value. */
+function errorText(e: unknown): string {
+  if (e instanceof Error) return e.message
+  if (typeof e === 'string') return e
+  return 'unexpected error'
 }
 
 function StateBadge({ state }: { state: StageState }) {
@@ -61,19 +79,14 @@ function StateBadge({ state }: { state: StageState }) {
     case 'active':
       return (
         <Badge variant="secondary" className="gap-1">
-          <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+          <span className="size-1.5 animate-pulse rounded-full bg-warning" />
           running
         </Badge>
       )
     case 'ok':
-      return (
-        <Badge
-          variant="outline"
-          className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-        >
-          ok
-        </Badge>
-      )
+      return <Badge variant="success">ok</Badge>
+    case 'dry':
+      return <Badge variant="secondary">dry run</Badge>
     case 'failed':
       return <Badge variant="destructive">failed</Badge>
     default:
@@ -88,11 +101,10 @@ function StateBadge({ state }: { state: StageState }) {
 /** Compact one-line status for a streamed step. */
 function StepLine({ step }: { step: TraceEvent }) {
   const failed =
-    step.status === 'error' ||
-    step.status === 'timeout' ||
+    classifyStatus(step.status) === 'failed' ||
     (step.exit_code != null && step.exit_code !== 0)
   return (
-    <div className="flex items-center gap-2 font-mono text-xs">
+    <div className="flex items-center gap-2 font-mono text-xs animate-in fade-in slide-in-from-bottom-1 duration-150">
       <span className={failed ? 'text-destructive' : 'text-muted-foreground'}>
         {step.status ? formatStatus(step.status) : '—'}
       </span>
@@ -114,6 +126,9 @@ function StepLine({ step }: { step: TraceEvent }) {
  * opens a run through its configured base (build stages on the build server,
  * deploy on the deploy server) and tails it over SSE, revealing the next stage
  * when its predecessor ends `ok`.
+ *
+ * The release is pinned when the flow starts, so a later edit to the field can
+ * never ship a different commit SHA than the one that was built.
  */
 export function Pipeline({
   app,
@@ -125,11 +140,9 @@ export function Pipeline({
 }) {
   const queryClient = useQueryClient()
   const [release, setRelease] = useState('')
-  const [stages, setStages] = useState<Record<Stage, StageInfo>>({
-    build: EMPTY_STAGE,
-    transfer: EMPTY_STAGE,
-    deploy: EMPTY_STAGE,
-  })
+  const [stages, setStages] = useState<Record<Stage, StageInfo>>(EMPTY_STAGES)
+  const [pinnedRelease, setPinnedRelease] = useState<string | null>(null)
+  const [confirmDeploy, setConfirmDeploy] = useState(false)
 
   const gitQuery = useQuery({
     queryKey: queryKeys.git(app.name),
@@ -153,15 +166,29 @@ export function Pipeline({
     transfer: null,
     deploy: null,
   })
+  // Flips false on unmount so an in-flight POST cannot open a stream or fire
+  // toasts from a component that is already gone.
+  const alive = useRef(true)
+  // Set once the operator edits the release field, so a background git refetch
+  // never clobbers a value they cleared or changed.
+  const releaseTouched = useRef(false)
 
   const closeStreams = () => {
     for (const stream of Object.values(streams.current)) stream?.close()
     streams.current = { build: null, transfer: null, deploy: null }
   }
 
+  const resetFlow = () => {
+    setStages(EMPTY_STAGES)
+    setPinnedRelease(null)
+    closeStreams()
+  }
+
   useEffect(() => {
-    setStages({ build: EMPTY_STAGE, transfer: EMPTY_STAGE, deploy: EMPTY_STAGE })
+    setStages(EMPTY_STAGES)
     setRelease('')
+    setPinnedRelease(null)
+    releaseTouched.current = false
     closeStreams()
   }, [app.name])
 
@@ -169,11 +196,15 @@ export function Pipeline({
   // without clobbering a value the user has already typed.
   useEffect(() => {
     const remote = gitQuery.data?.remote_sha
-    if (remote) setRelease((cur) => cur || remote)
+    if (remote && !releaseTouched.current) setRelease(remote)
   }, [gitQuery.data])
 
   useEffect(() => {
-    return () => closeStreams()
+    alive.current = true
+    return () => {
+      alive.current = false
+      closeStreams()
+    }
   }, [])
 
   const buildMutation = useMutation({
@@ -192,19 +223,35 @@ export function Pipeline({
   })
 
   const releaseValue = release.trim()
-  const releaseInvalid =
-    releaseValue === '' || !RELEASE_RE.test(releaseValue)
+  const releaseInvalid = releaseValue === '' || !RELEASE_RE.test(releaseValue)
+  // The release the flow is bound to once it starts.
+  const releaseForFlow = pinnedRelease ?? releaseValue
   const imageRef =
-    app.image_repo && releaseValue ? `${app.image_repo}:${releaseValue}` : null
+    app.image_repo && releaseForFlow
+      ? `${app.image_repo}:${releaseForFlow}`
+      : null
+
+  const anyStageActive = (Object.keys(stages) as Stage[]).some(
+    (s) => stages[s].state === 'active',
+  )
+  const flowActive = pinnedRelease !== null
+  const releaseLocked = flowActive || anyStageActive
 
   /** POST a stage's run, then tail it, enabling the next stage on `ok`. */
-  const start = (stage: Stage, fn: () => Promise<{ run_id: string }>) => {
+  const start = (
+    stage: Stage,
+    releaseForStage: string,
+    fn: () => Promise<{ run_id: string }>,
+  ) => {
+    if (pinnedRelease === null) setPinnedRelease(releaseForStage)
+    const toastId = `${app.name}:${stage}`
     setStages((cur) => ({
       ...cur,
       [stage]: { state: 'active', runId: null, steps: [], error: null },
     }))
     fn().then(
       ({ run_id }) => {
+        if (!alive.current) return
         setStages((cur) => ({
           ...cur,
           [stage]: { ...cur[stage], runId: run_id },
@@ -225,48 +272,69 @@ export function Pipeline({
                 ...cur,
                 [stage]: { ...cur[stage], state: 'failed', error: message },
               }))
-              toast.error(`${stage} failed`, { description: message })
+              toast.error(`${stage} failed`, { id: toastId, description: message })
             },
             onEnd: (status) => {
-              const ok = isOk(status)
+              const outcome = classifyStatus(status)
+              const ok = outcome === 'ok'
+              const dry = outcome === 'dry'
               if (ok) {
                 if (stage === 'build' && imageRef) {
-                  toast.success(`build ok: ${imageRef}`)
+                  toast.success(`build ok: ${imageRef}`, { id: toastId })
                   queryClient.invalidateQueries({
                     queryKey: queryKeys.images(app.name),
                   })
                 }
-                if (stage === 'transfer') toast.success('transfer ok')
+                if (stage === 'transfer')
+                  toast.success('transfer ok', { id: toastId })
                 if (stage === 'deploy') {
-                  toast.success('deploy ok')
+                  toast.success('deploy ok', { id: toastId })
                   onDeployed?.()
                 }
+              } else if (dry) {
+                toast.message(`${stage} finished as a dry run`, {
+                  id: toastId,
+                  description: 'Nothing was changed.',
+                })
               } else {
-                const detail = status ? `ended: ${status}` : 'stream closed'
-                toast.error(`${stage} failed`, { description: detail })
+                const detail = status
+                  ? `ended: ${formatStatus(status)}`
+                  : 'stream closed'
+                toast.error(`${stage} failed`, { id: toastId, description: detail })
               }
               setStages((cur) => ({
                 ...cur,
                 [stage]: {
                   ...cur[stage],
-                  state: ok ? 'ok' : 'failed',
-                  error: ok
-                    ? null
-                    : (cur[stage].error ?? (status ? `ended: ${status}` : 'stream closed')),
+                  state: ok ? 'ok' : dry ? 'dry' : 'failed',
+                  error:
+                    ok || dry
+                      ? null
+                      : (cur[stage].error ??
+                        (status
+                          ? `ended: ${formatStatus(status)}`
+                          : 'stream closed')),
                 },
               }))
             },
           },
           stage === 'deploy' ? 'deploy' : 'build',
         )
+        // The component may have unmounted while the POST was in flight.
+        if (!alive.current) {
+          stream.close()
+          return
+        }
         streams.current[stage]?.close()
         streams.current[stage] = stream
       },
       (e) => {
-        toast.error(`${stage} failed`, { description: String(e) })
+        if (!alive.current) return
+        const message = errorText(e)
+        toast.error(`${stage} failed`, { id: toastId, description: message })
         setStages((cur) => ({
           ...cur,
-          [stage]: { ...cur[stage], state: 'failed', error: String(e) },
+          [stage]: { ...cur[stage], state: 'failed', error: message },
         }))
       },
     )
@@ -285,6 +353,21 @@ export function Pipeline({
   const deployEnabled =
     !releaseInvalid && transferOk && stages.deploy.state !== 'active'
 
+  // Why a stage button is disabled, surfaced through `title`.
+  const releaseHint = releaseInvalid ? 'enter a valid commit SHA first' : undefined
+  const transferHint = releaseInvalid
+    ? releaseHint
+    : transferTarget == null
+      ? 'no transfer target configured'
+      : !(buildOk || imageExists)
+        ? 'build the release first, or make sure its image exists'
+        : undefined
+  const deployHint = releaseInvalid
+    ? releaseHint
+    : !transferOk
+      ? 'transfer this release first'
+      : undefined
+
   const stageOrder: Stage[] = ['build', 'transfer', 'deploy']
 
   return (
@@ -300,21 +383,46 @@ export function Pipeline({
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-end gap-3">
           <div className="flex flex-col gap-1">
-            <label className="text-xs text-muted-foreground">
+            <Label htmlFor="pipeline-release" className="text-muted-foreground">
               Target release
-            </label>
+            </Label>
             <Input
+              id="pipeline-release"
               value={release}
-              onChange={(e) => setRelease(e.target.value)}
+              onChange={(e) => {
+                releaseTouched.current = true
+                setRelease(e.target.value)
+              }}
+              disabled={releaseLocked}
+              title={
+                releaseLocked
+                  ? 'locked while a pipeline flow is in progress'
+                  : undefined
+              }
               placeholder="commit sha"
               className="w-64 font-mono"
               aria-invalid={releaseValue !== '' && releaseInvalid}
+              aria-describedby={
+                releaseValue !== '' && releaseInvalid
+                  ? 'pipeline-release-error'
+                  : undefined
+              }
             />
           </div>
           {releaseValue !== '' && releaseInvalid && (
-            <p className="pb-1 text-xs text-destructive">
+            <p id="pipeline-release-error" className="pb-1 text-xs text-destructive">
               must be a commit SHA (hex, 4-64 chars)
             </p>
+          )}
+          {flowActive && !anyStageActive && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={resetFlow}
+            >
+              Start over
+            </Button>
           )}
           {git ? (
             <p className="pb-1 font-mono text-xs text-muted-foreground">
@@ -355,9 +463,10 @@ export function Pipeline({
                     size="sm"
                     variant="outline"
                     disabled={releaseInvalid || info.state === 'active'}
+                    title={info.state === 'active' ? undefined : releaseHint}
                     onClick={() =>
-                      start('build', () =>
-                        buildMutation.mutateAsync({ release: releaseValue }),
+                      start('build', releaseForFlow, () =>
+                        buildMutation.mutateAsync({ release: releaseForFlow }),
                       )
                     }
                   >
@@ -369,15 +478,11 @@ export function Pipeline({
                     size="sm"
                     variant="outline"
                     disabled={!transferEnabled}
-                    title={
-                      buildOk || imageExists
-                        ? undefined
-                        : 'build the release first, or make sure its image exists'
-                    }
+                    title={transferEnabled ? undefined : transferHint}
                     onClick={() =>
-                      start('transfer', () =>
+                      start('transfer', releaseForFlow, () =>
                         transferMutation.mutateAsync({
-                          release: releaseValue,
+                          release: releaseForFlow,
                           target: transferTarget ?? '',
                         }),
                       )
@@ -390,11 +495,8 @@ export function Pipeline({
                   <Button
                     size="sm"
                     disabled={!deployEnabled}
-                    onClick={() =>
-                      start('deploy', () =>
-                        api.deploy(app.name, releaseValue),
-                      )
-                    }
+                    title={deployEnabled ? undefined : deployHint}
+                    onClick={() => setConfirmDeploy(true)}
                   >
                     {info.state === 'active' ? 'Deploying…' : 'Deploy'}
                   </Button>
@@ -430,6 +532,39 @@ export function Pipeline({
           )
         })}
       </CardContent>
+
+      <Dialog open={confirmDeploy} onOpenChange={setConfirmDeploy}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Deploy {app.name}?</DialogTitle>
+            <DialogDescription>
+              This runs the deploy for release{' '}
+              <span className="font-mono">{releaseForFlow}</span>. It ships to
+              production and cannot be undone from here.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setConfirmDeploy(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                setConfirmDeploy(false)
+                start('deploy', releaseForFlow, () =>
+                  api.deploy(app.name, releaseForFlow),
+                )
+              }}
+            >
+              Deploy
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }
