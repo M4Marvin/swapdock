@@ -18,7 +18,7 @@ export const Route = createRootRoute({
       <main className="p-6">
         <Outlet />
       </main>
-      <Toaster richColors position="bottom-right" />
+      <Toaster position="bottom-right" />
     </div>
   ),
 })
