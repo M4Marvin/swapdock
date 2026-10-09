@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { api, formatStatus } from '../../api'
 import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -17,6 +18,12 @@ export const Route = createFileRoute('/runs/')({
   component: Runs,
 })
 
+/** Formats an RFC3339 timestamp for display, falling back to the raw value. */
+function formatTime(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
+}
+
 function Runs() {
   const runsQuery = useQuery({
     queryKey: queryKeys.runs,
@@ -28,7 +35,19 @@ function Runs() {
     <div className="space-y-4">
       <h1 className="text-xl font-semibold">Runs</h1>
       {runsQuery.isError && (
-        <p className="text-destructive">{String(runsQuery.error)}</p>
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <span>Could not load runs: {String(runsQuery.error)}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runsQuery.refetch()}
+          >
+            Retry
+          </Button>
+        </div>
       )}
       {runsQuery.isPending && (
         <div className="space-y-2">
@@ -63,7 +82,7 @@ function Runs() {
                 <TableCell>
                   {run.app ?? <span className="text-muted-foreground">—</span>}
                 </TableCell>
-                <TableCell>{run.started}</TableCell>
+                <TableCell>{formatTime(run.started)}</TableCell>
                 <TableCell>
                   <Badge variant={run.non_ok > 0 ? 'destructive' : 'outline'}>
                     {formatStatus(run.status)}

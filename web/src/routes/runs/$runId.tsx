@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ApiError,
   api,
+  classifyStatus,
   formatStatus,
   openRunEvents,
   type RunStream,
@@ -11,6 +12,7 @@ import {
 } from '../../api'
 import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
@@ -35,40 +37,41 @@ export const Route = createFileRoute('/runs/$runId')({
 /** How long the client waits without an event before closing the stream. */
 const IDLE_TIMEOUT_MS = 60_000
 
+/** Operator-facing text for a thrown value. */
+function errorText(e: unknown): string {
+  if (e instanceof Error) return e.message
+  if (typeof e === 'string') return e
+  return 'unexpected error'
+}
+
 function StepStatusBadge({ status }: { status?: string }) {
-  const key = status?.toLowerCase()
-  if (key === 'ok') {
-    return (
-      <Badge
-        variant="outline"
-        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-      >
-        ok
-      </Badge>
-    )
+  switch (classifyStatus(status)) {
+    case 'ok':
+      return <Badge variant="success">ok</Badge>
+    case 'failed':
+      return <Badge variant="destructive">{formatStatus(status ?? '')}</Badge>
+    case 'dry':
+      return <Badge variant="secondary">dry run</Badge>
+    default:
+      return (
+        <Badge variant="secondary">
+          {status ? formatStatus(status) : '—'}
+        </Badge>
+      )
   }
-  if (key === 'error' || key === 'timeout') {
-    return <Badge variant="destructive">{formatStatus(status ?? '')}</Badge>
-  }
-  return <Badge variant="secondary">{status ? formatStatus(status) : '—'}</Badge>
 }
 
 function EndedBadge({ status }: { status: string }) {
-  const s = status.toLowerCase()
-  if (s.includes('ok') || s.includes('succeed')) {
-    return (
-      <Badge
-        variant="outline"
-        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
-      >
-        {formatStatus(status)}
-      </Badge>
-    )
+  switch (classifyStatus(status)) {
+    case 'ok':
+      return <Badge variant="success">{formatStatus(status)}</Badge>
+    case 'failed':
+      return <Badge variant="destructive">{formatStatus(status)}</Badge>
+    case 'dry':
+      return <Badge variant="secondary">dry run</Badge>
+    default:
+      return <Badge variant="secondary">{formatStatus(status)}</Badge>
   }
-  if (s.includes('fail') || s.includes('error')) {
-    return <Badge variant="destructive">{formatStatus(status)}</Badge>
-  }
-  return <Badge variant="secondary">{formatStatus(status)}</Badge>
 }
 
 type Phase = 'loading' | 'streaming' | 'reconnecting' | 'ended' | 'error'
@@ -79,6 +82,8 @@ function RunDetail() {
   const [ended, setEnded] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [phase, setPhase] = useState<Phase>('loading')
+  // Bumped by Retry to re-run the pre-check/stream effect.
+  const [attempt, setAttempt] = useState(0)
 
   // Ask whether the run exists (and is over) before opening a stream, so an
   // unknown or already-finished run does not hold a connection open. The
@@ -96,6 +101,7 @@ function RunDetail() {
     setEnded(null)
     setError(null)
     setPhase('loading')
+    setAttempt(0)
   }, [runId])
 
   useEffect(() => {
@@ -116,12 +122,14 @@ function RunDetail() {
       setEnded(status ?? 'stream closed')
       setPhase('ended')
     }
-    // Backstop: a dangling run whose writer stopped still ends the stream.
+    // Backstop: a dangling run whose writer stopped is reported as an error,
+    // not as an ordinary finish — a hung or killed run must not read as clean.
     const armIdle = () => {
       clearIdle()
       idle = setTimeout(() => {
         stream?.close()
-        finish('no events for 60s — stream closed')
+        setError('stalled: no events for 60s — the run may have been killed')
+        setPhase('error')
       }, IDLE_TIMEOUT_MS)
     }
 
@@ -149,7 +157,7 @@ function RunDetail() {
         finish(status)
       } catch (e) {
         if (controller.signal.aborted) return
-        setError(String(e))
+        setError(errorText(e))
         setPhase('error')
       }
     }
@@ -186,7 +194,7 @@ function RunDetail() {
         void fallbackToTrace()
       } else {
         setPhase('error')
-        setError(String(e))
+        setError(errorText(e))
       }
     }
 
@@ -195,10 +203,11 @@ function RunDetail() {
       clearIdle()
       stream?.close()
     }
-    // Only re-run when the run changes or the pre-check resolves; a background
-    // refetch of the same key must not tear down a live stream.
+    // Only re-run when the run changes, the pre-check resolves, or Retry is
+    // pressed; a background refetch of the same key must not tear down a live
+    // stream.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, resumeQuery.status])
+  }, [runId, resumeQuery.status, attempt])
 
   const start = events.find((e) => e.event === 'run_start')
   const end = events.find((e) => e.event === 'run_end')
@@ -217,8 +226,21 @@ function RunDetail() {
       </div>
 
       {error ? (
-        <div className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <span>{error}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              void resumeQuery.refetch()
+              setAttempt((a) => a + 1)
+            }}
+          >
+            Retry
+          </Button>
         </div>
       ) : ended ? (
         <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm">
@@ -227,12 +249,12 @@ function RunDetail() {
         </div>
       ) : phase === 'reconnecting' ? (
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
-          <span className="size-2 animate-pulse rounded-full bg-amber-500" />
+          <span className="size-2 animate-pulse rounded-full bg-warning" />
           reconnecting…
         </p>
       ) : phase === 'streaming' ? (
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
-          <span className="size-2 animate-pulse rounded-full bg-emerald-500" />
+          <span className="size-2 animate-pulse rounded-full bg-success" />
           streaming…
         </p>
       ) : phase === 'loading' ? (

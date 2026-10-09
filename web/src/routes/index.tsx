@@ -12,6 +12,7 @@ import {
 import { queryKeys } from '@/lib/query-keys'
 import { StatusPill } from '@/components/StatusPill'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
@@ -64,7 +65,11 @@ function UpdateChip({
     )
   }
   if (latestError)
-    return <span className="text-xs text-muted-foreground">—</span>
+    return (
+      <Badge variant="warning" title="could not read the upstream ref">
+        check failed
+      </Badge>
+    )
   if (latest === undefined)
     return <Skeleton className="h-5 w-24 rounded-4xl" />
   const remote = latest.release
@@ -104,7 +109,13 @@ function VerifyCell({
 }) {
   if (pending) return <Skeleton className="h-5 w-24 rounded-4xl" />
   // A missing access log or an unreadable one is not an error to show.
-  if (error || report === undefined) return null
+  if (error)
+    return (
+      <span className="text-xs text-muted-foreground" title="could not read the access log">
+        unavailable
+      </span>
+    )
+  if (report === undefined) return <Skeleton className="h-5 w-24 rounded-4xl" />
   return (
     <div className="flex flex-wrap items-center gap-1 text-xs">
       <Badge variant="outline">{report.requests} req</Badge>
@@ -311,7 +322,19 @@ function Index() {
       </div>
 
       {appsQuery.isError && (
-        <p className="text-destructive">{String(appsQuery.error)}</p>
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <span>Could not load the registry: {String(appsQuery.error)}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void appsQuery.refetch()}
+          >
+            Retry
+          </Button>
+        </div>
       )}
 
       {appsQuery.isPending && (
@@ -324,7 +347,15 @@ function Index() {
         </Card>
       )}
 
-      {apps && (
+      {apps && apps.length === 0 && (
+        <Card>
+          <CardContent className="p-6 text-sm text-muted-foreground">
+            No apps in the registry.
+          </CardContent>
+        </Card>
+      )}
+
+      {apps && apps.length > 0 && (
         <Card className="py-0">
           <CardHeader className="border-b py-4">
             <CardTitle>Registry</CardTitle>
