@@ -127,6 +127,7 @@ impl Estate {
             old_release: None,
             build_host: Some("local".into()),
             root: None,
+            spa: false,
             // nginx:alpine serves / with 200.
             health_url: Some("http://127.0.0.1/".into()),
             compose_dir: projdir.to_path_buf(),
@@ -486,6 +487,7 @@ fn sync_clones_fetches_and_fast_forwards() {
         old_release: None,
         build_host: None,
         root: None,
+        spa: false,
         health_url: None,
         compose_dir: dir.path().to_path_buf(),
         compose_svc: "web".into(),
@@ -588,6 +590,7 @@ fn build_local_clones_checks_out_and_builds() {
         old_release: None,
         build_host: Some("local".into()),
         root: None,
+        spa: false,
         health_url: None,
         compose_dir: dir.path().to_path_buf(),
         compose_svc: "web".into(),

@@ -5,6 +5,10 @@ All notable changes to swapdock. The format follows
 
 ## [Unreleased]
 
+- Static apps: `spa = true` includes the shared SPA history fallback, so
+  extensionless deep links resolve to `index.html` while a missing asset keeps
+  its 404. Ships `install/nginx/spa-fallback.conf`.
+
 ## [0.1.0] — 2026-10-05
 
 First public release. A complete deploy loop for one Docker host:

@@ -105,6 +105,7 @@ const draftSchema = z
     branch: z.string(),
     repo: z.string(),
     root: z.string(),
+    spa: z.boolean(),
     build_repo: z.string(),
   })
   // A front port doubles as a back-end port only if it collides with this
@@ -156,6 +157,7 @@ function toDraft(app: App): Draft {
     branch: app.branch ?? '',
     repo: app.repo ?? '',
     root: app.root ?? '',
+    spa: app.spa ?? false,
     build_repo: app.build_repo ?? '',
   }
 }
@@ -202,6 +204,7 @@ function fromDraft(app: App, d: Draft): App {
     branch: str(d.branch),
     repo: str(d.repo),
     root: str(d.root),
+    spa: d.spa,
     build_repo: str(d.build_repo),
   }
 }
@@ -243,6 +246,7 @@ function toToml(app: App, d: Draft): string {
   str('old_release', d.old_release)
   str('build_host', d.build_host)
   str('root', d.root)
+  if (d.spa) out.push('spa = true')
   str('health_url', d.health_url)
   str('compose_dir', d.compose_dir)
   str('compose_svc', d.compose_svc)
@@ -504,6 +508,37 @@ export function RegistryEditor({ app }: { app: App }) {
             </form.Field>
             <form.Field name="root">
               {(field) => <FieldInput field={field} label="root" mono />}
+            </form.Field>
+            <form.Field name="spa">
+              {(field) => {
+                const isInvalid =
+                  field.state.meta.isTouched && !field.state.meta.isValid
+                return (
+                  <Field orientation="horizontal" data-invalid={isInvalid}>
+                    <Checkbox
+                      id={field.name}
+                      name={field.name}
+                      checked={field.state.value}
+                      onCheckedChange={(checked) =>
+                        field.handleChange(checked)
+                      }
+                      aria-invalid={isInvalid}
+                    />
+                    <FieldContent>
+                      <FieldLabel
+                        htmlFor={field.name}
+                        className="font-normal"
+                      >
+                        spa
+                      </FieldLabel>
+                      <FieldDescription>
+                        static only: deep links fall back to index.html
+                      </FieldDescription>
+                    </FieldContent>
+                    {isInvalid && <FieldError errors={field.state.meta.errors} />}
+                  </Field>
+                )
+              }}
             </form.Field>
             <form.Field name="git_remote">
               {(field) => <FieldInput field={field} label="git_remote" />}

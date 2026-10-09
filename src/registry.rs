@@ -189,6 +189,12 @@ pub struct App {
     // ---- static only ----
     #[serde(default)]
     pub root: Option<String>,
+    /// Serve a single-page app: extensionless paths fall back to index.html.
+    ///
+    /// Paths with an extension keep the `=404` behavior, because a missing
+    /// asset must never come back as index.html with a 200.
+    #[serde(default)]
+    pub spa: bool,
 
     // ---- runtime ----
     #[serde(default)]
@@ -475,6 +481,14 @@ impl App {
                         "root-unused-for-container",
                         Some(name),
                         "root has no meaning for a container app",
+                    ));
+                }
+                if self.spa {
+                    out.push(Problem::warning(
+                        "spa-unused-for-container",
+                        Some(name),
+                        "spa has no meaning for a container app: the app's own \
+                         router serves its routes",
                     ));
                 }
                 match &self.image_repo {
@@ -866,6 +880,7 @@ pub(crate) mod tests {
             old_release: Some("4d8e0f1".into()),
             build_host: Some("local".into()),
             root: None,
+            spa: false,
             health_url: Some("http://127.0.0.1/".into()),
             compose_dir: PathBuf::from("/home/marv/apps"),
             compose_svc: "portfolio".into(),
@@ -1152,6 +1167,27 @@ pub(crate) mod tests {
         let mut app = sample_static();
         app.strategy = Strategy::Replace;
         assert!(codes(&app).contains(&"static-strategy"));
+    }
+
+    #[test]
+    fn a_spa_static_app_is_still_valid() {
+        let app = App {
+            spa: true,
+            image_repo: None,
+            release: None,
+            old_release: None,
+            health_url: None,
+            writes_state: false,
+            ..sample_static()
+        };
+        assert_eq!(app.problems(), vec![], "spa must not dirty a static app");
+    }
+
+    #[test]
+    fn spa_warns_on_a_container_app() {
+        let mut app = sample();
+        app.spa = true;
+        assert!(codes(&app).contains(&"spa-unused-for-container"));
     }
 
     #[test]

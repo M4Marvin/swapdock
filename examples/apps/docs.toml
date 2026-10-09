@@ -7,6 +7,7 @@ front_port = 8003
 slot = 2
 writes_state = false
 root = "/srv/www/docs/current"
+spa = true
 compose_dir = "/srv/example/compose"
 compose_svc = "docs"
 env_name = "DOCS_PORT"

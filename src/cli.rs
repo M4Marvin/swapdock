@@ -949,7 +949,9 @@ pub fn init_template(name: &str, kind: &str) -> anyhow::Result<String> {
             "# strategy is \"swap\" for stateless apps, \"replace\" when the app\n# writes to a database file or other shared local state.",
         ),
         "static" => (
-            "kind = \"static\"\nstrategy = \"swap\"\nroot = \"/srv/www/NAME/current\"\n",
+            "kind = \"static\"\nstrategy = \"swap\"\nroot = \"/srv/www/NAME/current\"\n\
+             # spa = true serves a single-page app: extensionless paths fall back\n\
+             # to index.html, so a deep link survives a refresh.\n",
             "# static apps always swap: the symlink rename is atomic.",
         ),
         other => anyhow::bail!("kind must be \"container\" or \"static\", not {other:?}"),

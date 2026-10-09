@@ -22,6 +22,7 @@ export interface App {
   branch: string | null
   repo: string | null
   root: string | null
+  spa: boolean
   build_repo: string | null
 }
 

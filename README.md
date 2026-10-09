@@ -130,7 +130,9 @@ repo = "/srv/example/shop"
 ```
 
 Static apps need `root` instead of ports and images; the flip is an atomic
-symlink rename and rollback is instant.
+symlink rename and rollback is instant. Set `spa = true` when the app is a
+single-page app: extensionless paths fall back to `index.html`, while a
+missing asset keeps its 404.
 
 ## What your compose files need
 

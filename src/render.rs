@@ -34,6 +34,10 @@ pub const LOG_FORMAT: &str = "swapdock";
 /// Hand-written include shared by container blocks.
 pub const PROXY_COMMON: &str = "/etc/nginx/snippets/proxy-common.conf";
 
+/// Hand-written include a static app with `spa = true` opts into: extensionless
+/// paths fall back to index.html, so a deep link survives a refresh.
+pub const SPA_FALLBACK: &str = "/etc/nginx/snippets/spa-fallback.conf";
+
 /// Indentation inside a server block.
 const INDENT: &str = "    ";
 
@@ -219,10 +223,16 @@ fn render_app(out: &mut String, app: &App) {
             out.push_str(INDENT);
             out.push_str("index index.html;\n");
             // `=404` and not a bare `/index.html`: a missing asset must return 404,
-            // not index.html with a 200. A single-page app that needs history
-            // fallback adds `include snippets/spa-fallback.conf;` after this line.
+            // not index.html with a 200. A single-page app sets `spa = true`, which
+            // includes the history-fallback snippet; dotted paths keep this =404.
             out.push_str(INDENT);
             out.push_str("try_files $uri $uri/ =404;\n");
+            if app.spa {
+                out.push_str(INDENT);
+                out.push_str("include ");
+                out.push_str(SPA_FALLBACK);
+                out.push_str(";\n");
+            }
         }
     }
 
@@ -351,6 +361,35 @@ mod tests {
             !out.contains("/index.html;"),
             "no bare index fallback: {out}"
         );
+    }
+
+    #[test]
+    fn a_spa_static_app_includes_the_history_fallback() {
+        let mut app = static_app();
+        app.spa = true;
+        let out = render(&[app]);
+        assert!(out.contains(&format!("include {SPA_FALLBACK};")), "{out}");
+        // The include comes after the `=404` try_files, so dotted paths keep
+        // the 404 and only the snippet's extensionless location falls back.
+        let tf = out.find("try_files $uri $uri/ =404;").unwrap();
+        let inc = out.find(&format!("include {SPA_FALLBACK};")).unwrap();
+        assert!(tf < inc, "fallback must come after try_files: {out}");
+    }
+
+    #[test]
+    fn a_plain_static_app_does_not_include_the_history_fallback() {
+        let out = render(&[static_app()]);
+        assert!(!out.contains(SPA_FALLBACK), "{out}");
+    }
+
+    #[test]
+    fn spa_on_a_container_renders_no_include() {
+        // Validation warns instead; the renderer must never emit the include
+        // outside a static block.
+        let mut app = container();
+        app.spa = true;
+        let out = render(&[app]);
+        assert!(!out.contains(SPA_FALLBACK), "{out}");
     }
 
     #[test]
