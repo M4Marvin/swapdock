@@ -1,9 +1,10 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
-import { api, formatStatus } from '../../api'
+import { api, classifyStatus } from '../../api'
 import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RunStatusBadge } from '@/components/RunStatusBadge'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -85,8 +86,8 @@ function Runs() {
                 <TableCell>{formatTime(run.started)}</TableCell>
                 <TableCell>
                   <div className="flex flex-wrap items-center gap-1">
-                    <Badge variant="outline">{formatStatus(run.status)}</Badge>
-                    {run.non_ok > 0 && (
+                    <RunStatusBadge status={run.status} />
+                    {classifyStatus(run.status) === 'ok' && run.non_ok > 0 && (
                       <Badge variant="destructive">{run.non_ok} non-ok</Badge>
                     )}
                   </div>

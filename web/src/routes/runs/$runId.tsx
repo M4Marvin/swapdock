@@ -4,8 +4,6 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ApiError,
   api,
-  classifyStatus,
-  formatStatus,
   openRunEvents,
   type RunStream,
   type TraceEvent,
@@ -13,6 +11,7 @@ import {
 import { queryKeys } from '@/lib/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RunStatusBadge } from '@/components/RunStatusBadge'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
@@ -42,36 +41,6 @@ function errorText(e: unknown): string {
   if (e instanceof Error) return e.message
   if (typeof e === 'string') return e
   return 'unexpected error'
-}
-
-function StepStatusBadge({ status }: { status?: string }) {
-  switch (classifyStatus(status)) {
-    case 'ok':
-      return <Badge variant="success">ok</Badge>
-    case 'failed':
-      return <Badge variant="destructive">{formatStatus(status ?? '')}</Badge>
-    case 'dry':
-      return <Badge variant="secondary">dry run</Badge>
-    default:
-      return (
-        <Badge variant="secondary">
-          {status ? formatStatus(status) : '—'}
-        </Badge>
-      )
-  }
-}
-
-function EndedBadge({ status }: { status: string }) {
-  switch (classifyStatus(status)) {
-    case 'ok':
-      return <Badge variant="success">{formatStatus(status)}</Badge>
-    case 'failed':
-      return <Badge variant="destructive">{formatStatus(status)}</Badge>
-    case 'dry':
-      return <Badge variant="secondary">dry run</Badge>
-    default:
-      return <Badge variant="secondary">{formatStatus(status)}</Badge>
-  }
 }
 
 type Phase = 'loading' | 'streaming' | 'reconnecting' | 'ended' | 'error'
@@ -245,7 +214,7 @@ function RunDetail() {
       ) : ended ? (
         <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm">
           <span className="text-muted-foreground">ended:</span>
-          <EndedBadge status={ended} />
+          <RunStatusBadge status={ended} />
         </div>
       ) : phase === 'reconnecting' ? (
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -306,7 +275,7 @@ function RunDetail() {
                     </TableCell>
                     <TableCell className="font-medium">{s.step}</TableCell>
                     <TableCell>
-                      <StepStatusBadge status={s.status} />
+                      <RunStatusBadge status={s.status} />
                     </TableCell>
                     <TableCell>{s.exit_code ?? '—'}</TableCell>
                     <TableCell>{s.duration_ms ?? '—'}</TableCell>

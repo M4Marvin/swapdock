@@ -3,7 +3,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   api,
-  formatStatus,
+  classifyStatus,
   type AppEntry,
   type AppLatest,
   type RunSummary,
@@ -11,6 +11,7 @@ import {
 } from '../api'
 import { queryKeys } from '@/lib/query-keys'
 import { StatusPill } from '@/components/StatusPill'
+import { RunStatusBadge } from '@/components/RunStatusBadge'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -202,8 +203,8 @@ function AppRow({
             <span className="text-muted-foreground">
               {formatTime(newest.started)}
             </span>
-            <Badge variant="outline">{formatStatus(newest.status)}</Badge>
-            {newest.non_ok > 0 && (
+            <RunStatusBadge status={newest.status} />
+            {classifyStatus(newest.status) === 'ok' && newest.non_ok > 0 && (
               <Badge variant="destructive">{newest.non_ok} non-ok</Badge>
             )}
           </Link>
@@ -227,8 +228,8 @@ function AppRow({
                 <span className="font-mono text-xs">
                   {run.run_id.slice(0, 8)}
                 </span>
-                <Badge variant="outline">{formatStatus(run.status)}</Badge>
-                {run.non_ok > 0 && (
+                <RunStatusBadge status={run.status} />
+                {classifyStatus(run.status) === 'ok' && run.non_ok > 0 && (
                   <Badge variant="destructive">{run.non_ok} non-ok</Badge>
                 )}
               </Link>
