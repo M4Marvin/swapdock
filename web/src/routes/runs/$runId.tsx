@@ -297,7 +297,10 @@ function RunDetail() {
               </TableHeader>
               <TableBody>
                 {steps.map((s, i) => (
-                  <TableRow key={`${s.seq ?? i}-${s.step ?? ''}`}>
+                  <TableRow
+                    key={`${s.seq ?? i}-${s.step ?? ''}`}
+                    className="animate-in fade-in duration-150"
+                  >
                     <TableCell className="pl-6 text-muted-foreground">
                       {s.seq ?? i + 1}
                     </TableCell>
