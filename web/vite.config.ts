@@ -20,7 +20,7 @@ export default defineConfig({
     // entry covers it and the SPA's own routes (/, /apps/..., /runs/...) are
     // left for Vite to serve, keeping deep links working in dev.
     proxy: {
-      '/api': 'http://127.0.0.1:8088',
+      '/api': 'http://100.105.177.97:8088',
     },
   },
 })

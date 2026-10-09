@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# deploy.sh — ship the built SPA to the host as a release, then flip `current`.
+#
+#   ./deploy.sh [release-id]
+#
+# Builds `dist/`, rsyncs it to <host>:/srv/www/swapdock-ui/releases/<id>, and
+# atomically repoints the `current` symlink nginx serves. nginx needs no change:
+# its `root` is the stable symlink, so the flip is the whole deploy.
+#
+# Default release id: the short commit, plus `-dirty<YYYYmmddHHMM>` when the
+# tree has uncommitted changes — a release must never masquerade as a commit
+# that does not contain it. Override the target with SWAPDOCK_WEB_HOST and
+# SWAPDOCK_WEB_URL.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+host="${SWAPDOCK_WEB_HOST:-hetzner}"
+root="/srv/www/swapdock-ui"
+url="${SWAPDOCK_WEB_URL:-http://100.80.96.4:8015/}"
+
+rev="$(git -C "$here" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M)"
+if test -n "$(git -C "$here" status --porcelain -- . 2>/dev/null)"; then
+    rev="$rev-dirty$(date +%Y%m%d%H%M)"
+fi
+release="${1:-$rev}"
+
+case "$release" in
+    *[!a-z0-9.-]*)
+        echo "release id must be [a-z0-9.-]: $release" >&2
+        exit 1
+        ;;
+esac
+
+printf '== build (%s)\n' "$release"
+(cd "$here" && pnpm build)
+
+printf '== ship to %s:%s/releases/%s\n' "$host" "$root" "$release"
+rsync -az --delete "$here/dist/" "$host:$root/releases/$release/"
+
+printf '== flip current\n'
+ssh "$host" "ln -sfn 'releases/$release' '$root/current.tmp' && mv -T '$root/current.tmp' '$root/current'"
+
+printf '== verify %s\n' "$url"
+curl -fsS -o /dev/null -w 'serving %{http_code}\n' "$url"

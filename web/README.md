@@ -46,10 +46,21 @@ the build server's image list.
 
 ```sh
 pnpm install
-pnpm dev       # Vite dev server, proxies /api to 127.0.0.1:8088
+pnpm dev       # Vite dev server, proxies /api to the build API
 pnpm exec tsc -b
 pnpm build
 ```
+
+## Deploying
+
+`./deploy.sh [release-id]` builds the app, ships `dist/` to
+`hetzner:/srv/www/swapdock-ui/releases/<id>`, flips the `current` symlink
+atomically, and checks the URL. nginx needs no change: the `swapdock-ui`
+registry entry serves the symlink as its `root`.
+
+The default release id is the short commit (plus `-dirty<timestamp>` when the
+tree is dirty). Override the host and URL with `SWAPDOCK_WEB_HOST` and
+`SWAPDOCK_WEB_URL`.
 
 ## Backend gaps
 
