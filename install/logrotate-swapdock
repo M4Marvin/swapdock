@@ -1,9 +1,18 @@
+# Weekly rotation for the run log.
+#
+# The recreated file must keep the deploy user's group and group-write: commands
+# that run unprivileged (sync, build, runs, show) append to this log, and a
+# root-only recreation made every one of them fail before doing any work. `su`
+# is what lets logrotate rotate inside a directory that is group-writable by the
+# deploy user; without it the rotation is skipped outright. User and group below
+# are written by install-swapdock.sh.
 /var/log/swapdock/*.jsonl {
+    su root @LOG_GROUP@
     weekly
     rotate 8
     compress
     delaycompress
     missingok
     notifempty
-    create 0644 root root
+    create 0664 root @LOG_GROUP@
 }

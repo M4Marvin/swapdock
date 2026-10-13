@@ -141,6 +141,14 @@ pub struct TraceLog {
     file: File,
 }
 
+/// Names the log in an io error, keeping its kind.
+///
+/// A bare "Permission denied" leaves the operator guessing which file to fix;
+/// the path is the one thing such an error must say.
+fn at(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
 impl TraceLog {
     /// Opens (or creates) the log for appending.
     ///
@@ -152,13 +160,14 @@ impl TraceLog {
         use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| at(parent, e))?;
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o644)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|e| at(&path, e))?;
         Ok(Self { path, file })
     }
 
@@ -190,7 +199,7 @@ impl TraceLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Read::default());
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(at(path, e)),
         };
 
         let mut events = Vec::new();
@@ -473,6 +482,23 @@ mod tests {
         )
         .expect("start run");
         (run, path)
+    }
+
+    #[test]
+    fn io_errors_name_the_log_path() {
+        // A bare "Permission denied" is what made the host's log problem take
+        // an afternoon to find; the message must name the file.
+        let path = Path::new("/srv/swapdock/logs/swapdock.jsonl");
+        let err = at(
+            path,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            err.to_string()
+                .contains("/srv/swapdock/logs/swapdock.jsonl"),
+            "{err}"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

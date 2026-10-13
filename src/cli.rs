@@ -150,6 +150,9 @@ pub enum Command {
         /// Commit to swapdock. Defaults to the recorded release.
         #[arg(long, value_name = "SHA")]
         release: Option<String>,
+        /// Deploy even when the app is already on that release.
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         paths: DeployPaths,
     },
@@ -160,6 +163,12 @@ pub enum Command {
         app: String,
         #[command(flatten)]
         paths: DeployPaths,
+    },
+
+    /// Report what one app is running: recorded release, live port, health.
+    Status {
+        /// App name, as in the registry.
+        app: String,
     },
 
     /// Write a commented registry template for a new app. Changes nothing existing.
@@ -257,9 +266,11 @@ impl Command {
             Command::Up {
                 app,
                 release,
+                force,
                 paths,
-            } => up_app(cli, app, release.as_deref(), paths),
+            } => up_app(cli, app, release.as_deref(), *force, paths),
             Command::Rollback { app, paths } => rollback_app(cli, app, paths),
+            Command::Status { app } => status_app(cli, app),
             Command::Sync { app } => sync_app(cli, app),
             Command::Init { name, dir, kind } => init_app(name, dir.clone(), kind),
             Command::Build {
@@ -889,10 +900,17 @@ fn load_app(cli: &Cli, name: &str) -> anyhow::Result<crate::registry::App> {
     }
 }
 
-/// `swapdock up <app> [--release]`
-fn up_app(cli: &Cli, name: &str, release: Option<&str>, paths: &DeployPaths) -> anyhow::Result<()> {
+/// `swapdock up <app> [--release] [--force]`
+fn up_app(
+    cli: &Cli,
+    name: &str,
+    release: Option<&str>,
+    force: bool,
+    paths: &DeployPaths,
+) -> anyhow::Result<()> {
     let mut app = load_app(cli, name)?;
-    let release = deploy::resolve_release(&app, release).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let release =
+        deploy::resolve_release(&app, release, force).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ctx = ctx_from(cli, paths);
 
     let mut run = start(cli)?;
@@ -935,6 +953,33 @@ fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()
             Err(anyhow::anyhow!("{e}"))
         }
     }
+}
+
+/// `swapdock status <app>`
+///
+/// Read-only and spawn-free: it probes the live port and prints what the
+/// registry recorded. No run is opened, so asking never pollutes the log.
+fn status_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let status = deploy::live_status(&app).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let port = status
+        .live_port
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let verdict = match status.code {
+        Some(code) if status.up => format!("up ({code})"),
+        Some(code) => format!("not healthy ({code})"),
+        None => "down (no answer)".to_string(),
+    };
+    println!("app          {}", app.name);
+    println!("release      {}", status.release.as_deref().unwrap_or("-"));
+    println!(
+        "previous     {}",
+        status.old_release.as_deref().unwrap_or("-")
+    );
+    println!("live port    {port}");
+    println!("health       {verdict}");
+    Ok(())
 }
 
 /// The template `init` writes. Every field is explained where it is used, so a
@@ -1480,6 +1525,30 @@ mod tests {
                 assert_eq!(access_log, PathBuf::from(crate::verify::DEFAULT_ACCESS_LOG));
             }
             _ => panic!("expected Verify"),
+        }
+    }
+
+    #[test]
+    fn up_takes_force_and_status_parses() {
+        let cli = Cli::try_parse_from(["swapdock", "up", "portfolio", "--force"]).unwrap();
+        match cli.command {
+            Command::Up { app, force, .. } => {
+                assert_eq!(app, "portfolio");
+                assert!(force);
+            }
+            _ => panic!("expected Up"),
+        }
+        // The default stays a plain deploy.
+        let cli = Cli::try_parse_from(["swapdock", "up", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Up { force, .. } => assert!(!force),
+            _ => panic!("expected Up"),
+        }
+
+        let cli = Cli::try_parse_from(["swapdock", "status", "portfolio"]).unwrap();
+        match cli.command {
+            Command::Status { app } => assert_eq!(app, "portfolio"),
+            _ => panic!("expected Status"),
         }
     }
 

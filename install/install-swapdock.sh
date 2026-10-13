@@ -25,6 +25,9 @@ test "$(id -u)" = "0" || { echo "run as root: sudo bash $0 $DIST" >&2; exit 1; }
 INSTALL_USER="${SUDO_USER:-}"
 test -n "$INSTALL_USER" || { echo "run via sudo, not as root directly" >&2; exit 1; }
 id "$INSTALL_USER" >/dev/null 2>&1 || { echo "unknown user: $INSTALL_USER" >&2; exit 1; }
+# Group that owns the run log, so unprivileged commands can append to it. The
+# group is not always the username: ask, do not assume.
+LOG_GROUP="$(id -gn "$INSTALL_USER")"
 
 say() { printf '== %s ==\n' "$*"; }
 
@@ -43,12 +46,18 @@ say "install the binary"
 install -m 0755 "$DIST/swapdock" /usr/local/bin/swapdock
 
 say "create /srv/swapdock and /var/log/swapdock"
-mkdir -p /srv/swapdock/apps /srv/swapdock/green /var/log/swapdock
+mkdir -p /srv/swapdock/apps /srv/swapdock/green
 # -n: never overwrite. Re-runs keep operator edits; new apps still get copied.
 cp -n "$DIST"/apps/*.toml /srv/swapdock/apps/
 chown -R "$INSTALL_USER:$INSTALL_USER" /srv/swapdock/apps
-chown root:root /srv/swapdock/green /var/log/swapdock
-chmod 0755 /srv/swapdock /srv/swapdock/apps /srv/swapdock/green /var/log/swapdock
+chown root:root /srv/swapdock/green
+chmod 0755 /srv/swapdock /srv/swapdock/apps /srv/swapdock/green
+# The run log is appended by unprivileged commands too, so it and its directory
+# belong to the deploy user's group. touch, never truncate: this re-runs.
+install -d -m 2770 -o root -g "$LOG_GROUP" /var/log/swapdock
+touch /var/log/swapdock/swapdock.jsonl
+chown root:"$LOG_GROUP" /var/log/swapdock/swapdock.jsonl
+chmod 0664 /var/log/swapdock/swapdock.jsonl
 echo "registry files: $(ls /srv/swapdock/apps/*.toml | wc -l)"
 
 say "install hand-written nginx files"
@@ -71,7 +80,19 @@ chmod 0440 /etc/sudoers.d/swapdock
 visudo -c -f /etc/sudoers.d/swapdock
 
 say "log rotation for the run log"
-install -m 0644 "$DIST/logrotate-swapdock" /etc/logrotate.d/swapdock
+# Substituted, not copied: a rotation that recreates the log root-only breaks
+# every unprivileged command until the next install.
+sed "s/@LOG_GROUP@/$LOG_GROUP/" "$DIST/logrotate-swapdock" > /etc/logrotate.d/swapdock
+chmod 0644 /etc/logrotate.d/swapdock
+
+say "let $INSTALL_USER read the nginx access log"
+# verify reads the front-door access log, which is www-data:adm 0640.
+if id -nG "$INSTALL_USER" | grep -qw adm; then
+    echo "$INSTALL_USER is already in adm"
+else
+    usermod -aG adm "$INSTALL_USER"
+    echo "added $INSTALL_USER to adm; log out and back in for verify to use it"
+fi
 
 say "done — running state untouched (no reload, no restart)"
 echo

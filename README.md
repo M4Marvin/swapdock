@@ -71,11 +71,12 @@ swapdock --registry examples/apps render
 | `validate` | no | Per-app rules, cross-app clashes, tunnel routes. Exits non-zero on error. |
 | `render [--app]` | no | Print the derived nginx config. |
 | `apply` | **yes** | Render, refuse on error, stage, `nginx -t`, atomic commit, reload. |
-| `up <app> [--release]` | **yes** | Full deploy through the app's strategy. |
+| `up <app> [--release] [--force]` | **yes** | Full deploy through the app's strategy. Refuses a release that is already live; `--force` overrides. |
 | `rollback <app>` | **yes** | Redeploy `old_release` through the same health gate. |
 | `sync <app>` | repo only | Fetch and fast-forward the app source. Refuses on dirty checkouts. |
 | `build <app> [--release]` | build host | Build the release image. Never touches the registry. |
 | `verify <app> --since` | no | Access-log verdict: failures, upstreams, the flip instant. |
+| `status <app>` | no | What's live right now: recorded release, previous release, live port, health verdict. |
 | `init <name>` | no | Write a commented registry template. Refuses to overwrite. |
 | `selftest` | no | Exercise every subprocess guarantee. |
 | `runs` / `show` / `resume` | no | Inspect the append-only run log. |
@@ -161,7 +162,7 @@ those routes.
 
 ```bash
 cargo build --release          # ~1.6 MB static binary with the musl target
-cargo test                     # 295 tests (6 against a real Docker daemon)
+cargo test                     # 354 tests (6 against a real Docker daemon)
 cargo clippy --all-targets     # zero warnings
 cargo fmt --check
 ```
@@ -178,6 +179,16 @@ covered by tests too, so the documentation cannot drift from the validator.
   deletes images yet.
 - The registry files are owned by the deploy user. Swapdock rewrites them
   in place as root but preserves their mode and owner.
+- The run log is one timeline that root and the deploy user both append to, so
+  `/var/log/swapdock/swapdock.jsonl` and its directory belong to the deploy
+  user's group. `install/logrotate-swapdock` carries the group and
+  `install-swapdock.sh` substitutes it: a rotation that recreated the log
+  root-only broke every unprivileged command until the next install.
+- `swapdock sync <app>` owns the app checkout; it is the only thing that should
+  move it. A hand-run `git pull` there races the tool and hides what is really
+  deployed.
+- `install-swapdock.sh` also adds the deploy user to `adm`, which `verify`
+  needs to read `/var/log/nginx/front-door.access.log`.
 
 ## License
 

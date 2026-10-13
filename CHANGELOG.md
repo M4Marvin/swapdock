@@ -5,6 +5,20 @@ All notable changes to swapdock. The format follows
 
 ## [Unreleased]
 
+- The run log stays readable and appendable by the deploy user across
+  rotations: `install/logrotate-swapdock` recreates it `0664` with the deploy
+  user's group instead of `root:root`, so unprivileged commands (`sync`,
+  `build`, `runs`, `show`) no longer fail before doing any work. The installer
+  substitutes the group, keeps the log's directory group-writable, and the
+  directive carries `su` so logrotate will rotate inside that directory.
+- `install-swapdock.sh` adds the deploy user to `adm`, which `verify` needs to
+  read the nginx access log.
+- `up` refuses to deploy the release that is already live unless `--force`
+  (API: `"force": true`); a bare `up` no longer restarts a healthy app.
+- `status <app>` prints the recorded release, previous release, live port and
+  the live health verdict. `GET /apps/{name}/status` now includes `release` and
+  `old_release` alongside the existing `up`, `status` and `live_port`.
+- Run-log io errors name the file instead of a bare `Permission denied`.
 - Static apps: `spa = true` includes the shared SPA history fallback, so
   extensionless deep links resolve to `index.html` while a missing asset keeps
   its 404. Ships `install/nginx/spa-fallback.conf`.

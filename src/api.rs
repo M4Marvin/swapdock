@@ -30,7 +30,7 @@ use serde::Deserialize;
 use crate::deploy::{self, Ctx};
 use crate::registry::{App, Loaded, Problem};
 use crate::trace::{Run, RunMode, RunStatus, TraceEvent, TraceLog};
-use crate::{apply, builder, exec, git, health, transfer, validator};
+use crate::{apply, builder, exec, git, transfer, validator};
 
 /// How often the SSE handler re-reads the run log for new lines.
 const EVENTS_POLL: Duration = Duration::from_millis(300);
@@ -281,41 +281,33 @@ async fn update_app(
 ///
 /// This answers "is it serving right now?", which is a different question from
 /// "did the last swapdock succeed?" — the registry's `live_port` and the process
-/// behind it can disagree. Only the path of `health_url` is used; host and port
-/// come from the live port, exactly as the deploy gate does.
+/// behind it can disagree. `release`/`old_release` are the recorded identity;
+/// `up`/`status` are the probe.
 async fn app_status(State(state): State<Shared>, Path(name): Path<String>) -> impl IntoResponse {
     let app = match load_app(&state, &name) {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    let Some(live_port) = app.live_port else {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"up": false, "status": null, "live_port": null})),
-        )
-            .into_response();
-    };
-    let health_url = app.health_url.as_deref().unwrap_or("http://127.0.0.1/");
-    let path = match health::checked_probe_path(health_url) {
-        Ok(p) => p,
-        Err(_) => return error_response(StatusCode::CONFLICT, "invalid health path"),
-    };
     // The probe is blocking socket I/O; keep it off the async workers.
-    let (up, status) = match tokio::task::spawn_blocking(move || {
-        health::http_status("127.0.0.1", live_port, &path)
-    })
-    .await
-    {
-        Ok(Ok(code)) => ((200..300).contains(&code), Some(code)),
-        // A transport failure is a down verdict, not a 5xx from this API: the
-        // API is fine, the app is not answering. A panicked probe is the same.
-        Ok(Err(_)) | Err(_) => (false, None),
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"up": up, "status": status, "live_port": live_port})),
-    )
-        .into_response()
+    match tokio::task::spawn_blocking(move || deploy::live_status(&app)).await {
+        Ok(Ok(s)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "up": s.up,
+                "status": s.code,
+                "live_port": s.live_port,
+                "release": s.release,
+                "old_release": s.old_release,
+            })),
+        )
+            .into_response(),
+        // An unusable health path is a registry conflict, not a fault here.
+        Ok(Err(e)) => error_response(StatusCode::CONFLICT, &e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("status probe failed: {e}"),
+        ),
+    }
 }
 
 /// The release that would be deployed: `origin/<branch>`, then local `HEAD`.
@@ -643,6 +635,9 @@ struct DeployBody {
     release: Option<String>,
     #[serde(default)]
     dry_run: bool,
+    /// Deploy even when the app is already on that release.
+    #[serde(default)]
+    force: bool,
 }
 
 async fn deploy_app(
@@ -655,7 +650,7 @@ async fn deploy_app(
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    let release = match deploy::resolve_release(&app, body.release.as_deref()) {
+    let release = match deploy::resolve_release(&app, body.release.as_deref(), body.force) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::CONFLICT, &e.to_string()),
     };
@@ -1485,6 +1480,30 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn status_reports_the_recorded_release_even_with_nothing_live() {
+        // The blog app has no recorded release and no live port: the verdict is
+        // "down", and asking must not dial anything or open a run.
+        let (state, _dir) = test_state();
+        let (status, json) = get_json(state, "/apps/blog/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["up"], false);
+        assert_eq!(json["live_port"], serde_json::Value::Null);
+        assert_eq!(json["release"], serde_json::Value::Null);
+        assert_eq!(json["old_release"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn deploy_body_takes_force() {
+        let body: DeployBody = serde_json::from_str(r#"{"force": true}"#).unwrap();
+        assert!(body.force);
+        // An absent field keeps the safe default: an explicit redeploy must be
+        // asked for, never assumed.
+        let body: DeployBody = serde_json::from_str("{}").unwrap();
+        assert!(!body.force);
+        assert_eq!(body.release, None);
+    }
+
     // ---- helpers ----
 
     /// Drives one request through the router and decodes a JSON body.
@@ -1773,7 +1792,11 @@ mod tests {
 
         let (status, json) = get_json(state, "/apps/blog/status").await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "invalid health path");
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(error.contains("invalid health path"), "{error}");
+        // The refusal explains itself, but must not smuggle the raw CRLF back
+        // into the response.
+        assert!(!error.contains('\r') && !error.contains('\n'), "{error:?}");
     }
 
     // ---- latest ----
