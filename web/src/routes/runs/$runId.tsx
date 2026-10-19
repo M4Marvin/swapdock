@@ -59,7 +59,7 @@ function RunDetail() {
   // stream itself stays a custom EventSource; this is only the pre-check.
   const resumeQuery = useQuery({
     queryKey: queryKeys.run(runId),
-    queryFn: ({ signal }) => api.resume(runId, signal),
+    queryFn: ({ signal }) => api.resume(runId, 'deploy', signal),
     retry: 0,
     staleTime: Infinity,
     refetchOnWindowFocus: false,

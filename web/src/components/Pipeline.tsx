@@ -263,6 +263,47 @@ export function Pipeline({
       ...cur,
       [stage]: { state: 'active', runId: null, steps: [], error: null },
     }))
+    const settle = (status: string | null) => {
+      if (!alive.current) return
+      const outcome = classifyStatus(status)
+      const ok = outcome === 'ok'
+      const dry = outcome === 'dry'
+      if (ok) {
+        if (stage === 'build' && imageRef) {
+          toast.success(`build ok: ${imageRef}`, { id: toastId })
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.images(app.name),
+          })
+        }
+        if (stage === 'transfer') toast.success('transfer ok', { id: toastId })
+        if (stage === 'deploy') {
+          toast.success('deploy ok', { id: toastId })
+          onDeployed?.()
+        }
+      } else if (dry) {
+        toast.message(`${stage} finished as a dry run`, {
+          id: toastId,
+          description: 'Nothing was changed.',
+        })
+      } else {
+        const detail = status
+          ? `ended: ${formatStatus(status)}`
+          : 'stream closed'
+        toast.error(`${stage} failed`, { id: toastId, description: detail })
+      }
+      setStages((cur) => ({
+        ...cur,
+        [stage]: {
+          ...cur[stage],
+          state: ok ? 'ok' : dry ? 'dry' : 'failed',
+          error:
+            ok || dry
+              ? null
+              : (cur[stage].error ??
+                (status ? `ended: ${formatStatus(status)}` : 'stream closed')),
+        },
+      }))
+    }
     fn().then(
       ({ run_id }) => {
         if (!alive.current) return
@@ -282,54 +323,53 @@ export function Pipeline({
               }))
             },
             onError: (message) => {
+              if (!alive.current) return
               setStages((cur) => ({
                 ...cur,
-                [stage]: { ...cur[stage], state: 'failed', error: message },
+                [stage]: { ...cur[stage], error: message },
               }))
-              toast.error(`${stage} failed`, { id: toastId, description: message })
             },
             onEnd: (status) => {
-              const outcome = classifyStatus(status)
-              const ok = outcome === 'ok'
-              const dry = outcome === 'dry'
-              if (ok) {
-                if (stage === 'build' && imageRef) {
-                  toast.success(`build ok: ${imageRef}`, { id: toastId })
-                  queryClient.invalidateQueries({
-                    queryKey: queryKeys.images(app.name),
-                  })
-                }
-                if (stage === 'transfer')
-                  toast.success('transfer ok', { id: toastId })
-                if (stage === 'deploy') {
-                  toast.success('deploy ok', { id: toastId })
-                  onDeployed?.()
-                }
-              } else if (dry) {
-                toast.message(`${stage} finished as a dry run`, {
-                  id: toastId,
-                  description: 'Nothing was changed.',
-                })
-              } else {
-                const detail = status
-                  ? `ended: ${formatStatus(status)}`
-                  : 'stream closed'
-                toast.error(`${stage} failed`, { id: toastId, description: detail })
+              if (status != null) {
+                settle(status)
+                return
               }
-              setStages((cur) => ({
-                ...cur,
-                [stage]: {
-                  ...cur[stage],
-                  state: ok ? 'ok' : dry ? 'dry' : 'failed',
-                  error:
-                    ok || dry
-                      ? null
-                      : (cur[stage].error ??
-                        (status
-                          ? `ended: ${formatStatus(status)}`
-                          : 'stream closed')),
-                },
-              }))
+              if (!alive.current) return
+              // A long step (a Docker build can take minutes) produces no
+              // trace events, so the server closes an idle SSE stream. Poll
+              // the run instead of treating a quiet stream as a failure.
+              toast.message(`${stage} stream closed; checking the run…`, {
+                id: toastId,
+              })
+              const started = Date.now()
+              let failures = 0
+              const poll = async () => {
+                while (alive.current) {
+                  try {
+                    const info = await api.resume(
+                      run_id,
+                      stage === 'deploy' ? 'deploy' : 'build',
+                    )
+                    failures = 0
+                    if (info.ended) {
+                      settle(info.ended)
+                      return
+                    }
+                  } catch {
+                    failures += 1
+                    if (failures >= 3) {
+                      settle(null)
+                      return
+                    }
+                  }
+                  if (Date.now() - started > 45 * 60 * 1000) {
+                    settle(null)
+                    return
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 3000))
+                }
+              }
+              void poll()
             },
           },
           stage === 'deploy' ? 'deploy' : 'build',
@@ -574,6 +614,9 @@ export function Pipeline({
               This runs the deploy for release{' '}
               <span className="font-mono">{releaseForFlow}</span>. It ships to
               production and cannot be undone from here.
+              {releaseForFlow === app.release && (
+                <> This is the live release, so it is redeployed with force.</>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -589,7 +632,11 @@ export function Pipeline({
               onClick={() => {
                 setConfirmDeploy(false)
                 start('deploy', releaseForFlow, () =>
-                  api.deploy(app.name, releaseForFlow),
+                  api.deploy(
+                    app.name,
+                    releaseForFlow,
+                    releaseForFlow === app.release,
+                  ),
                 )
               }}
             >

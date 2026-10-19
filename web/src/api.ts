@@ -543,10 +543,15 @@ export const api = {
         { signal },
       )
     ).text(),
-  deploy: async (name: string, release?: string, signal?: AbortSignal) =>
+  deploy: async (
+    name: string,
+    release?: string,
+    force = false,
+    signal?: AbortSignal,
+  ) =>
     post<{ run_id: string }>(
       await deploy(`apps/${enc(name)}/deploys`),
-      { release },
+      { release, force },
       signal,
     ),
   rollback: async (name: string, signal?: AbortSignal) =>
@@ -580,8 +585,15 @@ export const api = {
     get<RunSummary[]>(await deploy(`runs?limit=${limit}`), signal),
   run: async (id: string, signal?: AbortSignal) =>
     get<TraceEvent[]>(await deploy(`runs/${enc(id)}`), signal),
-  resume: async (id: string, signal?: AbortSignal) =>
-    get<ResumeInfo>(await deploy(`runs/${enc(id)}/resume`), signal),
+  resume: async (
+    id: string,
+    apiBase: EventsApi = 'deploy',
+    signal?: AbortSignal,
+  ) =>
+    get<ResumeInfo>(
+      await (apiBase === 'build' ? build : deploy)(`runs/${enc(id)}/resume`),
+      signal,
+    ),
   appStatus: async (name: string, signal?: AbortSignal) =>
     get<AppStatus>(await deploy(`apps/${enc(name)}/status`), signal),
   doctor: async (name: string, signal?: AbortSignal) =>

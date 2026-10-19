@@ -46,6 +46,13 @@ When `buildApi` and `deployApi` resolve to the same origin, the build already
 puts the image on the deploy host, so the Transfer stage is omitted and Deploy
 unlocks after a successful Build (or when the image already exists).
 
+A Docker build can run for several minutes without writing a trace step, and
+the events endpoint closes an idle stream after 60 seconds. The pipeline treats
+that as a transport event, not a failure: it falls back to polling
+`GET /runs/{id}/resume` until the run ends and then updates the stage.
+Redeploying the release that is already live (for example after rebuilding the
+same tag) passes `force: true`.
+
 ## Operations
 
 The app header has a **Deploy latest** quick action. It reads the local image
