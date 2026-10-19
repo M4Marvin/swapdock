@@ -13,6 +13,7 @@ import { queryKeys } from '@/lib/query-keys'
 import { Pipeline } from '@/components/Pipeline'
 import { RegistryEditor } from '@/components/RegistryEditor'
 import { Operations } from '@/components/Operations'
+import { DeployLatestButton } from '@/components/DeployLatestButton'
 import { StatusPill } from '@/components/StatusPill'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -323,6 +324,7 @@ function AppDetail() {
         <Badge variant="secondary">{app.kind}</Badge>
         <LatestChip release={app.release} latest={latestQuery.data} />
         <span className="flex-1" />
+        <DeployLatestButton app={app} onStarted={setLastRun} />
         <Button onClick={() => setDeployOpen(true)}>Deploy…</Button>
       </div>
 

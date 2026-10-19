@@ -48,6 +48,12 @@ unlocks after a successful Build (or when the image already exists).
 
 ## Operations
 
+The app header has a **Deploy latest** quick action. It reads the local image
+list, picks the newest deployable release tag, and deploys it through the
+normal health gate. It is disabled when that image is already live, when no
+release image exists, or when the app has not been adopted yet. It does not
+build or transfer.
+
 The app page has an **Operations** card driven by the `0.2.0` API:
 
 - **Doctor** — host/compose checks for this app; shows the findings inline.
