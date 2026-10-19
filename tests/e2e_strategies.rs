@@ -137,6 +137,9 @@ impl Estate {
             branch: None,
             repo: None,
             build_repo: None,
+            compose_override: None,
+            public_url: None,
+            backup: None,
         };
         registry::save_app(&self.registry_dir(), &app).unwrap();
         app
@@ -496,6 +499,9 @@ fn sync_clones_fetches_and_fast_forwards() {
         branch: Some("main".into()),
         repo: None,
         build_repo: None,
+        compose_override: None,
+        public_url: None,
+        backup: None,
     };
     // Pre-clone from a file URL: no network, same semantics. sync must then
     // fast-forward (short-form git_remote is GitHub-only, so it stays unset).
@@ -599,6 +605,9 @@ fn build_local_clones_checks_out_and_builds() {
         branch: Some("main".into()),
         repo: None,
         build_repo: None,
+        compose_override: None,
+        public_url: None,
+        backup: None,
     };
 
     let log = swapdock::TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();

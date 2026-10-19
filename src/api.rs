@@ -91,6 +91,12 @@ fn api_router() -> Router<Shared> {
         .route("/apps", get(list_apps).post(init_app))
         .route("/apps/{name}", get(show_app).put(update_app))
         .route("/apps/{name}/status", get(app_status))
+        .route("/apps/{name}/inspect", get(app_inspect))
+        .route("/apps/{name}/doctor", get(app_doctor))
+        .route("/apps/{name}/adopt", post(adopt_app))
+        .route("/apps/{name}/backup", post(backup_app))
+        .route("/apps/{name}/probe", post(probe_app))
+        .route("/apps/{name}/prune", post(prune_app))
         .route("/apps/{name}/latest", get(app_latest))
         .route("/apps/{name}/deploys", post(deploy_app))
         .route("/apps/{name}/rollback", post(rollback_app))
@@ -308,6 +314,287 @@ async fn app_status(State(state): State<Shared>, Path(name): Path<String>) -> im
             &format!("status probe failed: {e}"),
         ),
     }
+}
+
+fn inspect_json(app: &App) -> anyhow::Result<serde_json::Value> {
+    let live = deploy::live_status(app)?;
+    let mut value = serde_json::json!({
+        "app": app,
+        "live": {
+            "release": live.release,
+            "old_release": live.old_release,
+            "live_port": live.live_port,
+            "up": live.up,
+            "code": live.code,
+        },
+    });
+    let port = app.live_port.unwrap_or(app.front_port);
+    let found = exec::run_capture(&crate::docker::ps_publishing(port))?;
+    let names: Vec<String> = found
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(container) = names.first() {
+        let mut details = serde_json::json!({"name": container});
+        if let Ok(out) = exec::run_capture(&crate::docker::inspect_image_ref(container))
+            && out.success()
+        {
+            details["image"] = serde_json::json!(out.stdout_trimmed());
+        }
+        if let Ok(out) = exec::run_capture(&crate::docker::inspect_health(container))
+            && out.success()
+        {
+            details["health"] = serde_json::json!(out.stdout_trimmed());
+        }
+        if let Ok(out) = exec::run_capture(&crate::docker::inspect_mounts(container))
+            && out.success()
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(out.stdout_trimmed())
+        {
+            details["mounts"] = parsed;
+        }
+        value["container"] = details;
+    }
+    Ok(value)
+}
+
+async fn app_inspect(State(state): State<Shared>, Path(name): Path<String>) -> impl IntoResponse {
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    match tokio::task::spawn_blocking(move || inspect_json(&app)).await {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("inspect failed: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DoctorQuery {
+    #[serde(default)]
+    public: bool,
+}
+
+async fn app_doctor(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Query(q): Query<DoctorQuery>,
+) -> impl IntoResponse {
+    let loaded = match load(&state) {
+        Ok(l) => l,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let selected: Vec<App> = loaded
+        .sorted()
+        .into_iter()
+        .filter(|a| a.name == name)
+        .collect();
+    if selected.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, &format!("no app named {name:?}"));
+    }
+    let state_for_job = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        let log = TraceLog::open(&state_for_job.trace)?;
+        let mut run = Run::start(
+            log,
+            RunMode::Live,
+            Some(name.clone()),
+            &["swapdock".to_string(), "api".to_string()],
+            crate::redact::Redactor::new(),
+        )?;
+        let mut problems: Vec<Problem> = selected.iter().flat_map(|a| a.problems()).collect();
+        problems.extend(crate::doctor::check(&mut run, &selected, None, q.public));
+        validator::sort_problems(&mut problems);
+        run.finish(RunStatus::Ok)?;
+        Ok::<_, anyhow::Error>(problems)
+    })
+    .await
+    {
+        Ok(Ok(problems)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"problems": problems})),
+        )
+            .into_response(),
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("doctor failed: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct AdoptBody {
+    release: String,
+    healthcheck: Option<String>,
+    container_port: Option<u16>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn adopt_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Option<AdoptBody>>,
+) -> impl IntoResponse {
+    let Some(body) = body else {
+        return error_response(StatusCode::BAD_REQUEST, "release is required");
+    };
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let ctx = ctx_for(&state);
+    let mut app = app;
+    spawn_job(&state, Some(&name), body.dry_run, move |run| {
+        deploy::adopt(
+            run,
+            &ctx,
+            &mut app,
+            &body.release,
+            body.healthcheck.as_deref(),
+            body.container_port,
+        )
+        .map(|()| serde_json::json!({}))
+        .map_err(|e| e.to_string())
+    })
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct BackupBody {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn backup_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Option<BackupBody>>,
+) -> impl IntoResponse {
+    let dry = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    spawn_job(&state, Some(&name), dry, move |run| {
+        crate::backup::run_backup(run, &app, app.release.as_deref())
+            .map(|file| serde_json::json!({"file": file}))
+            .map_err(|e| e.to_string())
+    })
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct ProbeBody {
+    url: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn probe_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Option<ProbeBody>>,
+) -> impl IntoResponse {
+    let body = body.unwrap_or_default();
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let Some(url) = body.url.or_else(|| app.public_url.clone()) else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!("{name} has no public_url; pass a url"),
+        );
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "url must start with http:// or https://",
+        );
+    }
+    spawn_job(&state, Some(&name), body.dry_run, move |run| {
+        let spec = exec::StepSpec::new("probe-public", "curl")
+            .args([
+                "-fsS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "15",
+                &url,
+            ])
+            .timeout(Duration::from_secs(20));
+        let outcome = run.exec(&spec).map_err(|e| e.to_string())?;
+        let status = outcome.stdout_trimmed().parse::<u16>().unwrap_or(0);
+        Ok(serde_json::json!({"url": url, "status": status}))
+    })
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct PruneBody {
+    #[serde(default = "default_keep")]
+    keep: usize,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_keep() -> usize {
+    3
+}
+
+async fn prune_app(
+    State(state): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Option<PruneBody>>,
+) -> impl IntoResponse {
+    let body = body.unwrap_or_default();
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let Some(repo) = app.image_repo.clone() else {
+        return error_response(StatusCode::CONFLICT, "app has no image_repo");
+    };
+    spawn_job(&state, Some(&name), body.dry_run, move |run| {
+        if run.mode() == RunMode::DryRun {
+            return Ok(serde_json::json!({"would_prune": repo, "keep": body.keep}));
+        }
+        let listed = run
+            .exec(&crate::docker::image_tags(&repo))
+            .map_err(|e| e.to_string())?;
+        let tags: Vec<String> = listed
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        let keep = crate::prune::Keep {
+            current: app.release.clone(),
+            old: app.old_release.clone(),
+        };
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        for tag in crate::prune::select_removals(&tags, &keep, body.keep) {
+            let image = format!("{repo}:{tag}");
+            match run.exec(&crate::docker::rmi(&image)) {
+                Ok(o) if o.success() => removed += 1,
+                _ => failed += 1,
+            }
+        }
+        Ok(serde_json::json!({"removed": removed, "failed": failed}))
+    })
+    .into_response()
 }
 
 /// The release that would be deployed: `origin/<branch>`, then local `HEAD`.
@@ -1417,6 +1704,28 @@ mod tests {
             transfer_dir: dir.path().join("transfer"),
         };
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn inspect_returns_registry_and_live_sections() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/apps/blog/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["app"]["name"], "blog");
+        assert!(value["live"].is_object());
     }
 
     #[tokio::test]

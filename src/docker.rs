@@ -56,6 +56,49 @@ pub fn tag(source: &str, target: &str) -> StepSpec {
     StepSpec::new("docker-tag", "docker").args(["tag", source, target])
 }
 
+/// Reads the image ID a container was created from.
+pub fn inspect_image_id(container: &str) -> StepSpec {
+    StepSpec::new("docker-inspect-image", "docker")
+        .args(["inspect", "--format", "{{.Image}}"])
+        .arg(container)
+}
+
+/// Reads the image reference a container was created from.
+pub fn inspect_image_ref(container: &str) -> StepSpec {
+    StepSpec::new("docker-inspect-image-ref", "docker")
+        .args(["inspect", "--format", "{{.Config.Image}}"])
+        .arg(container)
+}
+
+/// Reads a container's published-port map as JSON.
+pub fn inspect_ports(container: &str) -> StepSpec {
+    StepSpec::new("docker-inspect-ports", "docker")
+        .args(["inspect", "--format", "{{json .NetworkSettings.Ports}}"])
+        .arg(container)
+}
+
+/// Reads a container's bind mounts as JSON.
+pub fn inspect_mounts(container: &str) -> StepSpec {
+    StepSpec::new("docker-inspect-mounts", "docker")
+        .args(["inspect", "--format", "{{json .Mounts}}"])
+        .arg(container)
+}
+
+/// Proves an image exists in the local daemon. Non-zero means missing.
+pub fn image_exists(image_ref: &str) -> StepSpec {
+    StepSpec::new("docker-image-inspect", "docker").args(["image", "inspect", image_ref])
+}
+
+/// Lists a repository's local tags, one per line.
+pub fn image_tags(repo: &str) -> StepSpec {
+    StepSpec::new("docker-images", "docker").args(["images", repo, "--format", "{{.Tag}}"])
+}
+
+/// Removes one local image tag.
+pub fn rmi(image_ref: &str) -> StepSpec {
+    StepSpec::new("docker-rmi", "docker").args(["rmi", image_ref])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

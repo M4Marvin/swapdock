@@ -20,17 +20,20 @@
 
 pub mod api;
 pub mod apply;
+pub mod backup;
 pub mod builder;
 pub mod cli;
 pub mod compose;
 pub mod deploy;
 pub mod docker;
+pub mod doctor;
 pub mod exec;
 pub mod git;
 pub mod health;
 pub mod id;
 pub mod lock;
 pub mod ports;
+pub mod prune;
 pub mod redact;
 pub mod registry;
 pub mod render;

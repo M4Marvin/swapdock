@@ -61,6 +61,34 @@ pub fn rm(compose_file: &Path, project: &str, service: &str) -> StepSpec {
     base("compose-rm", compose_file, project).args(["rm", "-f", service])
 }
 
+/// Renders the fully merged compose model as JSON.
+///
+/// This is how adoption and `doctor` ask compose what it will actually do,
+/// without parsing YAML themselves. Later files win, matching `up_detached`.
+pub fn config_json(
+    compose_file: &Path,
+    project: &str,
+    extra_files: &[&Path],
+    service: &str,
+) -> StepSpec {
+    let mut spec = base("compose-config", compose_file, project);
+    for file in extra_files {
+        spec = spec.arg("-f").arg(file.display().to_string());
+    }
+    // Restrict to one service: the full model can exceed the chokepoint's
+    // retained output tail, and a truncated JSON document does not parse.
+    spec.args(["config", "--format", "json", service])
+}
+
+/// Validates the merged compose model without starting anything.
+pub fn config_quiet(compose_file: &Path, project: &str, extra_files: &[&Path]) -> StepSpec {
+    let mut spec = base("compose-config", compose_file, project);
+    for file in extra_files {
+        spec = spec.arg("-f").arg(file.display().to_string());
+    }
+    spec.args(["config", "--quiet"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +144,21 @@ mod tests {
             "-f must precede the subcommand: {argv:?}"
         );
         assert!(argv.contains(&"apps-green".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn config_json_is_scoped_to_one_service() {
+        let spec = config_json(&file(), "apps", &[], "chats");
+        assert!(
+            spec.full_argv().ends_with(&[
+                "config".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "chats".to_string()
+            ]),
+            "{:?}",
+            spec.full_argv()
+        );
     }
 
     #[test]

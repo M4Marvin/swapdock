@@ -143,6 +143,33 @@ pub enum Command {
     /// Check the registry: per-app rules, cross-app clashes and tunnel routes.
     Validate,
 
+    /// Check the host as well: compose paths, mounts, ports, images and health.
+    Doctor {
+        /// Check only this app.
+        #[arg(long, value_name = "NAME")]
+        app: Option<String>,
+        /// Also probe each app's public_url.
+        #[arg(long)]
+        public: bool,
+    },
+
+    /// Adopt a legacy container into swapdock at the release it is running.
+    Adopt {
+        /// App name, as in the registry.
+        app: String,
+        /// Commit the legacy container is already running.
+        #[arg(long, value_name = "SHA")]
+        release: String,
+        /// Healthcheck command to add when the compose file has none.
+        #[arg(long, value_name = "CMD")]
+        healthcheck: Option<String>,
+        /// Container-side port; inferred from the legacy container when omitted.
+        #[arg(long, value_name = "PORT")]
+        container_port: Option<u16>,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
+
     /// Deploy one app through its registry strategy.
     Up {
         /// App name, as in the registry.
@@ -167,6 +194,12 @@ pub enum Command {
 
     /// Report what one app is running: recorded release, live port, health.
     Status {
+        /// App name, as in the registry.
+        app: String,
+    },
+
+    /// Print the registry entry, live verdict and container mounts as JSON.
+    Inspect {
         /// App name, as in the registry.
         app: String,
     },
@@ -201,6 +234,21 @@ pub enum Command {
         build_host: Option<String>,
     },
 
+    /// Run the app's configured [backup] command once.
+    Backup {
+        /// App name, as in the registry.
+        app: String,
+    },
+
+    /// Probe an app's public URL over HTTPS (or --url).
+    Probe {
+        /// App name, as in the registry.
+        app: String,
+        /// URL to probe. Defaults to the app's public_url.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+
     /// Check the access log since a time or run: failures, upstreams, the flip.
     Verify {
         /// App name, as in the registry.
@@ -217,6 +265,16 @@ pub enum Command {
     Apply {
         #[command(flatten)]
         paths: DeployPaths,
+    },
+
+    /// Remove old local release images while keeping rollback targets.
+    Prune {
+        /// Prune only this app. Defaults to every app in the registry.
+        #[arg(long, value_name = "NAME")]
+        app: Option<String>,
+        /// Recent rollback-pre-* tags to keep per app.
+        #[arg(long, default_value_t = 3)]
+        keep: usize,
     },
 
     /// Serve the HTTP API instead of one-shot CLI commands.
@@ -256,12 +314,27 @@ impl Command {
             Command::Resume { run_id } => resume_run(cli, run_id),
             Command::Render { app } => render_config(cli, app.as_deref()),
             Command::Validate => validate_registry(cli),
+            Command::Doctor { app, public } => doctor_app(cli, app.as_deref(), *public),
             Command::Apply { paths } => apply_config(
                 cli,
                 &paths.target,
                 &paths.main_config,
                 &paths.pid_file,
                 &paths.nginx_bin,
+            ),
+            Command::Adopt {
+                app,
+                release,
+                healthcheck,
+                container_port,
+                paths,
+            } => adopt_app(
+                cli,
+                app,
+                release,
+                healthcheck.as_deref(),
+                *container_port,
+                paths,
             ),
             Command::Up {
                 app,
@@ -271,6 +344,7 @@ impl Command {
             } => up_app(cli, app, release.as_deref(), *force, paths),
             Command::Rollback { app, paths } => rollback_app(cli, app, paths),
             Command::Status { app } => status_app(cli, app),
+            Command::Inspect { app } => inspect_app(cli, app),
             Command::Sync { app } => sync_app(cli, app),
             Command::Init { name, dir, kind } => init_app(name, dir.clone(), kind),
             Command::Build {
@@ -278,11 +352,14 @@ impl Command {
                 release,
                 build_host,
             } => build_app(cli, app, release.as_deref(), build_host.as_deref()),
+            Command::Backup { app } => backup_app(cli, app),
+            Command::Probe { app, url } => probe_app(cli, app, url.as_deref()),
             Command::Verify {
                 app,
                 since,
                 access_log,
             } => verify_app(cli, app, since, access_log),
+            Command::Prune { app, keep } => prune_app(cli, app.as_deref(), *keep),
             Command::Serve { bind, paths } => serve(cli, bind, paths),
         }
     }
@@ -738,6 +815,86 @@ fn validate_registry(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `swapdock doctor`
+///
+/// Unlike `validate`, this reads the compose model and the Docker daemon. It is
+/// still read-only: no container is started, stopped or tagged.
+fn doctor_app(cli: &Cli, only: Option<&str>, public: bool) -> anyhow::Result<()> {
+    let Some(loaded) = load(cli)? else {
+        return Ok(());
+    };
+    let apps = loaded.sorted();
+    let selected: Vec<App> = match only {
+        None => apps,
+        Some(name) => {
+            let found: Vec<App> = apps.into_iter().filter(|a| a.name == name).collect();
+            if found.is_empty() {
+                let mut known: Vec<&str> = loaded.apps.iter().map(|a| a.name.as_str()).collect();
+                known.sort_unstable();
+                anyhow::bail!(
+                    "no app named {name:?} in {}; known apps: {}",
+                    cli.registry.display(),
+                    known.join(", ")
+                );
+            }
+            found
+        }
+    };
+
+    let (mut problems, routes) = collect_problems(cli, &loaded, &selected);
+    let mut run = start(cli)?;
+    problems.extend(crate::doctor::check(&mut run, &selected, only, public));
+    validator::sort_problems(&mut problems);
+
+    let (errors, warnings) = validator::counts(&problems);
+    println!("registry  {}", cli.registry.display());
+    println!("apps      {}", selected.len());
+    println!(
+        "tunnel    {}",
+        match &cli.tunnel_config {
+            Some(p) => format!("{} ({} routes)", p.display(), routes.len()),
+            None => "not checked".to_string(),
+        }
+    );
+    println!(
+        "public    {}",
+        if public { "checked" } else { "not checked" }
+    );
+    println!();
+
+    if problems.is_empty() {
+        println!("no problems");
+    } else {
+        let rows: Vec<Vec<String>> = problems
+            .iter()
+            .map(|p| {
+                vec![
+                    p.severity.to_string(),
+                    p.code.to_string(),
+                    p.app.clone().unwrap_or_else(|| "-".to_string()),
+                    p.message.clone(),
+                ]
+            })
+            .collect();
+        print_table(&["severity", "code", "app", "message"], &rows);
+    }
+
+    println!();
+    println!("{errors} error(s), {warnings} warning(s)");
+    run.finish(if cli.dry_run {
+        RunStatus::DryRun
+    } else if errors > 0 {
+        RunStatus::Failed
+    } else {
+        RunStatus::Ok
+    })?;
+
+    if errors > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Flattens a cell to one line.
 ///
 /// A multi-line cell — a TOML parse error carries its own source excerpt — would
@@ -900,6 +1057,49 @@ fn load_app(cli: &Cli, name: &str) -> anyhow::Result<crate::registry::App> {
     }
 }
 
+/// `swapdock adopt <app> --release <current>`
+fn adopt_app(
+    cli: &Cli,
+    name: &str,
+    release: &str,
+    healthcheck: Option<&str>,
+    container_port: Option<u16>,
+    paths: &DeployPaths,
+) -> anyhow::Result<()> {
+    let mut app = load_app(cli, name)?;
+    let ctx = ctx_from(cli, paths);
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    println!("adopting {name} at release {release}");
+    match deploy::adopt(
+        &mut run,
+        &ctx,
+        &mut app,
+        release,
+        healthcheck,
+        container_port,
+    ) {
+        Ok(()) => {
+            run.finish(if cli.dry_run {
+                RunStatus::DryRun
+            } else {
+                RunStatus::Ok
+            })?;
+            if cli.dry_run {
+                println!("would adopt {name} at release {release}");
+            } else {
+                println!("adopted {name} at release {release}");
+            }
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
 /// `swapdock up <app> [--release] [--force]`
 fn up_app(
     cli: &Cli,
@@ -982,6 +1182,64 @@ fn status_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `swapdock inspect <app>`
+///
+/// JSON for scripts and for the "why is this app mounting the wrong data?"
+/// question. `status` stays spawn-free; this command deliberately asks Docker.
+fn inspect_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let live = deploy::live_status(&app).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut value = serde_json::json!({
+        "app": &app,
+        "live": {
+            "release": live.release,
+            "old_release": live.old_release,
+            "live_port": live.live_port,
+            "up": live.up,
+            "code": live.code,
+        },
+    });
+
+    let port = app.live_port.unwrap_or(app.front_port);
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    let found = run.exec(&crate::docker::ps_publishing(port))?;
+    let names: Vec<String> = found
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if let Some(container) = names.first() {
+        let mut details = serde_json::json!({"name": container});
+        if let Ok(out) = run.exec(&crate::docker::inspect_image_ref(container))
+            && out.success()
+        {
+            details["image"] = serde_json::json!(out.stdout_trimmed());
+        }
+        if let Ok(out) = run.exec(&crate::docker::inspect_health(container))
+            && out.success()
+        {
+            details["health"] = serde_json::json!(out.stdout_trimmed());
+        }
+        if let Ok(out) = run.exec(&crate::docker::inspect_mounts(container))
+            && out.success()
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(out.stdout_trimmed())
+        {
+            details["mounts"] = parsed;
+        }
+        value["container"] = details;
+    }
+
+    run.finish(RunStatus::Ok)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    eprintln!("run      {run_id}");
+    Ok(())
+}
+
 /// The template `init` writes. Every field is explained where it is used, so a
 /// first registry file teaches the format instead of just filling it.
 pub fn init_template(name: &str, kind: &str) -> anyhow::Result<String> {
@@ -1035,6 +1293,13 @@ env_name = "{upper}_PORT"
 # git_remote = "example-org/{name}"
 branch = "main"
 # repo = "/srv/example/{name}"
+# Optional: public URL used by `swapdock probe`.
+# public_url = "https://{name}.example.com/health"
+# Optional pre-deploy snapshot, run before every `up` when before_deploy = true.
+# [backup]
+# command = ["sqlite3", "/srv/example/{name}/data/app.db", ".backup {{file}}"]
+# dir = "/srv/swapdock/backups/{name}"
+# before_deploy = true
 {strategy_note}
 "#,
         upper = name.to_uppercase().replace('-', "_")
@@ -1124,6 +1389,183 @@ fn build_app(
         "swapdock it with: swapdock up {name} --release {}",
         built.release
     );
+    Ok(())
+}
+
+/// `swapdock backup <app>`
+fn backup_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    match crate::backup::run_backup(&mut run, &app, app.release.as_deref()) {
+        Ok(file) => {
+            run.finish(if cli.dry_run {
+                RunStatus::DryRun
+            } else {
+                RunStatus::Ok
+            })?;
+            match file {
+                Some(path) => println!("backup   {}", path.display()),
+                None => println!("backup   command completed (no {{file}} placeholder)"),
+            }
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// `swapdock prune [--app] [--keep N]`
+fn prune_app(cli: &Cli, only: Option<&str>, keep: usize) -> anyhow::Result<()> {
+    let Some(loaded) = load(cli)? else {
+        return Ok(());
+    };
+    let apps = loaded.sorted();
+    let selected: Vec<App> = match only {
+        None => apps,
+        Some(name) => {
+            let found: Vec<App> = apps.into_iter().filter(|a| a.name == name).collect();
+            if found.is_empty() {
+                let mut known: Vec<&str> = loaded.apps.iter().map(|a| a.name.as_str()).collect();
+                known.sort_unstable();
+                anyhow::bail!(
+                    "no app named {name:?} in {}; known apps: {}",
+                    cli.registry.display(),
+                    known.join(", ")
+                );
+            }
+            found
+        }
+    };
+
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+
+    for app in &selected {
+        let Some(repo) = app.image_repo.as_deref() else {
+            continue;
+        };
+        if cli.dry_run {
+            println!(
+                "would prune {repo}: keep release, old_release, latest and {keep} rollback tag(s)"
+            );
+            let seq = run.next_seq();
+            run.record_step(
+                crate::trace::StepRecord::new(
+                    seq,
+                    "prune",
+                    crate::trace::StepStatus::DryRun,
+                    &["docker".to_string(), "images".to_string(), repo.to_string()],
+                )
+                .with_detail(serde_json::json!({"keep": keep, "app": app.name})),
+            )?;
+            continue;
+        }
+        let outcome = run.exec(&crate::docker::image_tags(repo))?;
+        if !outcome.success() {
+            eprintln!(
+                "warning: could not list images for {repo}: {}",
+                outcome.stderr_trimmed()
+            );
+            continue;
+        }
+        let tags: Vec<String> = outcome
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        let keep_set = crate::prune::Keep {
+            current: app.release.clone(),
+            old: app.old_release.clone(),
+        };
+        let removals = crate::prune::select_removals(&tags, &keep_set, keep);
+        for tag in &removals {
+            let image = format!("{repo}:{tag}");
+            let result = run.exec(&crate::docker::rmi(&image))?;
+            if result.success() {
+                println!("removed {image}");
+                removed += 1;
+            } else {
+                eprintln!(
+                    "warning: could not remove {image}: {}",
+                    result.stderr_trimmed()
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    run.finish(if cli.dry_run {
+        RunStatus::DryRun
+    } else if failed > 0 {
+        RunStatus::Failed
+    } else {
+        RunStatus::Ok
+    })?;
+    println!();
+    println!("removed   {removed}");
+    println!("failed    {failed}");
+    println!("run       {run_id}");
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `swapdock probe <app> [--url]`
+fn probe_app(cli: &Cli, name: &str, url: Option<&str>) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let url = url
+        .map(str::to_string)
+        .or_else(|| app.public_url.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{name} has no public_url; pass --url https://host/path or set public_url in the registry"
+            )
+        })?;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        anyhow::bail!("{url:?} must start with http:// or https://");
+    }
+
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    let spec = StepSpec::new("probe-public", "curl")
+        .args([
+            "-fsS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "15",
+            &url,
+        ])
+        .timeout(Duration::from_secs(20));
+
+    if cli.dry_run {
+        run.exec(&spec)?;
+        run.finish(RunStatus::DryRun)?;
+        println!("would probe {url}");
+        return Ok(());
+    }
+
+    let outcome = run.exec(&spec)?;
+    let code = outcome.stdout_trimmed().parse::<u16>().unwrap_or(0);
+    let ok = (200..400).contains(&code);
+    println!("url     {url}");
+    println!("status  {code}");
+    println!("run     {run_id}");
+    run.finish(if ok { RunStatus::Ok } else { RunStatus::Failed })?;
+    if !ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -1423,6 +1865,65 @@ mod tests {
             }
             _ => panic!("expected Apply"),
         }
+    }
+
+    #[test]
+    fn operations_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "swapdock",
+            "adopt",
+            "chats",
+            "--release",
+            "69ff7b5",
+            "--healthcheck",
+            "true",
+            "--container-port",
+            "3000",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Adopt {
+                app,
+                release,
+                healthcheck,
+                container_port,
+                ..
+            } => {
+                assert_eq!(app, "chats");
+                assert_eq!(release, "69ff7b5");
+                assert_eq!(healthcheck.as_deref(), Some("true"));
+                assert_eq!(container_port, Some(3000));
+            }
+            _ => panic!("expected Adopt"),
+        }
+
+        let cli = Cli::try_parse_from(["swapdock", "doctor", "--app", "chat", "--public"]).unwrap();
+        match cli.command {
+            Command::Doctor { app, public } => {
+                assert_eq!(app.as_deref(), Some("chat"));
+                assert!(public);
+            }
+            _ => panic!("expected Doctor"),
+        }
+
+        let cli = Cli::try_parse_from(["swapdock", "backup", "chats"]).unwrap();
+        assert!(matches!(cli.command, Command::Backup { .. }));
+
+        let cli = Cli::try_parse_from(["swapdock", "probe", "chat"]).unwrap();
+        assert!(matches!(cli.command, Command::Probe { .. }));
+
+        let cli =
+            Cli::try_parse_from(["swapdock", "prune", "--app", "chat", "--keep", "2"]).unwrap();
+        match cli.command {
+            Command::Prune { app, keep } => {
+                assert_eq!(app.as_deref(), Some("chat"));
+                assert_eq!(keep, 2);
+            }
+            _ => panic!("expected Prune"),
+        }
+
+        let cli = Cli::try_parse_from(["swapdock", "inspect", "chat"]).unwrap();
+        assert!(matches!(cli.command, Command::Inspect { .. }));
     }
 
     #[test]

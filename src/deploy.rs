@@ -28,10 +28,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::apply::{self, ApplyPaths};
+use crate::backup;
 use crate::compose;
 use crate::docker;
 use crate::exec::StepSpec;
@@ -70,6 +71,7 @@ pub fn swap_steps() -> Vec<&'static str> {
         "nginx-reload",
         "probe-front",
         "drain-wait",
+        "retain-old-image",
         "stop-old",
         "registry-commit",
     ]
@@ -87,6 +89,7 @@ pub fn replace_steps() -> Vec<&'static str> {
         "apply-commit",
         "nginx-test",
         "nginx-reload",
+        "retain-old-image",
         "stop-old",
         "start-new",
         "health-wait-discover",
@@ -166,6 +169,12 @@ pub enum DeployError {
 
     #[error("invalid health path: {0}")]
     InvalidHealthPath(String),
+
+    #[error("backup failed: {0}")]
+    Backup(#[from] backup::BackupError),
+
+    #[error("cannot adopt {app}: {reason}")]
+    Adopt { app: String, reason: String },
 }
 
 /// Decides which commit to swapdock: the flag wins, then the recorded release.
@@ -326,6 +335,7 @@ pub fn sync_repo(run: &mut Run, app: &App) -> Result<String, DeployError> {
 pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Result<(), DeployError> {
     let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
     refuse_if_broken(run, ctx)?;
+    backup::before_deploy(run, app, Some(release))?;
 
     // Without a live port there is nothing to alternate against: a first swapdock
     // starts on the pair's first port.
@@ -353,6 +363,8 @@ pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Resul
 
     drain(run, ctx)?;
 
+    retain_old_image(run, app)?;
+
     stop_publishing(run, app.live_port)?;
 
     commit_release(run, ctx, app, release.to_string(), green_port)?;
@@ -372,6 +384,7 @@ pub fn run_replace(
 ) -> Result<(), DeployError> {
     let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
     refuse_if_broken(run, ctx)?;
+    backup::before_deploy(run, app, Some(release))?;
 
     let port = app.live_port.ok_or_else(|| {
         DeployError::Estate(format!(
@@ -389,6 +402,8 @@ pub fn run_replace(
     } else {
         record_skip(run, "apply-skipped", "rendered config identical; no reload")?;
     }
+
+    retain_old_image(run, app)?;
 
     stop_publishing(run, Some(port))?;
 
@@ -506,12 +521,12 @@ fn start_green(
     let project = format!("{}-green", app.compose_project());
     let image = app.image_ref(release).unwrap_or_default();
     let port_var = app.env_name.clone();
-    let mut spec = compose::up_detached(
-        &compose_file,
-        &project,
-        &[override_path.as_path()],
-        &app.compose_svc,
-    );
+    let mut extra: Vec<&Path> = Vec::new();
+    if let Some(path) = &app.compose_override {
+        extra.push(path);
+    }
+    extra.push(override_path.as_path());
+    let mut spec = compose::up_detached(&compose_file, &project, &extra, &app.compose_svc);
     spec = spec
         .env(port_var, green_port.to_string())
         .env(IMAGE_ENV, image);
@@ -530,7 +545,8 @@ fn start_live(run: &mut Run, app: &App, release: &str, port: u16) -> Result<(), 
     let compose_file = app.compose_dir.join("docker-compose.yml");
     let project = app.compose_project();
     let image = app.image_ref(release).unwrap_or_default();
-    let spec = compose::up_detached(&compose_file, &project, &[], &app.compose_svc)
+    let extra: Vec<&Path> = app.compose_override.iter().map(PathBuf::as_path).collect();
+    let spec = compose::up_detached(&compose_file, &project, &extra, &app.compose_svc)
         .env(app.env_name.clone(), port.to_string())
         .env(IMAGE_ENV, image);
     let outcome = run.exec(&spec)?;
@@ -656,6 +672,89 @@ fn drain(run: &mut Run, ctx: &Ctx) -> Result<(), DeployError> {
     Ok(())
 }
 
+/// Tags the running old image with the recorded rollback release.
+///
+/// The old container is about to be removed, so this is the last moment the
+/// image is reachable by ID. A later `rollback` asks for
+/// `image_repo:old_release`; without this step that tag can be missing even
+/// though the image is still in the daemon.
+fn retain_old_image(run: &mut Run, app: &App) -> Result<(), DeployError> {
+    let Some(old_release) = app.old_release.as_deref() else {
+        record_skip(run, "retain-old-image", "no previous release to retain")?;
+        return Ok(());
+    };
+    let Some(target) = app.image_ref(old_release) else {
+        record_skip(run, "retain-old-image", "no image_repo; nothing to tag")?;
+        return Ok(());
+    };
+    let Some(port) = app.live_port else {
+        record_skip(run, "retain-old-image", "no live port; nothing to retain")?;
+        return Ok(());
+    };
+
+    if run.mode() == RunMode::DryRun {
+        let seq = run.next_seq();
+        run.record_step(
+            StepRecord::new(
+                seq,
+                "retain-old-image",
+                crate::trace::StepStatus::DryRun,
+                &["docker".to_string(), "tag".to_string(), target.clone()],
+            )
+            .with_detail(json!({"old_release": old_release, "image": target})),
+        )?;
+        return Ok(());
+    }
+
+    let found = run.exec(&docker::ps_publishing(port))?;
+    let names: Vec<&str> = found
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if names.is_empty() {
+        record_skip(
+            run,
+            "retain-old-image",
+            &format!("nothing publishes {port}; no image to tag"),
+        )?;
+        return Ok(());
+    }
+
+    let mut tagged = Vec::new();
+    for name in names {
+        let id = run.exec(&docker::inspect_image_id(name))?;
+        if !id.success() {
+            continue;
+        }
+        let image_id = id.stdout_trimmed();
+        if image_id.is_empty() {
+            continue;
+        }
+        let tag = run.exec(&docker::tag(image_id, &target))?;
+        if !tag.success() {
+            return Err(DeployError::Estate(format!(
+                "could not tag old image {image_id} as {target}: {}",
+                tag.stderr_trimmed()
+            )));
+        }
+        tagged.push(json!({"container": name, "image_id": image_id, "tag": target.clone()}));
+    }
+
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "retain-old-image",
+            crate::trace::StepStatus::Ok,
+            &["docker".to_string(), "tag".to_string(), target.clone()],
+        )
+        .with_detail(json!({"old_release": old_release, "tagged": tagged})),
+    )?;
+    Ok(())
+}
+
 /// Stops and removes every container publishing `port`, if any.
 fn stop_publishing(run: &mut Run, port: Option<u16>) -> Result<(), DeployError> {
     let Some(port) = port else {
@@ -776,6 +875,370 @@ fn short_sha(release: &str) -> &str {
     &release[..release.len().min(7)]
 }
 
+// ---------------------------------------------------------------------------
+// adoption
+// ---------------------------------------------------------------------------
+
+/// Adopts a legacy container that publishes `front_port` directly.
+///
+/// This is the first-run path for a `replace` app. It deliberately does **not**
+/// deploy a new release: `release` is the commit the legacy container is already
+/// running. The sequence is:
+///
+/// ```text
+/// lock -> inspect-legacy -> tag-old-image -> compose-config -> adopt-override
+///      -> stop-legacy -> apply(nginx front -> back) -> start-adopted
+///      -> health-wait -> probe-front -> registry-commit
+/// ```
+///
+/// After it succeeds, the app has a recorded release, a live back port and a
+/// nginx block; the next `swapdock up <app> --release <new>` uses the normal
+/// replace strategy and records the adopted release as `old_release`.
+pub fn adopt(
+    run: &mut Run,
+    ctx: &Ctx,
+    app: &mut App,
+    release: &str,
+    healthcheck: Option<&str>,
+    container_port: Option<u16>,
+) -> Result<(), DeployError> {
+    if !registry::is_valid_release_arg(release) {
+        return Err(DeployError::InvalidRelease(release.to_string()));
+    }
+    if app.kind != registry::Kind::Container {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: "only container apps can be adopted".into(),
+        });
+    }
+
+    let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
+    refuse_if_broken(run, ctx)?;
+
+    if app.live_port.is_some() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: "the registry already has live_port; use `swapdock up` instead".into(),
+        });
+    }
+    if app.compose_override.is_some() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: "compose_override is already set; this app was adopted".into(),
+        });
+    }
+    let Some(image_ref) = app.image_ref(release) else {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: "a container app needs image_repo".into(),
+        });
+    };
+
+    if run.mode() == RunMode::DryRun {
+        let seq = run.next_seq();
+        run.record_step(
+            StepRecord::new(seq, "adopt", crate::trace::StepStatus::DryRun, &[]).with_detail(
+                json!({
+                    "release": release,
+                    "front_port": app.front_port,
+                    "slot": app.slot,
+                    "container_port": container_port,
+                    "healthcheck": healthcheck,
+                    "image": image_ref,
+                }),
+            ),
+        )?;
+        return Ok(());
+    }
+
+    backup::before_deploy(run, app, Some(release))?;
+
+    let legacy_name = legacy_container(run, app)?;
+    let legacy_image = run.exec(&docker::inspect_image_ref(&legacy_name))?;
+    if !legacy_image.success() || legacy_image.stdout_trimmed().is_empty() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!("could not read the image of legacy container {legacy_name}"),
+        });
+    }
+    let legacy_image = legacy_image.stdout_trimmed().to_string();
+
+    // Preserve the image under this release before the container is removed.
+    if legacy_image != image_ref {
+        let tagged = run.exec(&docker::tag(&legacy_image, &image_ref))?;
+        if !tagged.success() {
+            return Err(DeployError::Adopt {
+                app: app.name.clone(),
+                reason: format!(
+                    "could not tag legacy image {legacy_image} as {image_ref}: {}",
+                    tagged.stderr_trimmed()
+                ),
+            });
+        }
+    }
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "retain-old-image",
+            crate::trace::StepStatus::Ok,
+            &["docker".to_string(), "tag".to_string(), image_ref.clone()],
+        )
+        .with_detail(json!({
+            "source": legacy_image,
+            "tag": image_ref.clone(),
+            "container": legacy_name,
+        })),
+    )?;
+
+    let exists = run.exec(&docker::image_exists(&image_ref))?;
+    if !exists.success() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!("{image_ref} is not in the local daemon after tagging"),
+        });
+    }
+
+    let compose_file = app.compose_dir.join("docker-compose.yml");
+    let project = app.compose_project();
+    let config_out = run.exec(&compose::config_json(
+        &compose_file,
+        &project,
+        &[],
+        &app.compose_svc,
+    ))?;
+    if !config_out.success() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!(
+                "docker compose config failed for {}: {}",
+                compose_file.display(),
+                config_out.stderr_trimmed()
+            ),
+        });
+    }
+    let config: Value =
+        serde_json::from_str(config_out.stdout_trimmed()).map_err(|e| DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!("docker compose config did not return JSON: {e}"),
+        })?;
+    let base_has_healthcheck = crate::doctor::healthcheck_present(&config, &app.compose_svc);
+    if !base_has_healthcheck && healthcheck.is_none() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: "the compose service has no healthcheck; pass --healthcheck \"<command>\" \
+                     or add a healthcheck to the compose file"
+                .into(),
+        });
+    }
+
+    let container_port = container_port
+        .or(legacy_container_port(run, &legacy_name, app.front_port)?)
+        .ok_or_else(|| DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!(
+                "could not infer the container port of {legacy_name}; pass --container-port"
+            ),
+        })?;
+
+    let (back_port, _) =
+        crate::ports::pair(app.slot).map_err(|e| DeployError::Estate(e.to_string()))?;
+    let override_path = adopt_override_path(&ctx.state_dir, &app.name);
+    let text = adopt_override(
+        &app.compose_svc,
+        &app.env_name,
+        container_port,
+        back_port,
+        app.image_repo.as_deref().unwrap_or(""),
+        healthcheck,
+    );
+    write_named_state_file(run, "adopt-override", &override_path, &text)?;
+    app.compose_override = Some(override_path.clone());
+
+    let checked = run.exec(&compose::config_quiet(
+        &compose_file,
+        &project,
+        &[override_path.as_path()],
+    ))?;
+    if !checked.success() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!(
+                "the generated override failed `docker compose config`: {}",
+                checked.stderr_trimmed()
+            ),
+        });
+    }
+
+    // From here on the legacy container is gone. Everything that could be
+    // checked without stopping it has already been checked.
+    let stopped = run.exec(&docker::stop(&legacy_name))?;
+    if !stopped.success() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!("could not stop {legacy_name}: {}", stopped.stderr_trimmed()),
+        });
+    }
+    run.exec(&docker::rm(&legacy_name))?;
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "stop-legacy",
+            crate::trace::StepStatus::Ok,
+            &[
+                "docker".to_string(),
+                "stop".to_string(),
+                legacy_name.clone(),
+            ],
+        )
+        .with_detail(json!({"container": legacy_name})),
+    )?;
+
+    apply_new_state(run, ctx, app, back_port)?;
+    start_live(run, app, release, back_port)?;
+
+    let health_path =
+        health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
+    health::gate_container(run, "health-wait", back_port, &health_path)?;
+    probe_front(run, app)?;
+    commit_release(run, ctx, app, release.to_string(), back_port)?;
+    Ok(())
+}
+
+/// The single container publishing the app's front port, or a clear refusal.
+fn legacy_container(run: &mut Run, app: &App) -> Result<String, DeployError> {
+    let found = run.exec(&docker::ps_publishing(app.front_port))?;
+    if !found.success() {
+        return Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!("docker ps failed: {}", found.stderr_trimmed()),
+        });
+    }
+    let names: Vec<&str> = found
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    match names.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!(
+                "no container publishes front_port {}; nothing to adopt",
+                app.front_port
+            ),
+        }),
+        many => Err(DeployError::Adopt {
+            app: app.name.clone(),
+            reason: format!(
+                "{} containers publish front_port {}: {}; stop the extra ones first",
+                many.len(),
+                app.front_port,
+                many.join(", ")
+            ),
+        }),
+    }
+}
+
+/// The container-side port mapped to `front_port`, from Docker's port map.
+fn legacy_container_port(
+    run: &mut Run,
+    container: &str,
+    front_port: u16,
+) -> Result<Option<u16>, DeployError> {
+    let outcome = run.exec(&docker::inspect_ports(container))?;
+    if !outcome.success() {
+        return Ok(None);
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(outcome.stdout_trimmed()) else {
+        return Ok(None);
+    };
+    let Some(map) = parsed.as_object() else {
+        return Ok(None);
+    };
+    let front = front_port.to_string();
+    for (key, bindings) in map {
+        let Some(container_port) = key.split('/').next().and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        for binding in bindings.as_array().into_iter().flatten() {
+            if binding.get("HostPort").and_then(Value::as_str) == Some(front.as_str()) {
+                return Ok(Some(container_port));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Path of the persistent compose override generated by `adopt`.
+pub fn adopt_override_path(state_dir: &Path, app: &str) -> PathBuf {
+    state_dir
+        .parent()
+        .map(|p| p.join("overrides"))
+        .unwrap_or_else(|| PathBuf::from("/srv/swapdock/overrides"))
+        .join(format!("{app}.yml"))
+}
+
+/// The override that makes a hand-written compose service adoptable.
+///
+/// Later files win in compose, so this pins the image, replaces the published
+/// port instead of appending another one (`!override`) and optionally adds the
+/// healthcheck the deploy gate requires.
+pub fn adopt_override(
+    service: &str,
+    env_name: &str,
+    container_port: u16,
+    back_port: u16,
+    image_repo: &str,
+    healthcheck: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "# Generated by swapdock adopt; do not edit by hand.\n\
+         services:\n  {service}:\n    image: ${{IMAGE:-{image_repo}}}\n    ports: !override\n      - \"127.0.0.1:${{{env_name}:-{back_port}}}:{container_port}\"\n"
+    );
+    if let Some(command) = healthcheck {
+        let quoted = serde_json::to_string(command).unwrap_or_else(|_| "\"true\"".into());
+        text.push_str(&format!(
+            "    healthcheck:\n      test: [\"CMD-SHELL\", {quoted}]\n      interval: 5s\n      timeout: 5s\n      retries: 24\n      start_period: 10s\n"
+        ));
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
+// adoption helpers
+// ---------------------------------------------------------------------------
+
+fn write_named_state_file(
+    run: &mut Run,
+    step: &'static str,
+    path: &Path,
+    text: &str,
+) -> Result<(), DeployError> {
+    if run.mode() == RunMode::DryRun {
+        let seq = run.next_seq();
+        run.record_step(
+            StepRecord::new(
+                seq,
+                step,
+                crate::trace::StepStatus::DryRun,
+                &["write".to_string(), path.display().to_string()],
+            )
+            .with_detail(json!({"bytes": text.len()})),
+        )?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| DeployError::Io(format!("create {}: {e}", parent.display())))?;
+    }
+    std::fs::write(path, text)
+        .map_err(|e| DeployError::Io(format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1267,7 @@ mod tests {
                 "nginx-reload",
                 "probe-front",
                 "drain-wait",
+                "retain-old-image",
                 "stop-old",
                 "registry-commit",
             ]
@@ -820,6 +1284,7 @@ mod tests {
                 "apply-commit",
                 "nginx-test",
                 "nginx-reload",
+                "retain-old-image",
                 "stop-old",
                 "start-new",
                 "health-wait-discover",
@@ -935,6 +1400,41 @@ mod tests {
         assert_eq!(
             green_override_path(Path::new("/srv/swapdock/green"), "portfolio"),
             PathBuf::from("/srv/swapdock/green/portfolio.yml")
+        );
+    }
+
+    #[test]
+    fn adopt_override_pins_image_and_replaces_the_published_port() {
+        let text = adopt_override(
+            "chats",
+            "CHATS_PORT",
+            3000,
+            9016,
+            "charon-chats",
+            Some("node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1))\""),
+        );
+        assert!(text.contains("image: ${IMAGE:-charon-chats}"), "{text}");
+        assert!(text.contains("ports: !override"), "{text}");
+        assert!(
+            text.contains("127.0.0.1:${CHATS_PORT:-9016}:3000"),
+            "{text}"
+        );
+        assert!(text.contains("CMD-SHELL"), "{text}");
+        assert!(text.contains("start_period: 10s"), "{text}");
+    }
+
+    #[test]
+    fn adopt_override_can_leave_an_existing_healthcheck_alone() {
+        let text = adopt_override("app", "APP_PORT", 80, 9002, "app-image", None);
+        assert!(!text.contains("healthcheck:"), "{text}");
+        assert!(text.contains("!override"), "{text}");
+    }
+
+    #[test]
+    fn adopt_override_path_lives_beside_the_green_state() {
+        assert_eq!(
+            adopt_override_path(Path::new("/srv/swapdock/green"), "chats"),
+            PathBuf::from("/srv/swapdock/overrides/chats.yml")
         );
     }
 

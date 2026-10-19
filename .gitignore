@@ -5,3 +5,6 @@ deploy.jsonl
 hetzner/
 
 .playwright-mcp/
+/.target/
+/.target-*/
+/.docker-config/
