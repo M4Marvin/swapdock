@@ -42,6 +42,23 @@ run and tails it over SSE, revealing the next stage when its predecessor ends
 `ok`. A transfer is also offered when the target image is already present in
 the build server's image list.
 
+## Operations
+
+The app page has an **Operations** card driven by the `0.2.0` API:
+
+- **Doctor** — host/compose checks for this app; shows the findings inline.
+- **Backup** — runs the registry's `[backup]` command as a deploy run.
+- **Probe** — HTTP status from `public_url` or an explicit URL.
+- **Prune** — removes old local image tags, keeping the release chain.
+- **Inspect** — registry entry, live verdict, image, health and actual mounts.
+- **Adopt…** — shown only when `live_port` is unset; turns a legacy
+  front-port container into a swapdock-managed app.
+
+The **Doctor** page in the header runs the same checks across the whole
+estate, with an optional public-URL probe. The registry editor now edits
+`compose_override`, `public_url` and the `[backup]` block
+(`command`, `dir`, `before_deploy`).
+
 ## Commands
 
 ```sh

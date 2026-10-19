@@ -109,6 +109,7 @@ fn api_router() -> Router<Shared> {
         .route("/build/apps/{name}/images", get(app_images))
         .route("/build/apps/{name}/builds", post(build_app))
         .route("/build/apps/{name}/transfers", post(transfer_app))
+        .route("/doctor", get(doctor_all))
         .route("/validate", post(validate))
         .route("/render", get(render_config))
         .route("/apply", post(apply_config))
@@ -429,6 +430,61 @@ async fn app_doctor(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct DoctorAllQuery {
+    app: Option<String>,
+    #[serde(default)]
+    public: bool,
+}
+
+async fn doctor_all(
+    State(state): State<Shared>,
+    Query(q): Query<DoctorAllQuery>,
+) -> impl IntoResponse {
+    let loaded = match load(&state) {
+        Ok(l) => l,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let selected: Vec<App> = loaded
+        .sorted()
+        .into_iter()
+        .filter(|a| q.app.as_deref().is_none_or(|name| a.name == name))
+        .collect();
+    if selected.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, "no matching apps");
+    }
+    let state_for_job = state.clone();
+    let public = q.public;
+    match tokio::task::spawn_blocking(move || {
+        let log = TraceLog::open(&state_for_job.trace)?;
+        let mut run = Run::start(
+            log,
+            RunMode::Live,
+            None,
+            &["swapdock".to_string(), "api".to_string()],
+            crate::redact::Redactor::new(),
+        )?;
+        let mut problems: Vec<Problem> = selected.iter().flat_map(|a| a.problems()).collect();
+        problems.extend(crate::doctor::check(&mut run, &selected, None, public));
+        validator::sort_problems(&mut problems);
+        run.finish(RunStatus::Ok)?;
+        Ok::<_, anyhow::Error>(problems)
+    })
+    .await
+    {
+        Ok(Ok(problems)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"problems": problems})),
+        )
+            .into_response(),
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("doctor failed: {e}"),
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 struct AdoptBody {
     release: String,
@@ -494,8 +550,6 @@ async fn backup_app(
 #[derive(Deserialize, Default)]
 struct ProbeBody {
     url: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
 }
 
 async fn probe_app(
@@ -520,7 +574,7 @@ async fn probe_app(
             "url must start with http:// or https://",
         );
     }
-    spawn_job(&state, Some(&name), body.dry_run, move |run| {
+    match tokio::task::spawn_blocking(move || {
         let spec = exec::StepSpec::new("probe-public", "curl")
             .args([
                 "-fsS",
@@ -533,11 +587,19 @@ async fn probe_app(
                 &url,
             ])
             .timeout(Duration::from_secs(20));
-        let outcome = run.exec(&spec).map_err(|e| e.to_string())?;
+        let outcome = exec::run_capture(&spec).map_err(|e| e.to_string())?;
         let status = outcome.stdout_trimmed().parse::<u16>().unwrap_or(0);
-        Ok(serde_json::json!({"url": url, "status": status}))
+        Ok::<_, String>(serde_json::json!({"url": url, "status": status}))
     })
-    .into_response()
+    .await
+    {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_GATEWAY, &e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("probe failed: {e}"),
+        ),
+    }
 }
 
 #[derive(Deserialize, Default)]

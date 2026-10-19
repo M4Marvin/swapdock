@@ -12,6 +12,12 @@ export const queryKeys = {
   app: (name: string) => ['app', name] as const,
   /** Live health probe: `GET /api/apps/{name}/status`. */
   appStatus: (name: string) => ['app-status', name] as const,
+  /** Host/compose diagnostics for one app: `GET /api/apps/{name}/doctor`. */
+  appDoctor: (name: string) => ['app-doctor', name] as const,
+  /** Host/compose diagnostics for the whole estate: `GET /api/doctor`. */
+  doctor: ['doctor'] as const,
+  /** Full app/container state: `GET /api/apps/{name}/inspect`. */
+  inspect: (name: string) => ['inspect', name] as const,
   /** Registry-wide validation summary: `POST /api/validate`. */
   validate: ['validate'] as const,
   /** Recent runs: `GET /api/runs`. */

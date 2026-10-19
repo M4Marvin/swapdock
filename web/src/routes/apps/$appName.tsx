@@ -12,6 +12,7 @@ import {
 import { queryKeys } from '@/lib/query-keys'
 import { Pipeline } from '@/components/Pipeline'
 import { RegistryEditor } from '@/components/RegistryEditor'
+import { Operations } from '@/components/Operations'
 import { StatusPill } from '@/components/StatusPill'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -337,6 +338,8 @@ function AppDetail() {
       />
 
       <RegistryEditor key={app.name} app={app} />
+
+      <Operations app={app} />
 
       {problems.length > 0 && (
         <Card>

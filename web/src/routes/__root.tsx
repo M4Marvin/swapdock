@@ -19,6 +19,12 @@ export const Route = createRootRoute({
           >
             Runs
           </Link>
+          <Link
+            to="/doctor"
+            className="rounded-md px-2.5 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground [&.active]:bg-muted [&.active]:font-medium [&.active]:text-foreground"
+          >
+            Doctor
+          </Link>
         </nav>
       </header>
       <main className="mx-auto w-full max-w-[1600px] p-6">
