@@ -1,5 +1,5 @@
 {
-  "buildApi": "http://100.105.177.97:8088/api",
+  "buildApi": "http://100.80.96.4:8088/api",
   "deployApi": "http://100.80.96.4:8088/api",
   "transferTarget": "hetzner"
 }

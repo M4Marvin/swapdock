@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -160,6 +160,20 @@ export function Pipeline({
   const git: AppGit | null = gitQuery.data ?? null
   const images: AppImage[] = imagesQuery.data?.images ?? []
   const transferTarget = configQuery.data?.transferTarget ?? null
+
+  // When both APIs live on one host, a build already puts the image on the
+  // deploy host; the transfer stage would just copy it to itself.
+  const sameHost = useMemo(() => {
+    const build = configQuery.data?.buildApi
+    const deploy = configQuery.data?.deployApi
+    if (!build || !deploy) return false
+    try {
+      const origin = window.location.origin
+      return new URL(build, origin).origin === new URL(deploy, origin).origin
+    } catch {
+      return build === deploy
+    }
+  }, [configQuery.data])
 
   const streams = useRef<Record<Stage, RunStream | null>>({
     build: null,
@@ -346,12 +360,15 @@ export function Pipeline({
   const transferOk = stages.transfer.state === 'ok'
 
   const transferEnabled =
+    !sameHost &&
     !releaseInvalid &&
     transferTarget != null &&
     (buildOk || imageExists) &&
     stages.transfer.state !== 'active'
   const deployEnabled =
-    !releaseInvalid && transferOk && stages.deploy.state !== 'active'
+    !releaseInvalid &&
+    (sameHost ? buildOk || imageExists : transferOk) &&
+    stages.deploy.state !== 'active'
 
   // Why a stage button is disabled, surfaced through `title`.
   const releaseHint = releaseInvalid ? 'enter a valid commit SHA first' : undefined
@@ -368,16 +385,27 @@ export function Pipeline({
       ? 'transfer this release first'
       : undefined
 
-  const stageOrder: Stage[] = ['build', 'transfer', 'deploy']
+  const stageOrder: Stage[] = sameHost
+    ? ['build', 'deploy']
+    : ['build', 'transfer', 'deploy']
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Pipeline</CardTitle>
         <p className="text-sm text-muted-foreground">
-          Build on the build server, ship the image to{' '}
-          <span className="font-mono">{transferTarget ?? '…'}</span>, then
-          deploy. Each stage unlocks the next when it ends ok.
+          {sameHost ? (
+            <>
+              Build and deploy on the same host. Each stage unlocks the next
+              when it ends ok; no image transfer is needed.
+            </>
+          ) : (
+            <>
+              Build on the build server, ship the image to{' '}
+              <span className="font-mono">{transferTarget ?? '…'}</span>, then
+              deploy. Each stage unlocks the next when it ends ok.
+            </>
+          )}
         </p>
       </CardHeader>
       <CardContent className="space-y-4">

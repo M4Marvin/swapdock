@@ -42,6 +42,10 @@ run and tails it over SSE, revealing the next stage when its predecessor ends
 `ok`. A transfer is also offered when the target image is already present in
 the build server's image list.
 
+When `buildApi` and `deployApi` resolve to the same origin, the build already
+puts the image on the deploy host, so the Transfer stage is omitted and Deploy
+unlocks after a successful Build (or when the image already exists).
+
 ## Operations
 
 The app page has an **Operations** card driven by the `0.2.0` API:
