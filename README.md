@@ -71,7 +71,7 @@ swapdock --registry examples/apps render
 | `validate` | no | Per-app rules, cross-app clashes, tunnel routes. Exits non-zero on error. |
 | `render [--app]` | no | Print the derived nginx config. |
 | `apply` | **yes** | Render, refuse on error, stage, `nginx -t`, atomic commit, reload. |
-| `up <app> [--release] [--force]` | **yes** | Full deploy through the app's strategy. Refuses a release that is already live; `--force` overrides. |
+| `up <app> [--release] [--force]` | **yes** | Full deploy through the app's strategy. Refuses a release that is already live; `--force` overrides. Refuses a local release with no built image. |
 | `rollback <app>` | **yes** | Redeploy `old_release` through the same health gate. |
 | `sync <app>` | repo only | Fetch and fast-forward the app source. Refuses on dirty checkouts. |
 | `build <app> [--release]` | build host | Build the release image. Never touches the registry. |
@@ -152,7 +152,8 @@ missing asset keeps its 404.
 ## What your compose files need
 
 Three small conventions, so the tool injects per-deploy values without editing
-files:
+files. Compose is always invoked with `--no-build`: a missing image is an error,
+never an excuse to build from whatever checkout happens to be on the host.
 
 ```yaml
 services:

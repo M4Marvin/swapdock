@@ -43,6 +43,9 @@ All notable changes to swapdock. The format follows
   release, `old_release`, `latest`, unknown tags and recent rollback tags.
 - `probe <app>` checks `public_url` (or `--url`) over HTTP(S), and `inspect
   <app>` prints the registry entry, live verdict and container mounts as JSON.
+- `up` refuses a local release whose `image_repo:<release>` tag is absent, and
+  compose runs with `--no-build`. A missing image can no longer make compose
+  build from the host's checkout and tag stale code as the requested release.
 - The HTTP API mirrors the new operations: `GET /apps/{name}/inspect`,
   `GET /apps/{name}/doctor`, `POST /apps/{name}/adopt`,
   `POST /apps/{name}/backup`, `POST /apps/{name}/probe` and

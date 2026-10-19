@@ -46,7 +46,7 @@ pub fn up_detached(
     for file in extra_files {
         spec = spec.arg("-f").arg(file.display().to_string());
     }
-    spec.args(["up", "-d", "--no-deps", "--wait", service])
+    spec.args(["up", "-d", "--no-deps", "--no-build", "--wait", service])
 }
 
 /// Stops one service.
@@ -126,6 +126,10 @@ mod tests {
         assert!(
             !argv.contains(&"--build".to_string()),
             "never build here: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--no-build".to_string()),
+            "compose must not auto-build a missing image: {argv:?}"
         );
     }
 

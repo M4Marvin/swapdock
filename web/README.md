@@ -61,6 +61,11 @@ normal health gate. It is disabled when that image is already live, when no
 release image exists, or when the app has not been adopted yet. It does not
 build or transfer.
 
+The header **Deploy…** dialog also checks the local image list. A release with
+no `image_repo:<release>` tag is rejected there and by the API; use the
+Pipeline's Build stage first. This stops compose from auto-building a stale
+checkout under the requested release tag.
+
 The app page has an **Operations** card driven by the `0.2.0` API:
 
 - **Doctor** — host/compose checks for this app; shows the findings inline.

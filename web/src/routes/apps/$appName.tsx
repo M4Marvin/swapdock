@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useForm } from '@tanstack/react-form'
+import { useForm, useStore } from '@tanstack/react-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -108,9 +108,36 @@ function DeployDialog({
 }) {
   const queryClient = useQueryClient()
 
+  const imagesQuery = useQuery({
+    queryKey: queryKeys.images(app.name),
+    queryFn: ({ signal }) => api.appImages(app.name, signal),
+    enabled: open && app.registry === 'local' && app.image_repo != null,
+  })
+
+  /** True when a local release tag is not present in the daemon. */
+  const localImageMissing = (release: string) => {
+    const target = release.trim() || app.release || ''
+    if (app.registry !== 'local' || app.image_repo == null || target === '') {
+      return false
+    }
+    if (!imagesQuery.data) return false
+    return !imagesQuery.data.images.some(
+      (image) =>
+        image.tag === target ||
+        image.tag.startsWith(target) ||
+        target.startsWith(image.tag),
+    )
+  }
+
   const deployMutation = useMutation({
-    mutationFn: (release: string) =>
-      api.deploy(app.name, release.trim() || undefined),
+    mutationFn: (release: string) => {
+      const target = release.trim() || app.release || undefined
+      return api.deploy(
+        app.name,
+        target,
+        target != null && target === app.release,
+      )
+    },
     onSuccess: ({ run_id }) => {
       toast.success(`deploy started: ${run_id}`)
       queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
@@ -128,6 +155,7 @@ function DeployDialog({
     defaultValues: { release: app.release ?? '' },
     validators: { onChange: deploySchema, onSubmit: deploySchema },
     onSubmit: async ({ value }) => {
+      if (localImageMissing(value.release)) return
       try {
         await deployMutation.mutateAsync(value.release)
         onOpenChange(false)
@@ -136,6 +164,10 @@ function DeployDialog({
       }
     },
   })
+
+  const releaseValue = useStore(form.store, (s) => s.values.release)
+  const targetRelease = releaseValue.trim() || app.release || ''
+  const imageMissing = localImageMissing(releaseValue)
 
   // Start each open from the app's current release and clear stale errors.
   const wasOpen = useRef(false)
@@ -189,6 +221,24 @@ function DeployDialog({
           </form.Field>
         </form>
 
+        {imageMissing && (
+          <FieldError>
+            image {app.image_repo}:{targetRelease} is not in the local daemon.
+            Build that release first; swapdock will not let compose build a
+            stale checkout.
+          </FieldError>
+        )}
+        {app.registry === 'local' && imagesQuery.isError && (
+          <p className="text-xs text-muted-foreground">
+            Could not verify the local image list; the deploy will fail if the
+            tag is missing.
+          </p>
+        )}
+        {targetRelease !== '' && targetRelease === app.release && (
+          <p className="text-xs text-muted-foreground">
+            This is the live release; it will be redeployed with force.
+          </p>
+        )}
         {deployMutation.isError && (
           <FieldError>{errorText(deployMutation.error)}</FieldError>
         )}
@@ -204,7 +254,7 @@ function DeployDialog({
           <Button
             type="submit"
             form="deploy-form"
-            disabled={deployMutation.isPending}
+            disabled={deployMutation.isPending || imageMissing}
           >
             {deployMutation.isPending ? 'Deploying…' : 'Deploy'}
           </Button>

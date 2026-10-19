@@ -155,6 +155,16 @@ pub enum DeployError {
     #[error("could not pull {image_ref}: {stderr}")]
     PullFailed { image_ref: String, stderr: String },
 
+    #[error(
+        "{app} release {release} has no local image {image_ref}; \
+         run `swapdock build {app} --release {release}` first"
+    )]
+    ImageMissing {
+        app: String,
+        release: String,
+        image_ref: String,
+    },
+
     #[error("could not write a file: {0}")]
     Io(String),
 
@@ -487,11 +497,27 @@ fn pull_image(run: &mut Run, app: &App, release: &str) -> Result<(), DeployError
         return Ok(());
     };
     if !app.needs_pull() {
-        record_skip(
-            run,
-            "pull",
-            &format!("{image_ref} is local; assuming present"),
-        )?;
+        if run.mode() == RunMode::DryRun {
+            record_skip(
+                run,
+                "pull",
+                &format!("{image_ref} is local; would verify it exists"),
+            )?;
+            return Ok(());
+        }
+        // Compose is invoked with --no-build, but checking here turns a
+        // generic compose failure into an actionable "build it first" error.
+        // It also stops a stale checkout from being auto-built and tagged as
+        // a release it does not contain.
+        let exists = run.exec(&docker::image_exists(&image_ref))?;
+        if !exists.success() {
+            return Err(DeployError::ImageMissing {
+                app: app.name.clone(),
+                release: release.to_string(),
+                image_ref,
+            });
+        }
+        record_skip(run, "pull", &format!("{image_ref} is local and present"))?;
         return Ok(());
     }
     let outcome = run.exec(&docker::pull(&image_ref))?;
