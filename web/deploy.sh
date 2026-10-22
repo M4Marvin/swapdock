@@ -9,14 +9,18 @@
 #
 # Default release id: the short commit, plus `-dirty<YYYYmmddHHMM>` when the
 # tree has uncommitted changes — a release must never masquerade as a commit
-# that does not contain it. Override the target with SWAPDOCK_WEB_HOST and
-# SWAPDOCK_WEB_URL.
+# that does not contain it. Both the SSH destination and the verification URL
+# are required: this is a local helper, not an installer, and it has no
+# opinion about your host.
+#
+#   SWAPDOCK_WEB_HOST=deploy@example.com \
+#   SWAPDOCK_WEB_URL=https://console.example.com/ ./deploy.sh
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-host="${SWAPDOCK_WEB_HOST:-hetzner}"
+host="${SWAPDOCK_WEB_HOST:?set SWAPDOCK_WEB_HOST to the ssh destination}"
 root="/srv/www/swapdock-ui"
-url="${SWAPDOCK_WEB_URL:-http://100.80.96.4:8015/}"
+url="${SWAPDOCK_WEB_URL:?set SWAPDOCK_WEB_URL to the console URL to verify}"
 
 rev="$(git -C "$here" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M)"
 if test -n "$(git -C "$here" status --porcelain -- . 2>/dev/null)"; then

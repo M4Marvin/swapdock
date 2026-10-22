@@ -1,3 +1,5 @@
+import { authHeaders, markUnauthorized, withTokenParam } from '@/lib/auth'
+
 export interface App {
   name: string
   kind: string
@@ -36,6 +38,14 @@ export interface AppBackup {
   command: string[]
   dir: string | null
   before_deploy: boolean
+  /** Optional argv used by `swapdock restore`; `{file}` is the snapshot. */
+  restore_command?: string[] | null
+  /** Optional argv that checks a fresh snapshot; `{file}` is the snapshot. */
+  verify_command?: string[] | null
+  /** Keep the newest N snapshots; null disables pruning. */
+  keep?: number | null
+  /** Optional argv that copies a snapshot off the host; `{file}` is the snapshot. */
+  offsite_command?: string[] | null
 }
 
 export interface Problem {
@@ -88,6 +98,59 @@ export interface AppStatus {
   live_port?: number | null
   release?: string | null
   old_release?: string | null
+}
+
+/**
+ * Version drift between the live deployment and the fetched source, from
+ * GET /api/apps/{name}/drift.
+ *
+ * The backend is the authority on whether the app is up to date. The client
+ * must not infer "up to date" from missing data: `state` is the contract and
+ * an older API answers 404, which is handled as "unknown" by the UI.
+ */
+export type AppDriftState =
+  | 'up_to_date'
+  | 'behind_built'
+  | 'behind_unbuilt'
+  | 'not_deployed'
+  | 'live_unbuilt'
+  | 'no_source'
+  | 'unknown'
+
+export interface AppDriftLive {
+  release: string | null
+  up: boolean
+  live_port: number | null
+  /** Whether a local image exists for the live release. */
+  image_present?: boolean
+}
+
+export interface AppDriftLatest {
+  release: string
+  /** Which ref answered: "origin/main" or "HEAD". */
+  source: string | null
+  subject: string | null
+  committed_at: string | null
+}
+
+/** A local image for the latest release. The API may use `release` or `tag`. */
+export interface AppDriftBuilt {
+  release?: string | null
+  tag?: string | null
+  created?: string | null
+  size?: string | null
+  ref?: string | null
+}
+
+export interface AppDrift {
+  live: AppDriftLive
+  latest: AppDriftLatest | null
+  built: AppDriftBuilt | null
+  commits_behind: number | null
+  state: AppDriftState | string
+  message: string | null
+  /** Checkout the drift was computed from, when the API reports it. */
+  source?: string | null
 }
 
 /** One container mount, as returned by `inspect`. */
@@ -202,7 +265,13 @@ export function formatStatus(status: string): string {
 }
 
 /** Coarse outcome, folding the API's statuses onto one small set. */
-export type StatusOutcome = 'ok' | 'failed' | 'dry' | 'interrupted' | 'unknown'
+export type StatusOutcome =
+  | 'ok'
+  | 'failed'
+  | 'dry'
+  | 'running'
+  | 'interrupted'
+  | 'unknown'
 
 /**
  * Classifies a run or step status.
@@ -211,7 +280,9 @@ export type StatusOutcome = 'ok' | 'failed' | 'dry' | 'interrupted' | 'unknown'
  * `interrupted`) but `/resume` renders them with Rust's `Debug` spelling
  * (`Ok`, `DryRun`). Match a closed set rather than a substring, so `revoked`
  * or `not ok` can never read as success. Step-only statuses (`error`,
- * `timeout`) fold onto `failed`.
+ * `timeout`) fold onto `failed`. A run summary that has only written its
+ * `run_start` record carries the run mode (`live`) as its status; `live` is a
+ * mode name, not a terminal outcome, so it is classified as still running.
  */
 export function classifyStatus(status: string | null | undefined): StatusOutcome {
   if (status == null) return 'unknown'
@@ -228,6 +299,11 @@ export function classifyStatus(status: string | null | undefined): StatusOutcome
     case 'dry_run':
     case 'dryrun':
       return 'dry'
+    case 'live':
+    case 'running':
+    case 'in_progress':
+    case 'started':
+      return 'running'
     case 'interrupted':
       return 'interrupted'
     default:
@@ -243,43 +319,95 @@ export function classifyStatus(status: string | null | undefined): StatusOutcome
  * Served as a static `/config.json` next to the SPA.
  *
  * Same-origin defaults work both through the Vite dev proxy and when the built
- * app is served from either box. To split the build server from the deploy
- * server, point one base at the other box, e.g.
- *   { "buildApi": "/api", "deployApi": "http://100.80.96.4:8088/api" }
+ * app is served from the host that answers `/api`. A split install points
+ * `buildApi` or `deployApi` at the other box; `transferTarget` is required
+ * only when a build and its deploy live on different hosts.
  */
 export interface WebConfig {
   /** Base for the build-server surface (git, images, builds, transfers). */
   buildApi: string
   /** Base for the deploy surface (registry, deploys, runs, verify). */
   deployApi: string
-  /** Default `target` for a transfer (`ssh`/`taildrop` destination). */
+  /** Default `target` for a transfer (`ssh`/`taildrop` destination), or "". */
   transferTarget: string
+}
+
+/** Why the runtime config could not be used as written. */
+export type ConfigIssue = 'missing' | 'malformed'
+
+/** The resolved config plus whether `/config.json` was usable. */
+export interface ConfigSnapshot {
+  config: WebConfig
+  /** `null` when `/config.json` loaded and validated. */
+  issue: ConfigIssue | null
 }
 
 const DEFAULT_CONFIG: WebConfig = {
   buildApi: '/api',
   deployApi: '/api',
-  transferTarget: 'hetzner',
+  transferTarget: '',
 }
 
-let configPromise: Promise<WebConfig> | null = null
+let configPromise: Promise<ConfigSnapshot> | null = null
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string'
+}
+
+function loadConfig(): Promise<ConfigSnapshot> {
+  return fetch('/config.json', { cache: 'no-cache' })
+    .then(async (res): Promise<ConfigSnapshot> => {
+      if (!res.ok) return { config: DEFAULT_CONFIG, issue: 'missing' }
+      let raw: unknown
+      try {
+        raw = await res.json()
+      } catch {
+        return { config: DEFAULT_CONFIG, issue: 'malformed' }
+      }
+      if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { config: DEFAULT_CONFIG, issue: 'malformed' }
+      }
+      const c = raw as Record<string, unknown>
+      const badType =
+        (c.buildApi !== undefined && !isString(c.buildApi)) ||
+        (c.deployApi !== undefined && !isString(c.deployApi)) ||
+        (c.transferTarget !== undefined && !isString(c.transferTarget))
+      const buildApi = isString(c.buildApi) ? c.buildApi.trim() : ''
+      const deployApi = isString(c.deployApi) ? c.deployApi.trim() : ''
+      // A file with neither API base is not a usable config. Same-origin is the
+      // safe fallback, but the shell must say the file was unusable.
+      const noBases = buildApi === '' && deployApi === ''
+      return {
+        config: {
+          buildApi: buildApi || DEFAULT_CONFIG.buildApi,
+          deployApi: deployApi || DEFAULT_CONFIG.deployApi,
+          transferTarget: isString(c.transferTarget)
+            ? c.transferTarget.trim()
+            : DEFAULT_CONFIG.transferTarget,
+        },
+        issue: badType || noBases ? 'malformed' : null,
+      }
+    })
+    .catch(
+      (): ConfigSnapshot => ({ config: DEFAULT_CONFIG, issue: 'missing' }),
+    )
+}
 
 /**
  * Fetches `/config.json` once and caches the result.
  *
- * A missing or malformed file falls back to same-origin defaults rather than
- * failing the app: the defaults are correct in the common single-box case.
+ * Same-origin fallbacks are used when the file is missing or malformed, but
+ * the returned snapshot carries the problem so the shell can warn instead of
+ * silently acting on a guessed split-host setup.
  */
-export function cfg(): Promise<WebConfig> {
-  if (!configPromise) {
-    configPromise = fetch('/config.json', { cache: 'no-cache' })
-      .then(async (r) =>
-        r.ok ? ((await r.json()) as Partial<WebConfig>) : {},
-      )
-      .catch((): Partial<WebConfig> => ({}))
-      .then((c) => ({ ...DEFAULT_CONFIG, ...c }))
-  }
+export function cfgState(): Promise<ConfigSnapshot> {
+  if (!configPromise) configPromise = loadConfig()
   return configPromise
+}
+
+/** Backwards-compatible accessor for callers that only need the bases. */
+export function cfg(): Promise<WebConfig> {
+  return cfgState().then((snapshot) => snapshot.config)
 }
 
 /** Joins a configured base with a relative path, collapsing the slash. */
@@ -366,7 +494,7 @@ export function openRunEvents(
 
   const connect = () => {
     if (closed || eventsUrl == null) return
-    es = new EventSource(eventsUrl)
+    es = new EventSource(withTokenParam(eventsUrl))
 
     es.onopen = () => {
       retries = 0
@@ -460,9 +588,10 @@ export class ApiError extends Error {
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal })
+  const res = await fetch(url, { headers: authHeaders(), signal })
   const json = await res.json().catch(() => ({}))
   if (!res.ok) {
+    if (res.status === 401) markUnauthorized()
     throw new ApiError(
       res.status,
       (json as { error?: string }).error ?? `${res.status} ${res.statusText}`,
@@ -478,12 +607,13 @@ async function post<T>(
 ): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   })
   const json = await res.json().catch(() => ({}))
   if (!res.ok) {
+    if (res.status === 401) markUnauthorized()
     throw new ApiError(
       res.status,
       (json as { error?: string }).error ?? `${res.status}`,
@@ -499,12 +629,13 @@ async function put<T>(
 ): Promise<T> {
   const res = await fetch(url, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   })
   const json = await res.json().catch(() => ({}))
   if (!res.ok) {
+    if (res.status === 401) markUnauthorized()
     const problems = (json as { problems?: { code?: string }[] }).problems
     const suffix =
       problems && problems.length > 0
@@ -532,15 +663,40 @@ export const api = {
     get<AppEntry[]>(await deploy('apps'), signal),
   app: async (name: string, signal?: AbortSignal) =>
     get<AppEntry>(await deploy(`apps/${enc(name)}`), signal),
+  /**
+   * Estate validation counts.
+   *
+   * GET is the correct verb for this read. Older APIs only expose POST, so a
+   * 404/405 falls back to POST; a 409 still carries a valid body (it is the
+   * "validation found errors" response, not a transport failure).
+   */
   validate: async (signal?: AbortSignal) => {
-    const res = await fetch(await deploy('validate'), { method: 'POST', signal })
-    return { status: res.status, body: await res.json() }
+    const url = await deploy('validate')
+    const read = async (res: Response) => {
+      const body = (await res.json().catch(() => ({}))) as {
+        errors?: number
+        warnings?: number
+        [key: string]: unknown
+      }
+      if (!res.ok && res.status !== 409) {
+        if (res.status === 401) markUnauthorized()
+        throw new ApiError(
+          res.status,
+          (body as { error?: string }).error ?? `${res.status} ${res.statusText}`,
+        )
+      }
+      return { status: res.status, body }
+    }
+    const res = await fetch(url, { headers: authHeaders(), signal })
+    if (res.status !== 404 && res.status !== 405) return read(res)
+    const fallback = await fetch(url, { method: 'POST', headers: authHeaders(), signal })
+    return read(fallback)
   },
   render: async (app?: string, signal?: AbortSignal) =>
     (
       await fetch(
         await deploy(`render${app ? `?app=${enc(app)}` : ''}`),
-        { signal },
+        { headers: authHeaders(), signal },
       )
     ).text(),
   deploy: async (
@@ -642,6 +798,37 @@ export const api = {
     ),
   appLatest: async (name: string, signal?: AbortSignal) =>
     get<AppLatest>(await deploy(`apps/${enc(name)}/latest`), signal),
+  /** Live-vs-source drift; 404 on an older API means "unknown", not "current". */
+  appDrift: async (name: string, signal?: AbortSignal) =>
+    get<AppDrift>(await deploy(`apps/${enc(name)}/drift`), signal),
+  /** Import an existing Compose service (`POST /api/import`). */
+  importApp: async (
+    body: {
+      compose_dir: string
+      name?: string
+      domain?: string
+      front_port?: number
+      slot?: number
+      dry_run?: boolean
+    },
+    signal?: AbortSignal,
+  ) =>
+    post<{
+      app: App
+      wrote: boolean
+      dry_run: boolean
+      override_path: string
+      service: string
+      image: string
+      warnings: Problem[]
+    }>(await deploy('import'), body, signal),
+  /** Create a registry entry from the console (`POST /api/apps`). */
+  createApp: async (
+    name: string,
+    kind: 'container' | 'static',
+    signal?: AbortSignal,
+  ) =>
+    post<{ path?: string }>(await deploy('apps'), { name, kind }, signal),
   // Build-server reads.
   appGit: async (name: string, signal?: AbortSignal) =>
     get<AppGit>(await build(`build/apps/${enc(name)}/git`), signal),

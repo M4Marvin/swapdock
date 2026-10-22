@@ -1,36 +1,60 @@
-import { createRootRoute, Link, Outlet } from '@tanstack/react-router'
-import { Toaster } from '@/components/ui/sonner'
+import { createRootRoute, Link } from '@tanstack/react-router'
+import { useAuthState } from '@/lib/auth'
+import { TokenGate } from '@/components/shell/TokenGate'
+import { AuthedShell } from '@/components/shell/AuthedShell'
+import { Button } from '@/components/ui/button'
+
+/** Centered fallback for unknown URLs and unexpected render errors. */
+function CenteredMessage({
+  eyebrow,
+  title,
+  description,
+  children,
+}: {
+  eyebrow: string
+  title: string
+  description: React.ReactNode
+  children?: React.ReactNode
+}) {
+  return (
+    <main className="grid min-h-dvh place-items-center px-6">
+      <div className="w-full max-w-sm text-center">
+        <div className="label-eyebrow">{eyebrow}</div>
+        <h1 className="mt-2 text-2xl font-semibold tracking-[-0.028em] text-foreground">{title}</h1>
+        <p className="mt-2 text-pretty text-sm leading-relaxed text-muted-foreground">{description}</p>
+        <div className="mt-5 flex items-center justify-center gap-2">{children}</div>
+      </div>
+    </main>
+  )
+}
+
+function RootComponent() {
+  const auth = useAuthState()
+  if (auth.mode == null) return <TokenGate />
+  return <AuthedShell />
+}
 
 export const Route = createRootRoute({
-  component: () => (
-    <div className="min-h-screen bg-background text-foreground">
-      <header className="flex items-center gap-6 border-b px-6 py-3">
-        <strong className="text-lg">swapdock</strong>
-        <nav className="flex items-center gap-1 text-sm">
-          <Link
-            to="/"
-            className="rounded-md px-2.5 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground [&.active]:bg-muted [&.active]:font-medium [&.active]:text-foreground"
-          >
-            Apps
-          </Link>
-          <Link
-            to="/runs"
-            className="rounded-md px-2.5 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground [&.active]:bg-muted [&.active]:font-medium [&.active]:text-foreground"
-          >
-            Runs
-          </Link>
-          <Link
-            to="/doctor"
-            className="rounded-md px-2.5 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground [&.active]:bg-muted [&.active]:font-medium [&.active]:text-foreground"
-          >
-            Doctor
-          </Link>
-        </nav>
-      </header>
-      <main className="mx-auto w-full max-w-[1600px] p-6">
-        <Outlet />
-      </main>
-      <Toaster position="bottom-right" />
-    </div>
+  component: RootComponent,
+  notFoundComponent: () => (
+    <CenteredMessage
+      eyebrow="404"
+      title="That page moved"
+      description="The address does not match a view in this build. Head back to the fleet and pick an app."
+    >
+      <Button render={<Link to="/" />}>Back to the fleet</Button>
+    </CenteredMessage>
+  ),
+  errorComponent: ({ error, reset }) => (
+    <CenteredMessage
+      eyebrow="Unexpected error"
+      title="This view stopped rendering"
+      description={error instanceof Error ? error.message : String(error)}
+    >
+      <Button variant="outline" onClick={() => reset()}>
+        Try again
+      </Button>
+      <Button render={<Link to="/" />}>Back to the fleet</Button>
+    </CenteredMessage>
   ),
 })

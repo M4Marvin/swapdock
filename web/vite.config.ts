@@ -20,7 +20,9 @@ export default defineConfig({
     // entry covers it and the SPA's own routes (/, /apps/..., /runs/...) are
     // left for Vite to serve, keeping deep links working in dev.
     proxy: {
-      '/api': 'http://100.105.177.97:8088',
+      // Point the dev proxy at another box with SWAPDOCK_API, e.g.
+      //   SWAPDOCK_API=http://10.0.0.5:8088 pnpm dev
+      '/api': process.env.SWAPDOCK_API || 'http://127.0.0.1:8088',
     },
   },
 })

@@ -8,6 +8,8 @@
 export const queryKeys = {
   /** The whole registry: `GET /api/apps`. */
   apps: ['apps'] as const,
+  /** Server liveness: `GET /api/health`. */
+  health: ['health'] as const,
   /** One app entry (app + problems): `GET /api/apps/{name}`. */
   app: (name: string) => ['app', name] as const,
   /** Live health probe: `GET /api/apps/{name}/status`. */
@@ -18,7 +20,9 @@ export const queryKeys = {
   doctor: ['doctor'] as const,
   /** Full app/container state: `GET /api/apps/{name}/inspect`. */
   inspect: (name: string) => ['inspect', name] as const,
-  /** Registry-wide validation summary: `POST /api/validate`. */
+  /** Derived nginx server block: `GET /api/render?app={name}`. */
+  render: (name: string) => ['render', name] as const,
+  /** Registry-wide validation summary: `GET /api/validate` (POST fallback). */
   validate: ['validate'] as const,
   /** Recent runs: `GET /api/runs`. */
   runs: ['runs'] as const,
@@ -28,6 +32,8 @@ export const queryKeys = {
   verify: (name: string, since: string) => ['verify', name, since] as const,
   /** What an app's upstream ref resolves to: `GET /api/apps/{name}/latest`. */
   latest: (name: string) => ['latest', name] as const,
+  /** Live-vs-source version drift: `GET /api/apps/{name}/drift`. */
+  drift: (name: string) => ['drift', name] as const,
   /** Source state of an app's checkout: `GET /build/apps/{name}/git`. */
   git: (name: string) => ['git', name] as const,
   /** Local image tags: `GET /build/apps/{name}/images`. */
