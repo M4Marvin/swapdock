@@ -1,0 +1,63 @@
+# Example: serve the swapdock console and proxy /api on one HTTPS origin.
+#
+# This is NOT installed by install-swapdock.sh. It is a starting point for the
+# authenticated TLS reverse proxy that must sit in front of the loopback API:
+#
+#   internet -> nginx:443 (TLS) -> /api -> 127.0.0.1:8088 (token auth)
+#                              -> /    -> /srv/www/swapdock-ui/current
+#
+# Obtain the certificate with certbot, Caddy, Cloudflare, or your existing
+# certificate automation. Do not put the API directly on a public interface.
+#
+# Replace console.example.com and the certificate paths before using this.
+
+server {
+    listen 80;
+    server_name console.example.com;
+
+    # Keep the ACME challenge reachable; certbot writes here.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name console.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/console.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/console.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # The console is a static SPA with a stable symlink root.
+    root /srv/www/swapdock-ui/current;
+    index index.html;
+
+    # Same-origin API. Keep the `/api` prefix: the server expects it.
+    location /api/ {
+        proxy_pass http://127.0.0.1:8088;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # EventSource must not be buffered or timed out during a quiet build.
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
+    # SPA history fallback. A missing asset stays a 404.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # The API token belongs in the browser's session gate, not in a URL that
+    # ends up in the access log. If you use an upstream proxy that logs query
+    # strings, scrub `token=` there.
+}

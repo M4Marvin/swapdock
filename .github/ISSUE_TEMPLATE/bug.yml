@@ -1,0 +1,109 @@
+name: Bug report
+description: Report a reproducible bug in swapdock.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. swapdock is pre-launch: please check
+        [LAUNCH.md](https://github.com/M4Marvin/swapdock/blob/main/LAUNCH.md)
+        and [docs/troubleshooting.md](https://github.com/M4Marvin/swapdock/blob/main/docs/troubleshooting.md)
+        first — some failures are documented known gaps.
+
+        **Do not report a security vulnerability here.** Use
+        [SECURITY.md](https://github.com/M4Marvin/swapdock/blob/main/SECURITY.md)
+        instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I read the troubleshooting guide and this is not a documented pre-launch gap.
+          required: true
+        - label: I removed tokens, hostnames, customer data and other secrets from this report.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: swapdock version or commit
+      description: Output of `swapdock --version`, or the commit SHA.
+      placeholder: "0.2.0 / 728b2b9"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Built from source with scripts/package-dist.sh
+        - Downloaded a release archive
+        - cargo install
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: OS, architecture, Docker Engine version, nginx version.
+      placeholder: "Ubuntu 24.04, x86_64, Docker 27.3, nginx 1.24"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: The actual behavior, including the exact command and the error output.
+      placeholder: |
+        Command:
+        $ swapdock ...
+
+        Output:
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: The behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps on a disposable host. Include registry/compose snippets with paths and secrets redacted.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Run id, `swapdock show <run-id>`, or `swapdock doctor` output. Redact tokens, hostnames and paths if needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Workarounds tried, related issues, or a theory about the cause.
+    validations:
+      required: false

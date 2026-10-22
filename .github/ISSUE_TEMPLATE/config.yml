@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/M4Marvin/swapdock/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue. See SECURITY.md.
+  - name: Launch plan and current status
+    url: https://github.com/M4Marvin/swapdock/blob/main/LAUNCH.md
+    about: Read the gates, scope and open defects before filing a feature request.
+  - name: Troubleshooting
+    url: https://github.com/M4Marvin/swapdock/blob/main/docs/troubleshooting.md
+    about: Common pre-launch failures and their workarounds.

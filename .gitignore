@@ -8,3 +8,15 @@ hetzner/
 /.target/
 /.target-*/
 /.docker-config/
+
+# Local UI verification artifacts
+.shots/
+.chrome-prof/
+.chrome-cdp/
+
+# Built by scripts/package-dist.sh; not source
+/swapdock-dist/
+/swapdock-dist.tmp.*/
+
+# Writable Cargo home used when the system cargo cache is read-only.
+.cargo-home/

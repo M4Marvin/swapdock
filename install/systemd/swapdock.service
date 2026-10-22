@@ -1,11 +1,67 @@
+# swapdock API example unit — DOCUMENTATION ONLY.
+#
+# install-swapdock.sh does NOT install this file unless you pass
+# --with-service, and even then it is installed but NOT enabled or started.
+#
+# SECURITY, READ THIS FIRST:
+#   - The API requires a bearer token in SWAPDOCK_API_TOKEN (at least 16
+#     characters). This unit reads it from /etc/swapdock/api.env, which
+#     install-swapdock.sh --with-service creates with mode 0600 when missing.
+#     Do not put the token in ExecStart or any other argv: it would show in ps.
+#   - The API is mounted under /api. The health endpoints (`/health` and
+#     `/api/health`) and `POST /api/login` are the only unauthenticated routes.
+#     The token is a single
+#     shared secret; the console exchanges it for an in-memory HttpOnly session
+#     cookie and sends a CSRF header on mutations. There is no user directory,
+#     OIDC or token rotation. Host/Origin are enforced when
+#     SWAPDOCK_ALLOWED_HOSTS/ORIGINS are set; rate limiting is still open
+#     (G0.2/G0.3 still partial).
+#   - TLS is optional on the API listener: add `--tls-cert` and `--tls-key`
+#     below when the certificate files exist. No ACME client is built in.
+#     The console still needs the nginx TLS proxy in docs/tls.md.
+#   - The console has an access-token gate that exchanges the token for an
+#     HttpOnly session cookie. Remote UI access still requires an authenticated
+#     TLS reverse proxy in front of this loopback listener; the proxy is
+#     defence in depth, not a substitute for the API token.
+#   - It binds to 127.0.0.1 on purpose. Do NOT expose this port to the
+#     internet or to an untrusted network, and do not add a public bind address
+#     as a shortcut.
+#   - The process runs as root because `apply`/`up` write nginx config and
+#     manage containers. A non-root service plus a narrow privileged broker is
+#     planned (SEC-03 / G0.5); this unit does not implement it. It is NOT
+#     hardened and must not be described as "secure as-is".
+#
+# See docs/install.md and docs/security.md before enabling it.
 [Unit]
-Description=swapdock deploy API (privileged)
+Description=swapdock deploy API (loopback only; token-auth)
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/swapdock serve --bind 100.80.96.4:8088 --registry /srv/swapdock/apps --trace /var/log/swapdock/swapdock.jsonl
-Restart=always
+Type=simple
+# `-` keeps the unit loadable when the file is absent; `serve` then fails at
+# startup because authentication is required by default. Fail closed is right.
+EnvironmentFile=-/etc/swapdock/api.env
+# Hardening baseline. This does NOT make the service non-root: apply/up still
+# need root until the narrow broker lands (SEC-03/G0.5). It removes writable
+# system paths except the explicit ones below.
+RuntimeDirectory=swapdock
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/srv/swapdock /var/log/swapdock /run/swapdock /etc/nginx/conf.d /etc/nginx/snippets
+UMask=0027
+ExecStart=/usr/local/bin/swapdock serve --bind 127.0.0.1:8088 --registry /srv/swapdock/apps --trace /var/log/swapdock/swapdock.jsonl
+# Optional API TLS (both files, readable by this process):
+# ExecStart=/usr/local/bin/swapdock serve --bind 127.0.0.1:8088 --registry /srv/swapdock/apps --trace /var/log/swapdock/swapdock.jsonl --tls-cert /etc/letsencrypt/live/api.example.com/fullchain.pem --tls-key /etc/letsencrypt/live/api.example.com/privkey.pem
+Restart=on-failure
 RestartSec=5
 
 [Install]

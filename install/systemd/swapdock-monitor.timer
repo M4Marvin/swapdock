@@ -1,0 +1,11 @@
+[Unit]
+Description=Run swapdock app/TLS/disk monitor every five minutes
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=30s
+Persistent=true
+Unit=swapdock-monitor.service
+
+[Install]
+WantedBy=timers.target

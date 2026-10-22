@@ -1,0 +1,25 @@
+[Unit]
+Description=swapdock app/TLS/disk monitor
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Read-only checks plus a de-duplicated webhook. Findings are printed and the
+# unit fails only when a check itself could not run.
+ExecStart=/usr/local/bin/swapdock monitor
+User=root
+EnvironmentFile=-/etc/swapdock/api.env
+RuntimeDirectory=swapdock
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/srv/swapdock /var/log/swapdock
+UMask=0027

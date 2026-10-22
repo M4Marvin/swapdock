@@ -1,0 +1,11 @@
+[Unit]
+Description=Run swapdock app backups daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=swapdock-backup.service
+
+[Install]
+WantedBy=timers.target

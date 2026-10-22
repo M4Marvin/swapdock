@@ -1,0 +1,35 @@
+[Unit]
+Description=swapdock privileged apply broker (nginx only)
+After=network.target nginx.service
+Wants=nginx.service
+
+[Service]
+Type=simple
+# The only privileged operation: install a rendered nginx config and reload.
+# The API authenticates to this socket with SWAPDOCK_API_TOKEN.
+RuntimeDirectory=swapdock
+RuntimeDirectoryMode=0755
+EnvironmentFile=-/etc/swapdock/api.env
+Environment=DOCKER_CONFIG=/var/lib/swapdock/docker
+ExecStart=/usr/local/bin/swapdock broker \
+  --socket /run/swapdock/broker.sock \
+  --trace /var/log/swapdock/swapdock.jsonl \
+  --target /etc/nginx/conf.d/front-door.conf \
+  --main-config /etc/nginx/nginx.conf \
+  --pid-file /run/nginx.pid \
+  --nginx-bin nginx
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/etc/nginx/conf.d /etc/nginx/snippets /var/log/swapdock /var/lib/swapdock -/var/log/nginx -/var/lib/nginx
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
