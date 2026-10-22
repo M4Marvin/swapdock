@@ -1,0 +1,341 @@
+# Import an existing Compose app
+
+**Status: pre-launch.** `swapdock import` writes a registry entry and a generated
+Compose override; it does **not** deploy. The first `swapdock up` is still a
+separate, host-mutating step, and the import-to-first-deploy evidence for
+[G3.1/G3.2](../LAUNCH.md) (five recorded imports on real apps) is not recorded
+yet. Try this on a disposable host or a backed-up app first.
+
+`import` is the onboarding path for a service that already runs from a Compose
+file. It reads what Compose will actually run, derives the registry fields,
+allocates a front port and a back-end slot, and writes:
+
+- `<registry>/<name>.toml` — the app's registry entry;
+- `<state-dir>/../overrides/<name>.yml` — the generated Compose override.
+
+It does **not** edit your Compose file, start or stop a container, build an
+image, touch nginx, or deploy anything. It also writes no run-log record: import
+is one read-only Compose probe plus two file writes, not a deploy. The first
+`swapdock up` records the deploy in the normal JSONL ledger.
+
+## Requirements
+
+- Docker Engine with Compose v2. Import runs `docker compose config`, which reads
+  files but does not contact the daemon.
+- A Compose v2 release that understands `!override` (the generated override uses
+  it to replace, rather than append, the published port). Import validates the
+  merged model after writing the override and fails clearly if yours does not.
+- Write access to the registry directory and to `overrides/` beside the state
+  directory. With the installer layout that is `/srv/swapdock/apps` and
+  `/srv/swapdock/overrides`, both owned by the deploy user; the `green/`
+  directory itself is root-owned and is not written by import. On a host without
+  that layout, point `--registry` and `--state-dir` at writable directories.
+  Import itself does not need root. The later `up`/`apply` steps do, for nginx.
+- A service with an `image`. Build-only services are refused for now: swapdock
+  deploys tagged images, and a release tag that does not exist would fail later
+  and less clearly.
+- The Compose project directory's basename must be a valid Compose project name
+  (lowercase letters, digits, `-`, `_`, starting with a letter or digit).
+
+## Quick start
+
+```bash
+mkdir -p ~/swapdock-demo/apps ~/swapdock-demo/state/green
+cd ~/apps/shop
+
+swapdock import \
+  --compose-dir . \
+  --service web \
+  --name shop \
+  --domain shop.example.com \
+  --registry ~/swapdock-demo/apps \
+  --state-dir ~/swapdock-demo/state/green \
+  --dry-run
+```
+
+`--service` is required only when the file defines more than one service.
+`--name` defaults to the service name, slugified (`web_api` becomes `web-api`).
+`--domain` is optional; without it the entry validates with a
+`hostnames-empty` warning and the next-step output tells you what to add.
+
+`--dry-run` still runs the read-only `docker compose config` probe — it is what
+the plan is derived from — but writes no registry file, no override and no run
+record. It prints the TOML and the override it would write.
+
+Remove `--dry-run` to write the two files. The command prints their paths and
+the remaining onboarding steps.
+
+## Worked example
+
+The Compose file in `~/apps/shop`:
+
+```yaml
+services:
+  web:
+    image: ghcr.io/acme/shop:1.4.2
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/healthz || exit 1"]
+      interval: 30s
+  db:
+    image: postgres:16
+    volumes:
+      - shop-data:/var/lib/postgresql/data
+volumes:
+  shop-data:
+```
+
+Import only the web service:
+
+```bash
+swapdock import \
+  --compose-dir ~/apps/shop \
+  --service web \
+  --name shop \
+  --domain shop.example.com \
+  --registry ~/swapdock-demo/apps \
+  --state-dir ~/swapdock-demo/state/green
+```
+
+Representative output (paths shortened):
+
+```text
+app          shop
+compose      /home/you/apps/shop/compose.yaml
+service      web (project shop)
+image        ghcr.io/acme/shop:1.4.2 (image_repo ghcr.io/acme/shop)
+container    3000/tcp (from ports)
+health       compose healthcheck: wget -q -O /dev/null http://127.0.0.1:3000/healthz || exit 1 -> GET /healthz
+strategy     replace (dependencies: db)
+ports        front 8001 / slot 0 (back 9000, 9001)
+hostnames    shop.example.com
+
+wrote        /home/you/swapdock-demo/apps/shop.toml
+override     /home/you/swapdock-demo/state/overrides/shop.yml
+```
+
+The generated `shop.toml`:
+
+```toml
+name = "shop"
+kind = "container"
+strategy = "replace"
+hostnames = ["shop.example.com"]
+listen = []
+front_port = 8001
+slot = 0
+writes_state = false
+image_repo = "ghcr.io/acme/shop"
+registry = "local"
+build_host = "local"
+spa = false
+health_url = "http://127.0.0.1/healthz"
+compose_dir = "/home/you/apps/shop"
+compose_svc = "web"
+env_name = "SHOP_PORT"
+branch = "main"
+compose_override = "/home/you/swapdock-demo/state/overrides/shop.yml"
+```
+
+The generated override:
+
+```yaml
+# Generated by swapdock adopt; do not edit by hand.
+services:
+  web:
+    image: ${IMAGE:-ghcr.io/acme/shop}
+    ports: !override
+      - "127.0.0.1:${SHOP_PORT:-9000}:3000"
+```
+
+`db` is not imported and is not managed by swapdock. Because `web` has a
+dependency, the strategy is `replace`, which stays in the original Compose
+project — so `db` and `shop-data` keep working. A `swap` would start in a
+separate project with an empty volume and no `db`, which is why import refuses
+that combination (see below).
+
+### Finish the onboarding
+
+Import stored an image repository, not a release tag. Create the release image
+first, then deploy:
+
+```bash
+# Check host wiring: compose path, bind mounts, healthcheck, ports.
+swapdock --registry ~/swapdock-demo/apps doctor shop
+
+# Option A: build the commit on this host (needs repo = a source checkout).
+swapdock --registry ~/swapdock-demo/apps build shop --release 9c1f2ab
+
+# Option B: tag the image the service is already running.
+docker tag ghcr.io/acme/shop:1.4.2 ghcr.io/acme/shop:9c1f2ab
+
+# Deploy. Import itself never runs this.
+swapdock --registry ~/swapdock-demo/apps up shop --release 9c1f2ab \
+  --state-dir ~/swapdock-demo/state/green
+```
+
+`--release` takes a 7–64 character hex commit name, never a branch or `latest`.
+
+## What is detected, and why
+
+| Registry field | Source |
+|---|---|
+| `compose_svc` | `--service`, or the only service in the file |
+| `image_repo` | `image`, with any `:tag` or `@digest` removed |
+| `compose_dir` | absolute, canonical path of `--compose-dir` |
+| container port | first `ports[].target`, else `expose[0]`, else 80 |
+| `health_url` | HTTP path found in the healthcheck command, else `/` |
+| `strategy` | `swap` by default; `replace` for named volumes or dependencies |
+| `writes_state` | true only for named volumes |
+| `hostnames` | `--domain`, else empty |
+| `front_port`, `slot` | allocated from the existing registry, or explicit flags |
+| `env_name` | `<UPPER_NAME>_PORT`, e.g. `SHOP_PORT` |
+| `repo` | `--repo`, absolutised, else absent |
+| `registry` | `local` |
+| `build_host` | `local` |
+| `branch` | `main` |
+
+### Image
+
+`ghcr.io/acme/shop:1.4.2` becomes `image_repo = "ghcr.io/acme/shop"`.
+`ghcr.io/acme/shop@sha256:...` becomes the same repository. A registry port is
+not a tag: `localhost:5000/shop` is kept whole, while
+`localhost:5000/shop:2` becomes `localhost:5000/shop`. The release tag is
+appended at deploy time (`image_repo:release`).
+
+### Container port
+
+If the service publishes one distinct container port, that is used. If it
+publishes several (`80` and `443`, say), import stops and asks for
+`--container-port 80` rather than guessing which port serves the healthcheck:
+
+```bash
+swapdock import --compose-dir ~/apps/shop --container-port 3000 ...
+```
+
+`expose` is the fallback when there is no `ports` mapping; 80 is the last
+resort. An explicit `--container-port` wins, with a warning if Compose does not
+report that port at all.
+
+### Healthcheck
+
+If `healthcheck.test` exists, the override leaves it alone and `health_url` uses
+its first `http://` or `https://` URL. A command with no URL (for example
+`pg_isready`) defaults `health_url` to `/` and prints a warning.
+
+If there is no healthcheck:
+
+```bash
+swapdock import --compose-dir ~/apps/shop \
+  --healthcheck "curl -fsS http://127.0.0.1:3000/healthz" ...
+```
+
+The override installs it as a `CMD-SHELL` healthcheck. Without the flag, the
+import still succeeds, but it prints a warning: the deploy gate refuses a
+container with no healthcheck, so the first `up` will fail until one exists.
+
+### Named volumes and dependencies
+
+- **Named volume** (`type: volume` with a `source`) at a mount point: strategy
+  `replace`, `writes_state = true`. A swap would use a new, empty volume in a
+  different Compose project and could silently reset data.
+- **`depends_on` / `links` / `volumes_from`**: strategy `replace`, with a
+  warning. Those services and links do not exist in a separate swap project.
+  `replace` stays in the original project, so they keep working.
+- **Bind mounts and anonymous volumes** do not make the app stateful: a bind
+  points at the same host path in both projects, and an anonymous volume holds
+  no named data.
+
+`writes_state = true` makes the validator refuse a `swap`; `doctor` additionally
+warns that no `[backup]` command is configured. Add one before the first deploy.
+
+### Compose project name
+
+The project name is the Compose directory basename, matching
+`App::compose_project()`. Compose requires lowercase letters, digits, `-` and
+`_`, starting with a letter or digit. A directory such as `Shop_v2` is refused
+with a rename instruction rather than a raw Compose error.
+
+## Ports and slots
+
+- **Front port:** the first free port at or above 8001, skipping ports already
+  used by any app (front, live or old) and the reserved back-end range
+  9000–9255. `--front-port` is refused if it is zero, reserved, or held by
+  another app.
+- **Slot:** the first free slot 0–127. `--slot` is refused if it is out of range
+  or owned by another app. The slot owns two back-end ports
+  (`9000 + 2×slot` and the next port). Import's override points at the first of
+  the pair by default; deploys alternate between them.
+
+No port or slot is ever taken from another app. If the estate is full, import
+fails before writing anything.
+
+## The generated override
+
+The override is passed after the base Compose file, so later entries win:
+
+- `image: ${IMAGE:-<image_repo>}` — deploy exports `IMAGE=image_repo:release`;
+  a hand-run `docker compose up` still works with the default.
+- `ports: !override` — replaces the published mapping with
+  `127.0.0.1:${<ENV_NAME>:-<back_port>}:<container_port>`. Without
+  `!override`, Compose would append a second mapping and publish two ports.
+- `healthcheck` — only when the base service has none and `--healthcheck` was
+  given.
+
+Import writes the override first, runs `docker compose config` with the base
+file plus the override, and only then writes the registry entry. If Compose
+rejects the override, import restores or removes it and writes no registry file.
+Do not edit the generated file; change the Compose service or re-import under
+another name.
+
+## Validation
+
+Before writing, import validates the **whole staged estate**: existing apps,
+load-time problems, the new app's own rules, and cross-app checks (duplicate
+slots, ports, listeners, hostnames). Any error refuses the import with the full
+list; warnings are printed and do not block. This means an import cannot be the
+change that makes `swapdock validate` fail for the first time.
+
+With `--tunnel-config`, the new hostname is also cross-checked against the
+tunnel routes. Without it, route checks are skipped.
+
+To retry after a refusal, fix the reported problem. To change a successful
+import, edit the TOML (or delete both files and re-import); there is no
+`--force`, so an existing registry file is never overwritten.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `no compose file in ...` | `--compose-dir` points at the wrong directory, or the file is named something else. Import checks `compose.yaml`, `compose.yml`, then `docker-compose.yml`. |
+| `` `docker compose config` failed `` | Compose is missing, the file has a syntax/interpolation error, or the service name is wrong. The Compose stderr is included. |
+| `the compose file has N services; pass --service` | A multi-service file needs `--service <NAME>`; the available names are listed. |
+| `has no image; build-only services cannot be imported yet` | Add an `image`, or build and tag one, then import. |
+| `publishes several container ports` / `exposes several container ports` | Pass `--container-port <PORT>` naming the port the app serves. |
+| `already exists; refusing to overwrite` | The registry file exists. Choose another `--name`, or remove the old file deliberately. |
+| `no free slot` / `no free front port` | The registry is at its limit (128 slots). Remove an app or free its slot/port. |
+| `compose project name ... is invalid` | Rename the directory so its basename is a lowercase Compose project name, or move the Compose file. |
+| warning `no-healthcheck` | Add `--healthcheck "<cmd>"` or a Compose `healthcheck`; the deploy gate refuses otherwise. |
+| `the generated compose override was refused` | The Compose version probably lacks `!override`. Upgrade Compose v2; no registry file was written. |
+
+## What is intentionally left for later gates
+
+- Import writes files but does not deploy. The keep-old-until-healthy and
+  auto-rollback behaviour belongs to `swapdock up` (swap and replace); the
+  five-real-import evidence for [G3.1](../LAUNCH.md) is still open.
+- The Compose import flow in the console ([G3.3](../LAUNCH.md)) is not built; the
+  CLI is the interface.
+- Domain/TLS onboarding ([G3.4](../LAUNCH.md)) is separate: `--domain` only sets
+  `hostnames`.
+- Importing several related services as one app, build-only services, and a
+  `--force` overwrite are out of scope for this gate.
+
+## See also
+
+- [Quickstart](quickstart.md) — install, validate and the first registry entry.
+- [Install](install.md) — the installer and the `/srv/swapdock` layout.
+- [Troubleshooting](troubleshooting.md) — host and deploy failures.
+- [LAUNCH.md](../LAUNCH.md) — the gates and the evidence still required.
