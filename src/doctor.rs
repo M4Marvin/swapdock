@@ -24,7 +24,8 @@ use crate::exec::StepSpec;
 use crate::registry::{App, ImageRegistry, Kind, Problem};
 use crate::trace::{Run, RunMode};
 
-/// Runs every check for `apps`, optionally narrowed to one app.
+/// Runs every check for `apps`, optionally narrowed to one app. When `public`,
+/// also probes each app's public URL.
 pub fn check(run: &mut Run, apps: &[App], only: Option<&str>, public: bool) -> Vec<Problem> {
     let mut out = Vec::new();
     for app in apps {
@@ -101,7 +102,17 @@ fn check_compose_paths(run: &mut Run, app: &App, out: &mut Vec<Problem>) {
     if app.kind != Kind::Container {
         return;
     }
-    let path = app.compose_dir.join("docker-compose.yml");
+    let path = match compose::resolve_compose_file(&app.compose_dir) {
+        Ok(path) => path,
+        Err(e) => {
+            out.push(Problem::error(
+                "compose-missing",
+                Some(&app.name),
+                e.to_string(),
+            ));
+            return;
+        }
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         out.push(Problem::error(
             "compose-missing",

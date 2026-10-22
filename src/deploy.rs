@@ -15,10 +15,11 @@
 //! complete trace and `resume` knows where it stopped.
 //!
 //! ```text
-//! swap:    lock → resolve → pull → green-start → health-wait → render+validate
-//!          → apply → probe-front → drain → stop-old → registry-commit
-//! replace: lock → resolve → pull → render+validate → apply → stop-old
-//!          → start-new → health-wait → probe-front → registry-commit
+//! swap:    estate-lock → app-lock → resolve → pull → swap-preflight
+//!          → green-start → health-wait → render+validate → apply → probe-front
+//!          → drain → stop-old → registry-commit
+//! replace: estate-lock → app-lock → resolve → pull → render+validate → apply
+//!          → stop-old → start-new → health-wait → probe-front → registry-commit
 //! ```
 //!
 //! `rollback` is not a third strategy: it runs the app's own strategy with the
@@ -38,9 +39,11 @@ use crate::docker;
 use crate::exec::StepSpec;
 use crate::git;
 use crate::health::{self, HealthError};
+use crate::journal;
 use crate::lock::{self, Lock, LockError};
 use crate::registry::{self, App};
 use crate::render;
+use crate::static_site;
 use crate::trace::{Run, RunMode, StepRecord};
 
 /// Seconds to let old workers drain after the flip before stopping them.
@@ -58,6 +61,7 @@ pub fn swap_steps() -> Vec<&'static str> {
         "lock",
         "resolve-release",
         "pull",
+        "swap-preflight",
         "green-start",
         "health-wait-discover",
         "health-wait-inspect",
@@ -103,7 +107,7 @@ pub fn replace_steps() -> Vec<&'static str> {
 
 /// Everything a strategy run needs that is not the app itself.
 #[derive(Debug, Clone)]
-pub struct Ctx {
+pub struct DeployContext {
     pub registry_dir: PathBuf,
     pub state_dir: PathBuf,
     pub lock_dir: PathBuf,
@@ -112,7 +116,7 @@ pub struct Ctx {
     pub lock_timeout: Duration,
 }
 
-impl Default for Ctx {
+impl Default for DeployContext {
     fn default() -> Self {
         Self {
             registry_dir: PathBuf::from("/srv/swapdock/apps"),
@@ -126,6 +130,7 @@ impl Default for Ctx {
 }
 
 /// Why a swapdock did not finish.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum DeployError {
     #[error("no release to swapdock: pass --release, or record one with a previous swapdock")]
@@ -140,11 +145,57 @@ pub enum DeployError {
     #[error("apply failed: {0}")]
     Apply(#[from] apply::ApplyError),
 
+    #[error("could not find the app's compose file: {0}")]
+    Compose(#[from] compose::ComposeFileError),
+
     #[error("could not take the swapdock lock: {0}")]
     Lock(#[from] LockError),
 
     #[error("refused to swapdock into a broken estate: {0}")]
     Estate(String),
+
+    #[error(
+        "cannot swap {app}: {reasons}. Use strategy = \"replace\" \
+         (set writes_state = true when the app owns state) or move the data to bind mounts"
+    )]
+    SwapUnsafe { app: String, reasons: String },
+
+    #[error("replace of {app} release {release} failed: {failure}; {rollback}")]
+    ReplaceFailed {
+        app: String,
+        release: String,
+        failure: String,
+        rollback: String,
+    },
+
+    #[error("could not stop container {container} publishing port {port}: {stderr}")]
+    StopFailed {
+        container: String,
+        port: u16,
+        stderr: String,
+    },
+
+    #[error("could not remove the old container {container}: {stderr}")]
+    RemoveFailed { container: String, stderr: String },
+
+    #[error("static deploy failed: {0}")]
+    Static(#[from] static_site::StaticError),
+
+    #[error("could not write the in-flight deploy record: {0}")]
+    Journal(String),
+
+    #[error(
+        "refusing to overwrite tag {tag}: it already points at image {existing_image_id}, \
+         but the live container {container} is image {live_image_id}. Reconcile the release \
+         tags (or the registry's release fields) before deploying; the old container was \
+         left running"
+    )]
+    TagConflict {
+        container: String,
+        tag: String,
+        existing_image_id: String,
+        live_image_id: String,
+    },
 
     #[error("sync failed: {0}")]
     Sync(String),
@@ -171,7 +222,7 @@ pub enum DeployError {
     #[error("could not write to the run log: {0}")]
     Trace(#[from] anyhow::Error),
 
-    #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
+    #[error("invalid release {0:?}: must be a commit SHA (hex, 7-64 chars)")]
     InvalidRelease(String),
 
     #[error("{name} is already on {release}; pass --force to deploy it again")]
@@ -265,15 +316,23 @@ pub fn green_override_path(state_dir: &Path, app: &str) -> PathBuf {
 }
 
 /// Runs the app's strategy for `release`.
-pub fn deploy(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Result<(), DeployError> {
-    match app.strategy {
-        registry::Strategy::Swap => run_swap(run, ctx, app, release),
-        registry::Strategy::Replace => run_replace(run, ctx, app, release),
+pub fn deploy(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &mut App,
+    release: &str,
+) -> Result<(), DeployError> {
+    match app.kind {
+        registry::Kind::Static => run_static(run, ctx, app, release),
+        registry::Kind::Container => match app.strategy {
+            registry::Strategy::Swap => run_swap(run, ctx, app, release),
+            registry::Strategy::Replace => run_replace(run, ctx, app, release),
+        },
     }
 }
 
 /// Rolls back by deploying the previous release through the same strategy.
-pub fn rollback(run: &mut Run, ctx: &Ctx, app: &mut App) -> Result<String, DeployError> {
+pub fn rollback(run: &mut Run, ctx: &DeployContext, app: &mut App) -> Result<String, DeployError> {
     let old = app.old_release.clone().ok_or_else(|| {
         DeployError::Estate(format!(
             "{} has no previous release to roll back to",
@@ -342,8 +401,18 @@ pub fn sync_repo(run: &mut Run, app: &App) -> Result<String, DeployError> {
 // ---------------------------------------------------------------------------
 
 /// Deploys by starting the new release alongside the old one.
-pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Result<(), DeployError> {
+pub fn run_swap(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &mut App,
+    release: &str,
+) -> Result<(), DeployError> {
+    // Estate then app, always in that order. The estate lock is held through
+    // registry-commit, so a second deploy cannot render this app's pre-commit
+    // live_port and then apply a stale config after this one commits.
+    let _estate_lock = hold(run, ctx, lock::estate_lock_name())?;
     let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
+    reload_app(ctx, app)?;
     refuse_if_broken(run, ctx)?;
     backup::before_deploy(run, app, Some(release))?;
 
@@ -359,26 +428,153 @@ pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Resul
     };
 
     pull_image(run, app, release)?;
+    preflight_swap(run, app)?;
+
+    // The release being replaced is what is live now, *before* commit_release
+    // advances the chain. It is not `old_release`: on a rollback that is the
+    // target, and tagging the outgoing image with it would overwrite the very
+    // tag the rollback is deploying.
+    let replaced = app.release.clone();
 
     let green_name = format!("{}-green-{}", app.compose_svc, short_sha(release));
     start_green(run, ctx, app, release, green_port, &green_name)?;
 
     let health_path =
         health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
-    health::gate_container(run, "health-wait", green_port, &health_path)?;
+    health::gate_container_with_host(
+        run,
+        "health-wait",
+        green_port,
+        &health_path,
+        app.hostnames.first().map(String::as_str),
+    )?;
+
+    let mut pending = journal::Pending::new(
+        app.name.clone(),
+        release,
+        app.live_port,
+        green_port,
+        run.id().to_string(),
+    );
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
 
     apply_new_state(run, ctx, app, green_port)?;
+    pending.phase = journal::Phase::Flipped;
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
 
-    probe_front(run, app)?;
+    #[cfg(debug_assertions)]
+    if std::env::var("SWAPDOCK_FAILPOINT").ok().as_deref() == Some("swap-flipped") {
+        return Err(DeployError::Estate(
+            "failpoint: process would have died after the swap flip".into(),
+        ));
+    }
 
-    drain(run, ctx)?;
+    if let Err(failure) = probe_front(run, app) {
+        return Err(rollback_swap_candidate(
+            run, ctx, app, release, green_port, failure,
+        ));
+    }
 
-    retain_old_image(run, app)?;
+    if let Err(failure) = drain(run, ctx) {
+        return Err(rollback_swap_candidate(
+            run, ctx, app, release, green_port, failure,
+        ));
+    }
 
+    if let Err(failure) = retain_old_image(run, app, replaced.as_deref(), release) {
+        return Err(rollback_swap_candidate(
+            run, ctx, app, release, green_port, failure,
+        ));
+    }
+
+    pending.phase = journal::Phase::Stopping;
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
     stop_publishing(run, app.live_port)?;
+    if let Some(previous) = replaced.as_deref() {
+        cleanup_green_project(run, ctx, app, previous)?;
+    }
 
     commit_release(run, ctx, app, release.to_string(), green_port)?;
+    if run.mode() != RunMode::DryRun
+        && let Err(e) = journal::clear(&ctx.state_dir, &app.name)
+    {
+        tracing::warn!(app = %app.name, "could not clear pending deploy record: {e}");
+    }
     Ok(())
+}
+
+/// Removes a per-release green Compose project and its network after its
+/// container is no longer live. Without this every swap leaks a Docker network
+/// named `<project>-green-<sha>_default`.
+fn cleanup_green_project(
+    run: &mut Run,
+    _ctx: &DeployContext,
+    app: &App,
+    release: &str,
+) -> Result<(), DeployError> {
+    let compose_file = compose::resolve_compose_file(&app.compose_dir)?;
+    let project = format!("{}-green-{}", app.compose_project(), short_sha(release));
+    let outcome = run.exec(&compose::down(&compose_file, &project, &[]))?;
+    if !outcome.success() {
+        tracing::warn!(
+            app = %app.name,
+            project = %project,
+            "green project cleanup failed: {}",
+            outcome.stderr_trimmed()
+        );
+    }
+    Ok(())
+}
+
+fn rollback_swap_candidate(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &App,
+    release: &str,
+    green_port: u16,
+    failure: DeployError,
+) -> DeployError {
+    rollback_swap_candidate_inner(run, ctx, app, release, green_port, failure)
+}
+
+/// Puts the front door back on the old release, stops the failed candidate and
+/// clears the journal. Called for every post-flip swap failure.
+fn rollback_swap_candidate_inner(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &App,
+    release: &str,
+    green_port: u16,
+    failure: DeployError,
+) -> DeployError {
+    if let Some(old_live) = app.live_port
+        && let Err(restore) = apply_new_state(run, ctx, app, old_live)
+    {
+        return DeployError::Estate(format!(
+            "{failure}; restoring the previous front door also failed: {restore}"
+        ));
+    }
+    if let Err(stop) = stop_publishing(run, Some(green_port)) {
+        return DeployError::Estate(format!(
+            "{failure}; the failed candidate on {green_port} could not be stopped: {stop}"
+        ));
+    }
+    if let Err(e) = cleanup_green_project(run, ctx, app, release) {
+        tracing::warn!(app = %app.name, "failed green project cleanup: {e}");
+    }
+    if let Err(e) = journal::clear(&ctx.state_dir, &app.name) {
+        tracing::warn!(app = %app.name, "could not clear pending record after swap rollback: {e}");
+    }
+    failure
 }
 
 // ---------------------------------------------------------------------------
@@ -388,11 +584,13 @@ pub fn run_swap(run: &mut Run, ctx: &Ctx, app: &mut App, release: &str) -> Resul
 /// Deploys by stopping the old container and starting the new on the same port.
 pub fn run_replace(
     run: &mut Run,
-    ctx: &Ctx,
+    ctx: &DeployContext,
     app: &mut App,
     release: &str,
 ) -> Result<(), DeployError> {
+    let _estate_lock = hold(run, ctx, lock::estate_lock_name())?;
     let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
+    reload_app(ctx, app)?;
     refuse_if_broken(run, ctx)?;
     backup::before_deploy(run, app, Some(release))?;
 
@@ -405,6 +603,23 @@ pub fn run_replace(
 
     pull_image(run, app, release)?;
 
+    // What is live at the moment the old container is stopped. This is the
+    // release `retain_old_image` preserves and the one an automatic rollback
+    // restarts if the new release cannot pass the gate.
+    let previous = app.release.clone();
+
+    let mut pending = journal::Pending::new(
+        app.name.clone(),
+        release,
+        app.live_port,
+        port,
+        run.id().to_string(),
+    );
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
+
     // The port does not change, so the rendered config is identical. Skip the
     // reload rather than bounce every worker for no reason.
     if config_changed(ctx, app, port)? {
@@ -412,21 +627,293 @@ pub fn run_replace(
     } else {
         record_skip(run, "apply-skipped", "rendered config identical; no reload")?;
     }
+    pending.phase = journal::Phase::Flipped;
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
 
-    retain_old_image(run, app)?;
+    retain_old_image(run, app, previous.as_deref(), release)?;
 
+    pending.phase = journal::Phase::Stopping;
+    if run.mode() != RunMode::DryRun {
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
     stop_publishing(run, Some(port))?;
-
-    start_live(run, app, release, port)?;
 
     let health_path =
         health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
-    health::gate_container(run, "health-wait", port, &health_path)?;
+    let host = app.hostnames.first().map(String::as_str);
 
-    probe_front(run, app)?;
+    let started = start_live(run, app, release, port).and_then(|()| {
+        health::gate_container_with_host(run, "health-wait", port, &health_path, host)
+            .map(|_| ())
+            .map_err(DeployError::from)
+    });
+
+    if let Err(failure) = started {
+        return Err(replace_failure(
+            run,
+            ctx,
+            app,
+            release,
+            previous.as_deref(),
+            port,
+            &health_path,
+            host,
+            failure,
+        ));
+    }
+
+    if let Err(failure) = probe_front(run, app) {
+        return Err(replace_failure(
+            run,
+            ctx,
+            app,
+            release,
+            previous.as_deref(),
+            port,
+            &health_path,
+            host,
+            failure,
+        ));
+    }
 
     commit_release(run, ctx, app, release.to_string(), port)?;
+    if run.mode() != RunMode::DryRun
+        && let Err(e) = journal::clear(&ctx.state_dir, &app.name)
+    {
+        tracing::warn!(app = %app.name, "could not clear pending deploy record: {e}");
+    }
     Ok(())
+}
+
+/// Deploys a static release by verifying its directory and atomically flipping
+/// the stable `root` symlink.
+///
+/// The release files are produced outside this function (CI, rsync, or a build
+/// script) at `<root-parent>/releases/<release>/index.html`. swapdock owns the
+/// cutover: it refuses a missing release, flips the link, applies nginx, probes
+/// the public front door, and restores the previous link if the probe fails.
+/// There is no container and no image.
+fn run_static(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &mut App,
+    release: &str,
+) -> Result<(), DeployError> {
+    let _estate_lock = hold(run, ctx, lock::estate_lock_name())?;
+    let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
+    reload_app(ctx, app)?;
+    refuse_if_broken(run, ctx)?;
+    backup::before_deploy(run, app, Some(release))?;
+
+    let root = app
+        .root
+        .as_deref()
+        .ok_or_else(|| DeployError::Estate(format!("{} has no static root", app.name)))?;
+    let root = PathBuf::from(root);
+    let release_dir = static_site::release_dir(&root, release)?;
+
+    if run.mode() == RunMode::DryRun {
+        record_skip(
+            run,
+            "static-release",
+            &format!("dry-run: would verify {}", release_dir.display()),
+        )?;
+        record_skip(
+            run,
+            "static-flip",
+            &format!(
+                "dry-run: would link {} -> releases/{release}",
+                root.display()
+            ),
+        )?;
+        apply_new_state(run, ctx, app, app.front_port)?;
+        probe_front(run, app)?;
+        commit_release(run, ctx, app, release.to_string(), app.front_port)?;
+        return Ok(());
+    }
+
+    static_site::ensure_release(&root, release)?;
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "static-release",
+            crate::trace::StepStatus::Ok,
+            &["verify".to_string(), release_dir.display().to_string()],
+        )
+        .with_detail(json!({"release": release, "directory": release_dir})),
+    )?;
+
+    // The pending record makes a kill between the flip and the commit visible.
+    // It is written before the symlink moves; a failure to persist it aborts
+    // before any host state changes.
+    let pending = journal::Pending::new(
+        app.name.clone(),
+        release,
+        app.live_port,
+        app.front_port,
+        run.id().to_string(),
+    );
+    journal::write(&ctx.state_dir, &pending).map_err(|e| DeployError::Journal(e.to_string()))?;
+
+    let previous_link = match static_site::flip(&root, release) {
+        Ok(previous) => previous,
+        Err(e) => {
+            // No host state changed; do not leave a pending record claiming a
+            // cutover that never happened.
+            let _ = journal::clear(&ctx.state_dir, &app.name);
+            return Err(e.into());
+        }
+    };
+    let previous_release = app.release.clone();
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "static-flip",
+            crate::trace::StepStatus::Ok,
+            &[
+                "symlink".to_string(),
+                root.display().to_string(),
+                format!("releases/{release}"),
+            ],
+        )
+        .with_detail(json!({
+            "release": release,
+            "previous": previous_release,
+            "previous_link": previous_link.as_ref().map(|p| p.display().to_string()),
+        })),
+    )?;
+
+    // Test-only crash point: leave the new symlink and pending record in place
+    // exactly as a killed process would, without the normal restore path.
+    #[cfg(debug_assertions)]
+    if std::env::var("SWAPDOCK_FAILPOINT").ok().as_deref() == Some("static-flipped") {
+        return Err(DeployError::Estate(
+            "failpoint: process would have died after the static flip".into(),
+        ));
+    }
+
+    // From here the new files are live. Every failure restores the link and
+    // reports both errors; the registry is only committed after the probe.
+    let result = (|| {
+        apply_new_state(run, ctx, app, app.front_port)?;
+        probe_front(run, app)?;
+        commit_release(run, ctx, app, release.to_string(), app.front_port)?;
+        Ok::<(), DeployError>(())
+    })();
+
+    match result {
+        Ok(()) => {
+            if let Err(e) = journal::clear(&ctx.state_dir, &app.name) {
+                tracing::warn!(app = %app.name, "could not clear pending deploy record: {e}");
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            // `commit_release` advances the in-memory app before it saves and
+            // records the step. If the registry was already saved and only the
+            // run-log write failed, restoring the old symlink would make nginx
+            // disagree with the registry. Check the durable file, not the
+            // in-memory app.
+            if app.release.as_deref() == Some(release)
+                && registry_has_release(ctx, &app.name, release)
+            {
+                let _ = journal::clear(&ctx.state_dir, &app.name);
+                return Err(failure);
+            }
+            let restored = static_site::restore(&root, previous_link.as_deref());
+            if restored.is_ok() {
+                let _ = journal::clear(&ctx.state_dir, &app.name);
+                return Err(failure);
+            }
+            Err(DeployError::Estate(format!(
+                "{failure}; restoring the previous static release also failed: {}",
+                restored.unwrap_err()
+            )))
+        }
+    }
+}
+
+/// Restarts the previous release after a failed `replace`, then names both
+/// failures in one error.
+///
+/// The registry was not committed, so the recorded state still describes the
+/// previous release; restarting its image on the same port makes the running
+/// state agree with the registry again.
+#[allow(clippy::too_many_arguments)]
+fn replace_failure(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &App,
+    release: &str,
+    previous: Option<&str>,
+    port: u16,
+    health_path: &str,
+    host: Option<&str>,
+    failure: DeployError,
+) -> DeployError {
+    let rollback = match previous {
+        Some(previous) => match restore_previous(run, app, previous, port, health_path, host) {
+            Ok(()) => {
+                // The failed release never reached the registry. Leaving the
+                // pending record would make a later startup reconcile consider
+                // it; the old release is healthy again, so the crash window is
+                // closed.
+                if let Err(e) = journal::clear(&ctx.state_dir, &app.name) {
+                    tracing::warn!(app = %app.name, "could not clear pending record after replace rollback: {e}");
+                }
+                format!(
+                    "the previous release {previous} was restored and passed the same health gate"
+                )
+            }
+            Err(rollback) => format!("rollback to {previous} ALSO failed: {rollback}"),
+        },
+        None => "there is no previous release to roll back to".to_string(),
+    };
+    DeployError::ReplaceFailed {
+        app: app.name.clone(),
+        release: release.to_string(),
+        failure: failure.to_string(),
+        rollback,
+    }
+}
+
+/// Starts `previous` on the same port and waits for the same health gate.
+fn restore_previous(
+    run: &mut Run,
+    app: &App,
+    previous: &str,
+    port: u16,
+    health_path: &str,
+    host: Option<&str>,
+) -> Result<(), DeployError> {
+    let result = start_live(run, app, previous, port).and_then(|()| {
+        health::gate_container_with_host(run, "health-wait", port, health_path, host)
+            .map(|_| ())
+            .map_err(DeployError::from)
+    });
+
+    let seq = run.next_seq();
+    let argv = ["rollback".to_string(), previous.to_string()];
+    let record = match &result {
+        Ok(()) => StepRecord::new(seq, "replace-rollback", crate::trace::StepStatus::Ok, &argv)
+            .with_detail(json!({"release": previous, "port": port})),
+        Err(e) => StepRecord::new(
+            seq,
+            "replace-rollback",
+            crate::trace::StepStatus::Error,
+            &argv,
+        )
+        .with_detail(json!({"release": previous, "port": port}))
+        .with_error(e.to_string()),
+    };
+    run.record_step(record).map_err(DeployError::Trace)?;
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +925,7 @@ fn app_health_url(app: &App) -> &str {
 }
 
 /// Takes a lock, or records the intent in dry-run mode.
-fn hold(run: &mut Run, ctx: &Ctx, name: &str) -> Result<Option<Lock>, DeployError> {
+fn hold(run: &mut Run, ctx: &DeployContext, name: &str) -> Result<Option<Lock>, DeployError> {
     if run.mode() == RunMode::DryRun {
         let seq = run.next_seq();
         run.record_step(
@@ -461,8 +948,91 @@ fn hold(run: &mut Run, ctx: &Ctx, name: &str) -> Result<Option<Lock>, DeployErro
     Ok(Some(Lock::acquire(&ctx.lock_dir, name, ctx.lock_timeout)?))
 }
 
+/// Reloads the app from the registry under the estate and app locks.
+///
+/// The caller loaded its snapshot before waiting for the locks. Without this
+/// re-read, a second deploy of the same app computes the green port from the
+/// pre-lock `live_port` and can recreate the serving container instead of
+/// alternating against it. The fresh copy replaces the passed value so the
+/// commit below writes the state this run actually saw.
+fn reload_app(ctx: &DeployContext, app: &mut App) -> Result<(), DeployError> {
+    let loaded = registry::load_dir(&ctx.registry_dir)
+        .map_err(|e| DeployError::Io(format!("read {}: {e}", ctx.registry_dir.display())))?;
+    let fresh = loaded
+        .sorted()
+        .into_iter()
+        .find(|a| a.name == app.name)
+        .ok_or_else(|| DeployError::Estate(format!("{} vanished from the registry", app.name)))?;
+    *app = fresh;
+    Ok(())
+}
+
+/// Refuses a swap whose merged Compose model cannot survive a new project.
+fn preflight_swap(run: &mut Run, app: &App) -> Result<(), DeployError> {
+    if run.mode() == RunMode::DryRun {
+        record_skip(
+            run,
+            "swap-preflight",
+            "dry-run cannot inspect the merged compose model; a live swap would check named \
+             volumes and service dependencies first",
+        )?;
+        return Ok(());
+    }
+
+    let compose_file = compose::resolve_compose_file(&app.compose_dir)?;
+    let extra: Vec<&Path> = app.compose_override.as_deref().into_iter().collect();
+    let out = run.exec(&compose::config_json(
+        &compose_file,
+        &app.compose_project(),
+        &extra,
+        &app.compose_svc,
+    ))?;
+    if !out.success() {
+        return Err(DeployError::Estate(format!(
+            "swap preflight could not read the merged compose model for {}: {}",
+            app.name,
+            out.stderr_trimmed()
+        )));
+    }
+    let config: Value = serde_json::from_str(out.stdout_trimmed()).map_err(|e| {
+        DeployError::Estate(format!(
+            "swap preflight: `docker compose config` did not return JSON for {}: {e}",
+            app.name
+        ))
+    })?;
+    let blockers = compose::swap_blockers(&config, &app.compose_svc);
+    if !blockers.is_empty() {
+        let seq = run.next_seq();
+        run.record_step(
+            StepRecord::new(
+                seq,
+                "swap-preflight",
+                crate::trace::StepStatus::Error,
+                &["compose-config".to_string()],
+            )
+            .with_detail(json!({"blockers": blockers})),
+        )?;
+        return Err(DeployError::SwapUnsafe {
+            app: app.name.clone(),
+            reasons: blockers.join("; "),
+        });
+    }
+
+    let seq = run.next_seq();
+    run.record_step(
+        StepRecord::new(
+            seq,
+            "swap-preflight",
+            crate::trace::StepStatus::Ok,
+            &["compose-config".to_string()],
+        )
+        .with_detail(json!({"service": app.compose_svc})),
+    )?;
+    Ok(())
+}
+
 /// Refuses to swapdock into an estate that does not validate.
-fn refuse_if_broken(run: &mut Run, ctx: &Ctx) -> Result<(), DeployError> {
+fn refuse_if_broken(run: &mut Run, ctx: &DeployContext) -> Result<(), DeployError> {
     let loaded = registry::load_dir(&ctx.registry_dir)
         .map_err(|e| DeployError::Io(format!("read {}: {e}", ctx.registry_dir.display())))?;
     let mut problems = loaded.problems.clone();
@@ -533,7 +1103,7 @@ fn pull_image(run: &mut Run, app: &App, release: &str) -> Result<(), DeployError
 /// Starts the green candidate in its own compose project.
 fn start_green(
     run: &mut Run,
-    ctx: &Ctx,
+    ctx: &DeployContext,
     app: &App,
     release: &str,
     green_port: u16,
@@ -543,8 +1113,13 @@ fn start_green(
     let text = green_override(green_name, &app.compose_svc);
     write_state_file(run, &override_path, &text)?;
 
-    let compose_file = app.compose_dir.join("docker-compose.yml");
-    let project = format!("{}-green", app.compose_project());
+    let compose_file = compose::resolve_compose_file(&app.compose_dir)?;
+    // One Compose project per green release. Sharing a project makes Compose
+    // treat the previous green service as the same desired state and remove it
+    // before the new release passes health/probe, destroying the keep-old
+    // guarantee. Per-release projects leave the previous container alone until
+    // stop_publishing() stops it after the cutover.
+    let project = format!("{}-green-{}", app.compose_project(), short_sha(release));
     let image = app.image_ref(release).unwrap_or_default();
     let port_var = app.env_name.clone();
     let mut extra: Vec<&Path> = Vec::new();
@@ -568,7 +1143,7 @@ fn start_green(
 
 /// Starts (or recreates) the live service in place.
 fn start_live(run: &mut Run, app: &App, release: &str, port: u16) -> Result<(), DeployError> {
-    let compose_file = app.compose_dir.join("docker-compose.yml");
+    let compose_file = compose::resolve_compose_file(&app.compose_dir)?;
     let project = app.compose_project();
     let image = app.image_ref(release).unwrap_or_default();
     let extra: Vec<&Path> = app.compose_override.iter().map(PathBuf::as_path).collect();
@@ -588,7 +1163,7 @@ fn start_live(run: &mut Run, app: &App, release: &str, port: u16) -> Result<(), 
 /// Renders the estate with this app's live port moved, validates it, and applies.
 fn apply_new_state(
     run: &mut Run,
-    ctx: &Ctx,
+    ctx: &DeployContext,
     app: &App,
     new_live_port: u16,
 ) -> Result<(), DeployError> {
@@ -640,7 +1215,11 @@ fn apply_new_state(
 }
 
 /// True when the rendered config differs from the file on disk.
-fn config_changed(ctx: &Ctx, app: &App, port: u16) -> Result<bool, DeployError> {
+fn config_changed(ctx: &DeployContext, app: &App, port: u16) -> Result<bool, DeployError> {
+    // Resolve the compose file even when the rendered config is unchanged: the
+    // start step that follows needs it, and a missing file should fail with the
+    // resolver's clear message rather than as a generic compose error later.
+    let _compose_file = compose::resolve_compose_file(&app.compose_dir)?;
     let loaded = registry::load_dir(&ctx.registry_dir)
         .map_err(|e| DeployError::Io(format!("read {}: {e}", ctx.registry_dir.display())))?;
     let mut apps = loaded.sorted();
@@ -658,6 +1237,22 @@ fn config_changed(ctx: &Ctx, app: &App, port: u16) -> Result<bool, DeployError> 
 fn probe_front(run: &mut Run, app: &App) -> Result<(), DeployError> {
     if app.hostnames.is_empty() {
         record_skip(run, "probe-front", "no hostnames; nothing to probe")?;
+        return Ok(());
+    }
+    if run.mode() == RunMode::DryRun {
+        // There is no nginx in a dry run, and dialing the front port would just
+        // be a refused connection. Record the probe that a live run would make.
+        for host in &app.hostnames {
+            let seq = run.next_seq();
+            run.record_step(
+                StepRecord::new(seq, "probe-front", crate::trace::StepStatus::DryRun, &[])
+                    .with_detail(json!({
+                        "dry_run": true,
+                        "host": host,
+                        "front_port": app.front_port,
+                    })),
+            )?;
+        }
         return Ok(());
     }
     for host in &app.hostnames {
@@ -692,26 +1287,91 @@ fn probe_front(run: &mut Run, app: &App) -> Result<(), DeployError> {
 }
 
 /// Lets old workers drain before stopping the old container.
-fn drain(run: &mut Run, ctx: &Ctx) -> Result<(), DeployError> {
+fn drain(run: &mut Run, ctx: &DeployContext) -> Result<(), DeployError> {
     let spec = StepSpec::new("drain-wait", "sleep").arg(ctx.drain_secs.to_string());
     run.exec(&spec)?;
     Ok(())
 }
 
-/// Tags the running old image with the recorded rollback release.
+/// What retaining the outgoing image should do.
+#[derive(Debug, PartialEq, Eq)]
+enum RetainPlan {
+    Skip(&'static str),
+    Tag { release: String, target: String },
+}
+
+/// Decides which tag to write for the image being replaced.
+///
+/// `replaced` is the release that is live *before* the commit, never
+/// `app.old_release`: during a rollback `old_release` is the release being
+/// deployed, and tagging the outgoing image with it corrupts the rollback tag.
+fn retain_plan(app: &App, replaced: Option<&str>, deploying: &str) -> RetainPlan {
+    let Some(replaced) = replaced else {
+        return RetainPlan::Skip("no live release yet; nothing older to retain");
+    };
+    if replaced == deploying {
+        return RetainPlan::Skip(
+            "the live release is the one being deployed (force redeploy); \
+             leaving the rollback tag untouched",
+        );
+    }
+    let Some(target) = app.image_ref(replaced) else {
+        return RetainPlan::Skip("no image_repo; nothing to tag");
+    };
+    RetainPlan::Tag {
+        release: replaced.to_string(),
+        target,
+    }
+}
+
+/// What to do with a tag that may already exist.
+#[derive(Debug, PartialEq, Eq)]
+enum TagDecision {
+    /// The tag is absent: write it.
+    Tag,
+    /// The tag already names this exact image: nothing to do.
+    AlreadyTagged,
+    /// The tag names another image: never overwrite it.
+    Conflict,
+}
+
+fn tag_decision(existing: Option<&str>, live_image_id: &str) -> TagDecision {
+    match existing {
+        None => TagDecision::Tag,
+        Some(existing) if existing == live_image_id => TagDecision::AlreadyTagged,
+        Some(_) => TagDecision::Conflict,
+    }
+}
+
+/// Reads one image tag's image id. Missing tags are a result, not an error.
+fn inspect_tag_run(tag: &str) -> StepSpec {
+    StepSpec::new("docker-inspect-tag", "docker")
+        .args(["image", "inspect", "--format", "{{.Id}}"])
+        .arg(tag)
+}
+
+/// Preserves the image of the release being replaced under its release tag.
 ///
 /// The old container is about to be removed, so this is the last moment the
 /// image is reachable by ID. A later `rollback` asks for
-/// `image_repo:old_release`; without this step that tag can be missing even
+/// `image_repo:<replaced>`; without this step that tag can be missing even
 /// though the image is still in the daemon.
-fn retain_old_image(run: &mut Run, app: &App) -> Result<(), DeployError> {
-    let Some(old_release) = app.old_release.as_deref() else {
-        record_skip(run, "retain-old-image", "no previous release to retain")?;
-        return Ok(());
-    };
-    let Some(target) = app.image_ref(old_release) else {
-        record_skip(run, "retain-old-image", "no image_repo; nothing to tag")?;
-        return Ok(());
+///
+/// A tag that already points at a different image is left alone and recorded:
+/// silently retagging it would hide (or create) a provenance mismatch, and the
+/// next deploy would run an image that is not the release it names.
+fn retain_old_image(
+    run: &mut Run,
+    app: &App,
+    replaced: Option<&str>,
+    deploying: &str,
+) -> Result<(), DeployError> {
+    let (release, target) = match retain_plan(app, replaced, deploying) {
+        RetainPlan::Skip(reason) => {
+            record_skip(run, "retain-old-image", reason)?;
+            return Ok(());
+        }
+        RetainPlan::Tag { release, target } => (release, target),
     };
     let Some(port) = app.live_port else {
         record_skip(run, "retain-old-image", "no live port; nothing to retain")?;
@@ -727,12 +1387,22 @@ fn retain_old_image(run: &mut Run, app: &App) -> Result<(), DeployError> {
                 crate::trace::StepStatus::DryRun,
                 &["docker".to_string(), "tag".to_string(), target.clone()],
             )
-            .with_detail(json!({"old_release": old_release, "image": target})),
+            .with_detail(json!({
+                "replaced": release,
+                "deploying": deploying,
+                "image": target,
+            })),
         )?;
         return Ok(());
     }
 
     let found = run.exec(&docker::ps_publishing(port))?;
+    if !found.success() {
+        return Err(DeployError::Estate(format!(
+            "could not list containers publishing {port} while retaining {release}: {}",
+            found.stderr_trimmed()
+        )));
+    }
     let names: Vec<&str> = found
         .stdout
         .lines()
@@ -749,23 +1419,75 @@ fn retain_old_image(run: &mut Run, app: &App) -> Result<(), DeployError> {
     }
 
     let mut tagged = Vec::new();
+    let mut already = Vec::new();
     for name in names {
         let id = run.exec(&docker::inspect_image_id(name))?;
-        if !id.success() {
+        if !id.success() || id.stdout_trimmed().is_empty() {
             continue;
         }
-        let image_id = id.stdout_trimmed();
-        if image_id.is_empty() {
-            continue;
+        let image_id = id.stdout_trimmed().to_string();
+
+        // A missing tag exits non-zero. That is a normal answer here, so use
+        // the untraced read-only chokepoint and report the decision in the
+        // summary step instead of logging an expected miss as an error.
+        let existing = crate::exec::run_capture(&inspect_tag_run(&target))?;
+        let existing_id = existing
+            .success()
+            .then(|| existing.stdout_trimmed().to_string())
+            .filter(|s| !s.is_empty());
+
+        match tag_decision(existing_id.as_deref(), &image_id) {
+            TagDecision::Tag => {
+                let tag = run.exec(&docker::tag(&image_id, &target))?;
+                if !tag.success() {
+                    return Err(DeployError::Estate(format!(
+                        "could not tag old image {image_id} as {target}: {}",
+                        tag.stderr_trimmed()
+                    )));
+                }
+                tagged.push(json!({
+                    "container": name,
+                    "image_id": image_id,
+                    "tag": target.clone(),
+                }));
+            }
+            TagDecision::AlreadyTagged => already.push(json!({
+                "container": name,
+                "image_id": image_id,
+                "tag": target.clone(),
+            })),
+            TagDecision::Conflict => {
+                // Never overwrite a tag that names another image: the rollback
+                // would later run code that is not the release it names. Abort
+                // before the old container is stopped, so the app keeps serving.
+                let existing_image_id = existing_id.unwrap_or_default();
+                let seq = run.next_seq();
+                run.record_step(
+                    StepRecord::new(
+                        seq,
+                        "retain-old-image",
+                        crate::trace::StepStatus::Error,
+                        &["docker".to_string(), "tag".to_string(), target.clone()],
+                    )
+                    .with_detail(json!({
+                        "replaced": release,
+                        "deploying": deploying,
+                        "container": name,
+                        "existing_image_id": existing_image_id,
+                        "live_image_id": image_id,
+                    }))
+                    .with_error(format!(
+                        "tag {target} already points at {existing_image_id}, not at the live image {image_id}"
+                    )),
+                )?;
+                return Err(DeployError::TagConflict {
+                    container: name.to_string(),
+                    tag: target,
+                    existing_image_id,
+                    live_image_id: image_id,
+                });
+            }
         }
-        let tag = run.exec(&docker::tag(image_id, &target))?;
-        if !tag.success() {
-            return Err(DeployError::Estate(format!(
-                "could not tag old image {image_id} as {target}: {}",
-                tag.stderr_trimmed()
-            )));
-        }
-        tagged.push(json!({"container": name, "image_id": image_id, "tag": target.clone()}));
     }
 
     let seq = run.next_seq();
@@ -776,23 +1498,47 @@ fn retain_old_image(run: &mut Run, app: &App) -> Result<(), DeployError> {
             crate::trace::StepStatus::Ok,
             &["docker".to_string(), "tag".to_string(), target.clone()],
         )
-        .with_detail(json!({"old_release": old_release, "tagged": tagged})),
+        .with_detail(json!({
+            "replaced": release,
+            "deploying": deploying,
+            "tagged": tagged,
+            "already_tagged": already,
+        })),
     )?;
     Ok(())
 }
 
 /// Stops and removes every container publishing `port`, if any.
+///
+/// A non-zero `docker stop` or `rm` is a hard error: the caller must not commit
+/// a release while an old container still holds the port. The old image has
+/// already been retained, so a retry can still roll back.
 fn stop_publishing(run: &mut Run, port: Option<u16>) -> Result<(), DeployError> {
     let Some(port) = port else {
         record_skip(run, "stop-old", "no previous container; first swapdock")?;
         return Ok(());
     };
+    if run.mode() == RunMode::DryRun {
+        record_skip(
+            run,
+            "stop-old",
+            &format!("dry-run: would stop and remove containers publishing {port}"),
+        )?;
+        return Ok(());
+    }
     let found = run.exec(&docker::ps_publishing(port))?;
-    let names: Vec<&str> = found
+    if !found.success() {
+        return Err(DeployError::Estate(format!(
+            "could not list containers publishing {port} to stop them: {}",
+            found.stderr_trimmed()
+        )));
+    }
+    let names: Vec<String> = found
         .stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(str::to_string)
         .collect();
     if names.is_empty() {
         record_skip(
@@ -803,16 +1549,43 @@ fn stop_publishing(run: &mut Run, port: Option<u16>) -> Result<(), DeployError> 
         return Ok(());
     }
     for name in names {
-        run.exec(&docker::stop(name))?;
-        run.exec(&docker::rm(name))?;
+        let stopped = run.exec(&docker::stop(&name))?;
+        if !stopped.success() {
+            return Err(DeployError::StopFailed {
+                container: name,
+                port,
+                stderr: stopped.stderr_trimmed().to_string(),
+            });
+        }
+        let removed = run.exec(&docker::rm(&name))?;
+        if !removed.success() {
+            return Err(DeployError::RemoveFailed {
+                container: name,
+                stderr: removed.stderr_trimmed().to_string(),
+            });
+        }
     }
     Ok(())
 }
 
 /// Advances the registry and writes it back atomically.
+/// True when the durable registry file already records this release.
+fn registry_has_release(ctx: &DeployContext, app: &str, release: &str) -> bool {
+    registry::load_dir(&ctx.registry_dir)
+        .ok()
+        .and_then(|loaded| {
+            loaded
+                .apps
+                .into_iter()
+                .find(|candidate| candidate.name == app)
+        })
+        .and_then(|candidate| candidate.release)
+        .is_some_and(|saved| saved == release)
+}
+
 fn commit_release(
     run: &mut Run,
-    ctx: &Ctx,
+    ctx: &DeployContext,
     app: &mut App,
     release: String,
     new_live_port: u16,
@@ -912,17 +1685,23 @@ fn short_sha(release: &str) -> &str {
 /// running. The sequence is:
 ///
 /// ```text
-/// lock -> inspect-legacy -> tag-old-image -> compose-config -> adopt-override
-///      -> stop-legacy -> apply(nginx front -> back) -> start-adopted
-///      -> health-wait -> probe-front -> registry-commit
+/// estate-lock -> app-lock -> inspect-legacy -> tag-old-image -> compose-config
+///      -> adopt-override -> stop-legacy -> start-adopted -> health-wait
+///      -> apply(nginx front -> back) -> probe-front -> remove-legacy
+///      -> registry-commit
 /// ```
+///
+/// The legacy container is stopped before the cutover but **not removed** until
+/// the adopted release has passed both the health gate and the front probe. If
+/// anything after the stop fails, it is restarted and the registry is left
+/// unchanged, so the operator still has the old app rather than a dead port.
 ///
 /// After it succeeds, the app has a recorded release, a live back port and a
 /// nginx block; the next `swapdock up <app> --release <new>` uses the normal
 /// replace strategy and records the adopted release as `old_release`.
 pub fn adopt(
     run: &mut Run,
-    ctx: &Ctx,
+    ctx: &DeployContext,
     app: &mut App,
     release: &str,
     healthcheck: Option<&str>,
@@ -931,14 +1710,17 @@ pub fn adopt(
     if !registry::is_valid_release_arg(release) {
         return Err(DeployError::InvalidRelease(release.to_string()));
     }
+
+    let _estate_lock = hold(run, ctx, lock::estate_lock_name())?;
+    let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
+    reload_app(ctx, app)?;
+
     if app.kind != registry::Kind::Container {
         return Err(DeployError::Adopt {
             app: app.name.clone(),
             reason: "only container apps can be adopted".into(),
         });
     }
-
-    let _app_lock = hold(run, ctx, &lock::app_lock_name(&app.name))?;
     refuse_if_broken(run, ctx)?;
 
     if app.live_port.is_some() {
@@ -1025,7 +1807,7 @@ pub fn adopt(
         });
     }
 
-    let compose_file = app.compose_dir.join("docker-compose.yml");
+    let compose_file = compose::resolve_compose_file(&app.compose_dir)?;
     let project = app.compose_project();
     let config_out = run.exec(&compose::config_json(
         &compose_file,
@@ -1096,8 +1878,25 @@ pub fn adopt(
         });
     }
 
-    // From here on the legacy container is gone. Everything that could be
-    // checked without stopping it has already been checked.
+    // Record the cutover before the first host-changing step. An adopted app
+    // can be in flight across the same nginx/registry window as a swap; without
+    // this record a crash after `apply` leaves nginx on the back port while the
+    // registry says the app has no live_port at all.
+    if run.mode() != RunMode::DryRun {
+        let pending = journal::Pending::new(
+            app.name.clone(),
+            release.to_string(),
+            Some(app.front_port),
+            back_port,
+            run.id().to_string(),
+        );
+        journal::write(&ctx.state_dir, &pending)
+            .map_err(|e| DeployError::Journal(e.to_string()))?;
+    }
+
+    // Everything that could be checked without stopping the legacy container
+    // has been checked. Stop it, but keep it on disk: `docker rm` happens only
+    // after the adopted release has passed both gates.
     let stopped = run.exec(&docker::stop(&legacy_name))?;
     if !stopped.success() {
         return Err(DeployError::Adopt {
@@ -1105,7 +1904,6 @@ pub fn adopt(
             reason: format!("could not stop {legacy_name}: {}", stopped.stderr_trimmed()),
         });
     }
-    run.exec(&docker::rm(&legacy_name))?;
     let seq = run.next_seq();
     run.record_step(
         StepRecord::new(
@@ -1121,15 +1919,170 @@ pub fn adopt(
         .with_detail(json!({"container": legacy_name})),
     )?;
 
-    apply_new_state(run, ctx, app, back_port)?;
-    start_live(run, app, release, back_port)?;
-
     let health_path =
         health::checked_probe_path(app_health_url(app)).map_err(DeployError::InvalidHealthPath)?;
-    health::gate_container(run, "health-wait", back_port, &health_path)?;
+
+    match adopt_cutover(run, ctx, app, release, back_port, &health_path) {
+        Ok(()) => {
+            // The new release is live and gated; removing the stopped legacy
+            // container is now cleanup, not a point of no return. A failed rm
+            // is recorded as such but does not hide a successful cutover.
+            let _ = remove_legacy(run, &legacy_name);
+            if run.mode() != RunMode::DryRun
+                && let Err(e) = journal::clear(&ctx.state_dir, &app.name)
+            {
+                tracing::warn!(app = %app.name, "could not clear pending adopt record: {e}");
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            let rollback = restart_legacy(run, &legacy_name);
+            let rollback = match rollback {
+                Ok(()) => format!(
+                    "legacy container {legacy_name} was restarted; the registry was not changed"
+                ),
+                Err(error) => format!(
+                    "could not restart legacy container {legacy_name}: {error}; the app is DOWN"
+                ),
+            };
+            Err(DeployError::Adopt {
+                app: app.name.clone(),
+                reason: format!("{failure}; {rollback}"),
+            })
+        }
+    }
+}
+
+/// Starts and gates the adopted release, then points nginx at it.
+///
+/// The order is deliberate: the container must be healthy *before* nginx is
+/// repointed, and the legacy container is still kept until the front probe has
+/// answered through the new block.
+fn adopt_cutover(
+    run: &mut Run,
+    ctx: &DeployContext,
+    app: &mut App,
+    release: &str,
+    back_port: u16,
+    health_path: &str,
+) -> Result<(), DeployError> {
+    start_live(run, app, release, back_port)?;
+    health::gate_container_with_host(
+        run,
+        "health-wait",
+        back_port,
+        health_path,
+        app.hostnames.first().map(String::as_str),
+    )?;
+    apply_new_state(run, ctx, app, back_port)?;
     probe_front(run, app)?;
     commit_release(run, ctx, app, release.to_string(), back_port)?;
     Ok(())
+}
+
+/// Best-effort restart of a stopped legacy container. Records the outcome.
+fn restart_legacy(run: &mut Run, legacy: &str) -> Result<(), String> {
+    let spec = StepSpec::new("docker-start", "docker")
+        .arg("start")
+        .arg(legacy);
+    match run.exec(&spec) {
+        Ok(outcome) if outcome.success() => {
+            record_adopt_step(
+                run,
+                "adopt-restore-legacy",
+                crate::trace::StepStatus::Ok,
+                legacy,
+                None,
+            );
+            Ok(())
+        }
+        Ok(outcome) => {
+            let error = format!(
+                "docker start exited with {}: {}",
+                outcome
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                outcome.stderr_trimmed()
+            );
+            record_adopt_step(
+                run,
+                "adopt-restore-legacy",
+                crate::trace::StepStatus::Error,
+                legacy,
+                Some(&error),
+            );
+            Err(error)
+        }
+        Err(e) => {
+            let error = e.to_string();
+            record_adopt_step(
+                run,
+                "adopt-restore-legacy",
+                crate::trace::StepStatus::Error,
+                legacy,
+                Some(&error),
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Removes the stopped legacy container once adoption has succeeded.
+fn remove_legacy(run: &mut Run, legacy: &str) -> Result<(), String> {
+    match run.exec(&docker::rm(legacy)) {
+        Ok(outcome) if outcome.success() => {
+            record_adopt_step(
+                run,
+                "remove-legacy",
+                crate::trace::StepStatus::Ok,
+                legacy,
+                None,
+            );
+            Ok(())
+        }
+        Ok(outcome) => {
+            let error = format!("docker rm: {}", outcome.stderr_trimmed());
+            record_adopt_step(
+                run,
+                "remove-legacy",
+                crate::trace::StepStatus::Error,
+                legacy,
+                Some(&error),
+            );
+            Err(error)
+        }
+        Err(e) => {
+            let error = e.to_string();
+            record_adopt_step(
+                run,
+                "remove-legacy",
+                crate::trace::StepStatus::Error,
+                legacy,
+                Some(&error),
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Records an adoption cleanup step, ignoring a trace failure on the error path
+/// (the original error is more useful than "could not write the log").
+fn record_adopt_step(
+    run: &mut Run,
+    step: &'static str,
+    status: crate::trace::StepStatus,
+    legacy: &str,
+    error: Option<&str>,
+) {
+    let seq = run.next_seq();
+    let argv = ["docker".to_string(), legacy.to_string()];
+    let mut record =
+        StepRecord::new(seq, step, status, &argv).with_detail(json!({"container": legacy}));
+    if let Some(error) = error {
+        record = record.with_error(error);
+    }
+    let _ = run.record_step(record);
 }
 
 /// The single container publishing the app's front port, or a clear refusal.
@@ -1268,6 +2221,11 @@ fn write_named_state_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::trace::TraceLog;
+
+    /// Static tests share /srv/www and one test sets a process-global failpoint.
+    static STATIC_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::registry::tests::{sample, sample_static};
 
     #[test]
@@ -1280,6 +2238,7 @@ mod tests {
                 "lock",
                 "resolve-release",
                 "pull",
+                "swap-preflight",
                 "green-start",
                 "health-wait-discover",
                 "health-wait-inspect",
@@ -1359,11 +2318,22 @@ mod tests {
     #[test]
     fn resolve_refuses_a_non_commit_release() {
         let app = sample();
-        for bad in ["main", "main; curl evil|sh", "abc", "9c1f2ab ", "latest"] {
+        for bad in [
+            "main",
+            "main; curl evil|sh",
+            "abc",
+            "abcd",
+            "9c1f2ab ",
+            "latest",
+        ] {
             let err = resolve_release(&app, Some(bad), false).unwrap_err();
             assert!(
                 matches!(err, DeployError::InvalidRelease(_)),
                 "{bad:?} must be refused, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("7-64"),
+                "the range must match the registry validator: {err}"
             );
         }
         // A recorded release is checked the same way.
@@ -1376,9 +2346,12 @@ mod tests {
     }
 
     #[test]
-    fn a_four_char_sha_is_accepted() {
+    fn a_seven_char_sha_is_accepted() {
         let app = sample();
-        assert_eq!(resolve_release(&app, Some("abcd"), false).unwrap(), "abcd");
+        assert_eq!(
+            resolve_release(&app, Some("abcd123"), false).unwrap(),
+            "abcd123"
+        );
     }
 
     #[test]
@@ -1473,5 +2446,491 @@ mod tests {
         );
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
+    }
+
+    // ---- rollback tag integrity ----
+
+    #[test]
+    fn retain_targets_the_replaced_release_not_the_rollback_release() {
+        // Forward deploy r2 -> r3: the outgoing image is r2, so the r2 tag is
+        // what a later rollback needs. Tagging it r1 (the recorded old_release)
+        // would overwrite the image a rollback is about to deploy.
+        let mut app = sample();
+        app.release = Some("aaaa111".into());
+        app.old_release = Some("bbbb222".into());
+        assert_eq!(
+            retain_plan(&app, Some("aaaa111"), "cccc333"),
+            RetainPlan::Tag {
+                release: "aaaa111".into(),
+                target: "apps-portfolio:aaaa111".into(),
+            }
+        );
+
+        // Rollback r2 -> r1: old_release *is* the target. The outgoing image is
+        // still r2 and must be tagged r2, never r1.
+        assert_eq!(
+            retain_plan(&app, Some("aaaa111"), "bbbb222"),
+            RetainPlan::Tag {
+                release: "aaaa111".into(),
+                target: "apps-portfolio:aaaa111".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn retain_skips_a_force_redeploy_of_the_live_release() {
+        let app = sample();
+        let plan = retain_plan(&app, Some("9c1f2ab"), "9c1f2ab");
+        assert!(matches!(plan, RetainPlan::Skip(_)), "{plan:?}");
+        assert!(format!("{plan:?}").contains("force redeploy"), "{plan:?}");
+    }
+
+    #[test]
+    fn retain_skips_without_a_previous_release_or_image_repo() {
+        let app = sample();
+        assert!(matches!(
+            retain_plan(&app, None, "9c1f2ab"),
+            RetainPlan::Skip(_)
+        ));
+
+        let mut no_repo = sample();
+        no_repo.image_repo = None;
+        assert!(matches!(
+            retain_plan(&no_repo, Some("9c1f2ab"), "abc1234"),
+            RetainPlan::Skip(_)
+        ));
+    }
+
+    #[test]
+    fn an_existing_tag_pointing_at_another_image_is_never_overwritten() {
+        assert_eq!(tag_decision(None, "sha256:aaa"), TagDecision::Tag);
+        assert_eq!(
+            tag_decision(Some("sha256:aaa"), "sha256:aaa"),
+            TagDecision::AlreadyTagged
+        );
+        assert_eq!(
+            tag_decision(Some("sha256:bbb"), "sha256:aaa"),
+            TagDecision::Conflict
+        );
+
+        // A conflict must become a hard error that names everything needed to
+        // reconcile provenance, and says the old container was not stopped.
+        let err = DeployError::TagConflict {
+            container: "portfolio-live".into(),
+            tag: "apps-portfolio:aaaa111".into(),
+            existing_image_id: "sha256:bbb".into(),
+            live_image_id: "sha256:aaa".into(),
+        };
+        let message = err.to_string();
+        for expected in [
+            "portfolio-live",
+            "apps-portfolio:aaaa111",
+            "sha256:bbb",
+            "sha256:aaa",
+            "left running",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?}: {message}"
+            );
+        }
+    }
+
+    // ---- swap preflight ----
+
+    #[test]
+    fn the_swap_refusal_explains_replace_or_bind_mounts() {
+        let err = DeployError::SwapUnsafe {
+            app: "app".into(),
+            reasons: "named volume \"data\"".into(),
+        };
+        let message = err.to_string();
+        assert!(message.contains("cannot swap"), "{message}");
+        assert!(message.contains("strategy = \"replace\""), "{message}");
+        assert!(message.contains("writes_state = true"), "{message}");
+        assert!(message.contains("bind mounts"), "{message}");
+    }
+
+    // ---- dry run ----
+
+    #[test]
+    fn a_dry_run_swap_reaches_registry_commit_without_a_live_container() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry_dir = dir.path().join("apps");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+
+        let mut app = sample();
+        app.live_port = None;
+        app.old_port = None;
+        app.release = None;
+        app.old_release = None;
+        app.compose_dir = dir.path().join("compose");
+        std::fs::create_dir_all(&app.compose_dir).unwrap();
+        std::fs::write(app.compose_dir.join("compose.yaml"), "services: {}\n").unwrap();
+        registry::save_app(&registry_dir, &app).unwrap();
+
+        let ctx = DeployContext {
+            registry_dir: registry_dir.clone(),
+            state_dir: dir.path().join("green"),
+            lock_dir: dir.path().join("locks"),
+            apply_paths: ApplyPaths {
+                nginx_bin: PathBuf::from("nginx"),
+                main_config: dir.path().join("nginx.conf"),
+                target: dir.path().join("front-door.conf"),
+                pid_file: None,
+            },
+            drain_secs: 1,
+            lock_timeout: Duration::from_secs(5),
+        };
+
+        let trace = dir.path().join("swapdock.jsonl");
+        let log = crate::trace::TraceLog::open(&trace).unwrap();
+        let mut run = Run::start(
+            log,
+            RunMode::DryRun,
+            Some(app.name.clone()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+
+        run_swap(&mut run, &ctx, &mut app, "abc1234")
+            .expect("a dry-run must not fail at the health gate");
+        run.finish(crate::trace::RunStatus::DryRun).unwrap();
+
+        // The commit is recorded as a plan, not applied.
+        assert_eq!(app.release.as_deref(), Some("abc1234"));
+        assert_eq!(app.live_port, Some(9000), "slot 0 starts on 9000");
+        let read = crate::trace::TraceLog::read(&trace).unwrap();
+        let steps: Vec<(&str, crate::trace::StepStatus)> = read
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                crate::trace::TraceEvent::Step { step, status, .. } => {
+                    Some((step.as_str(), *status))
+                }
+                _ => None,
+            })
+            .collect();
+        let commit = steps
+            .iter()
+            .find(|(step, _)| *step == "registry-commit")
+            .expect("dry-run must reach registry-commit");
+        assert_eq!(commit.1, crate::trace::StepStatus::DryRun, "{steps:?}");
+        assert!(
+            steps.iter().all(|(_, status)| !status.is_failure()),
+            "no dry-run step may be logged as a failure: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|(step, _)| *step == "swap-preflight"),
+            "the swap preflight must be visible in the plan: {steps:?}"
+        );
+
+        // Nothing was written and no lock file was created.
+        assert!(!ctx.apply_paths.target.exists(), "no nginx file in dry-run");
+        assert!(!ctx.state_dir.exists(), "no green override in dry-run");
+        assert!(!ctx.lock_dir.exists(), "no lock files in dry-run");
+    }
+
+    #[test]
+    fn a_crash_after_a_static_flip_is_reconciled_from_the_journal() {
+        let _serial = STATIC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_parent = std::path::Path::new("/srv/www");
+        if std::fs::create_dir_all(root_parent).is_err() {
+            eprintln!("SKIP a_crash_after_static_flip: /srv/www is not writable");
+            return;
+        }
+        let dir = tempfile::TempDir::new_in(root_parent).unwrap();
+        let registry_dir = dir.path().join("apps");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let root = dir.path().join("www/docs/current");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        let release_dir = root.parent().unwrap().join("releases/abc1234");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("index.html"), "ok").unwrap();
+
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+
+        let mut app = sample_static();
+        app.root = Some(root.display().to_string());
+        app.hostnames = vec!["docs.test".into()];
+        app.front_port = port;
+        app.release = None;
+        app.old_release = None;
+        app.live_port = None;
+        app.old_port = None;
+        registry::save_app(&registry_dir, &app).unwrap();
+
+        let nginx = dir.path().join("fake-nginx");
+        std::fs::write(
+            &nginx,
+            "#!/bin/sh\ncase \"$1\" in -t|-s) exit 0;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nginx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let main_config = dir.path().join("nginx.conf");
+        std::fs::write(&main_config, "events {}\nhttp {}\n").unwrap();
+        let ctx = DeployContext {
+            registry_dir: registry_dir.clone(),
+            state_dir: dir.path().join("green"),
+            lock_dir: dir.path().join("locks"),
+            apply_paths: ApplyPaths {
+                nginx_bin: nginx,
+                main_config,
+                target: dir.path().join("front-door.conf"),
+                pid_file: None,
+            },
+            drain_secs: 0,
+            lock_timeout: Duration::from_secs(5),
+        };
+        let trace = dir.path().join("swapdock.jsonl");
+        let mut run = Run::start(
+            TraceLog::open(&trace).unwrap(),
+            RunMode::Live,
+            Some(app.name.clone()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+        // The process "dies" here: the symlink and journal are already on disk.
+        crate::test_env::set_var("SWAPDOCK_FAILPOINT", "static-flipped");
+        let result = run_static(&mut run, &ctx, &mut app, "abc1234");
+        crate::test_env::remove_var("SWAPDOCK_FAILPOINT");
+        let _ = run.finish(crate::trace::RunStatus::Failed);
+        assert!(result.is_err(), "failpoint must abort the deploy");
+        assert_eq!(
+            journal::read(&ctx.state_dir, "docs")
+                .unwrap()
+                .map(|p| p.release),
+            Some("abc1234".into()),
+            "the crash must leave a pending journal"
+        );
+        assert_eq!(
+            std::fs::read_link(&root).unwrap(),
+            std::path::Path::new("releases/abc1234"),
+            "the flip happened before the crash"
+        );
+
+        let mut run = Run::start(
+            TraceLog::open(&trace).unwrap(),
+            RunMode::Live,
+            Some(app.name.clone()),
+            &["swapdock".to_string(), "reconcile".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+        let outcome = crate::reconcile::reconcile(&mut run, &ctx, &mut app).unwrap();
+        let _ = run.finish(crate::trace::RunStatus::Ok);
+        assert!(matches!(
+            outcome,
+            crate::reconcile::Outcome::Committed { .. }
+        ));
+        assert_eq!(app.release.as_deref(), Some("abc1234"));
+        assert!(journal::read(&ctx.state_dir, "docs").unwrap().is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_live_static_deploy_flips_the_symlink_and_commits() {
+        let _serial = STATIC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        // `/tmp` is deliberately rejected as a static root and this harness only
+        // writes under the workspace. CI creates the real allowed root; local
+        // unprivileged runs skip the test rather than weakening the validator.
+        let root_parent = std::path::Path::new("/srv/www");
+        if std::fs::create_dir_all(root_parent).is_err() {
+            eprintln!("SKIP a_live_static_deploy: /srv/www is not writable");
+            return;
+        }
+        let dir = match tempfile::TempDir::new_in(root_parent) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("SKIP a_live_static_deploy: {e}");
+                return;
+            }
+        };
+        let registry_dir = dir.path().join("apps");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+
+        let root = dir.path().join("www/docs/current");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        // The release directory is produced by the build step; create it here
+        // so this test exercises the symlink flip, not a missing-artifact error.
+        let release_dir = root.parent().unwrap().join("releases/abc1234");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("index.html"), "ok").unwrap();
+
+        // Find a free loopback port, then serve the static front door there.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+
+        let mut app = sample_static();
+        app.root = Some(root.display().to_string());
+        app.hostnames = vec!["docs.test".into()];
+        app.front_port = port;
+        app.release = None;
+        app.old_release = None;
+        app.live_port = None;
+        app.old_port = None;
+        registry::save_app(&registry_dir, &app).unwrap();
+
+        let nginx = dir.path().join("fake-nginx");
+        std::fs::write(
+            &nginx,
+            "#!/bin/sh\ncase \"$1\" in -t|-s) exit 0;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nginx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let main_config = dir.path().join("nginx.conf");
+        std::fs::write(&main_config, "events {}\nhttp {}\n").unwrap();
+
+        let ctx = DeployContext {
+            registry_dir: registry_dir.clone(),
+            state_dir: dir.path().join("green"),
+            lock_dir: dir.path().join("locks"),
+            apply_paths: ApplyPaths {
+                nginx_bin: nginx,
+                main_config,
+                target: dir.path().join("front-door.conf"),
+                pid_file: None,
+            },
+            drain_secs: 0,
+            lock_timeout: Duration::from_secs(5),
+        };
+        let trace = dir.path().join("swapdock.jsonl");
+        let mut run = Run::start(
+            crate::trace::TraceLog::open(&trace).unwrap(),
+            RunMode::Live,
+            Some(app.name.clone()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+
+        run_static(&mut run, &ctx, &mut app, "abc1234").expect("static deploy");
+        run.finish(crate::trace::RunStatus::Ok).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(app.release.as_deref(), Some("abc1234"));
+        assert_eq!(app.live_port, Some(port));
+        let target = std::fs::read_link(&root).unwrap();
+        assert!(target.ends_with("releases/abc1234"), "{target:?}");
+        let saved = crate::registry::load_dir(&registry_dir).unwrap();
+        let saved = saved
+            .apps
+            .iter()
+            .find(|candidate| candidate.name == "docs")
+            .unwrap();
+        assert_eq!(saved.release.as_deref(), Some("abc1234"));
+        let rendered = std::fs::read_to_string(&ctx.apply_paths.target).unwrap();
+        assert!(
+            rendered.contains(&format!("root {};", root.display())),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_static_deploy_reaches_registry_commit() {
+        // Same `/srv/www` root and same failpoint window as the other static
+        // tests: it must not run while one of those is armed.
+        let _serial = STATIC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry_dir = dir.path().join("apps");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+
+        let mut app = sample_static();
+        app.root = Some("/srv/www/docs/current".into());
+        app.release = None;
+        app.old_release = None;
+        app.live_port = None;
+        app.old_port = None;
+        registry::save_app(&registry_dir, &app).unwrap();
+
+        let ctx = DeployContext {
+            registry_dir: registry_dir.clone(),
+            state_dir: dir.path().join("green"),
+            lock_dir: dir.path().join("locks"),
+            apply_paths: ApplyPaths {
+                nginx_bin: PathBuf::from("nginx"),
+                main_config: dir.path().join("nginx.conf"),
+                target: dir.path().join("front-door.conf"),
+                pid_file: None,
+            },
+            drain_secs: 0,
+            lock_timeout: Duration::from_secs(5),
+        };
+
+        let trace = dir.path().join("swapdock.jsonl");
+        let mut run = Run::start(
+            crate::trace::TraceLog::open(&trace).unwrap(),
+            RunMode::DryRun,
+            Some(app.name.clone()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+
+        run_static(&mut run, &ctx, &mut app, "abc1234")
+            .expect("static dry-run must not touch the symlink");
+        run.finish(crate::trace::RunStatus::DryRun).unwrap();
+
+        assert_eq!(app.release.as_deref(), Some("abc1234"));
+        assert_eq!(app.live_port, Some(app.front_port));
+        let read = crate::trace::TraceLog::read(&trace).unwrap();
+        let steps: Vec<(&str, crate::trace::StepStatus)> = read
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::trace::TraceEvent::Step { step, status, .. } => {
+                    Some((step.as_str(), *status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            steps.iter().any(|(step, status)| *step == "static-flip"
+                && *status == crate::trace::StepStatus::DryRun),
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().any(|(step, status)| *step == "registry-commit"
+                && *status == crate::trace::StepStatus::DryRun),
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().all(|(_, status)| !status.is_failure()),
+            "{steps:?}"
+        );
+        assert!(!ctx.apply_paths.target.exists());
     }
 }

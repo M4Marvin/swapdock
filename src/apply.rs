@@ -29,9 +29,9 @@
 //! because those do not go through the chokepoint.
 
 use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -79,13 +79,19 @@ impl Default for ApplyPaths {
 impl ApplyPaths {
     /// Where the new config is staged. Same directory as the target, so the
     /// rename stays on one filesystem and stays atomic.
+    ///
+    /// The suffix carries the pid and a process-wide counter: two applies in one
+    /// process (a CLI run and an API job, or two API jobs) must never stage into
+    /// the same file, or one can delete or rename the other's draft.
     fn staging(&self) -> PathBuf {
+        static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut name = self
             .target
             .file_name()
             .map(|s| s.to_os_string())
             .unwrap_or_default();
-        name.push(format!(".staging.{}", std::process::id()));
+        name.push(format!(".staging.{}.{}", std::process::id(), n));
         self.target.with_file_name(name)
     }
 
@@ -102,7 +108,7 @@ impl ApplyPaths {
 }
 
 /// What applying did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApplyOutcome {
     /// True when the reload signal was accepted and the master is unchanged.
     pub reloaded: bool,
@@ -112,8 +118,9 @@ pub struct ApplyOutcome {
     pub backup: Option<PathBuf>,
 }
 
-/// Why applying failed. Every variant leaves the target file in a known state,
-// see the docs on each one.
+/// Why applying failed. Every variant leaves the target file in a known state;
+/// see the docs on each one.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ApplyError {
     #[error(
@@ -142,6 +149,9 @@ pub enum ApplyError {
 
     #[error("could not write to the run log: {0}")]
     Trace(#[from] anyhow::Error),
+
+    #[error("privileged broker: {0}")]
+    Broker(String),
 }
 
 /// Makes every path absolute against the working directory.
@@ -184,6 +194,22 @@ pub fn apply(
     config_text: &str,
     paths: &ApplyPaths,
 ) -> Result<ApplyOutcome, ApplyError> {
+    if run.mode() != RunMode::DryRun
+        && let Ok(socket) = std::env::var(crate::broker::SOCKET_ENV)
+        && !socket.trim().is_empty()
+    {
+        return crate::broker::apply_via_broker(run, config_text, Path::new(socket.trim()));
+    }
+    apply_local(run, config_text, paths)
+}
+
+/// The real local apply. The broker calls this as root; the API reaches it only
+/// when no broker socket is configured.
+pub(crate) fn apply_local(
+    run: &mut Run,
+    config_text: &str,
+    paths: &ApplyPaths,
+) -> Result<ApplyOutcome, ApplyError> {
     // nginx resolves a relative `-c` against its compiled prefix, not the
     // working directory, so a relative main config would silently test the wrong
     // file. Absolutize everything up front; the log then shows exact paths too.
@@ -222,6 +248,9 @@ pub fn apply(
     //    never a mix.
     fs::rename(&staging, &paths.target)
         .map_err(|e| io_error(&format!("rename {} into place", staging.display()), e))?;
+    // Sync the directory entry after the rename. Without this the rename (the
+    // commit point) can be lost on power failure while nginx already reloaded.
+    sync_parent_dir(&paths.target)?;
     record_fs(
         run,
         "apply-commit",
@@ -235,7 +264,7 @@ pub fn apply(
 
     // 4. Test the real full config, which now includes the new file.
     if let Err(stderr_tail) = test_config(run, &paths) {
-        restore(run, &paths, had_target, &backup)?;
+        restore(run, &paths, &staging, had_target, &backup)?;
         // Prove the restore, because "restored" without a passing test is a claim.
         test_config(run, &paths).map_err(|tail| {
             ApplyError::Io(format!(
@@ -249,7 +278,7 @@ pub fn apply(
     reload(run, &paths).map_err(|detail| {
         // Best effort: make disk and running agree again. If the restore itself
         // fails there is nothing more this function can do, so report the reload.
-        let _ = restore(run, &paths, had_target, &backup);
+        let _ = restore(run, &paths, &staging, had_target, &backup);
         let _ = test_config(run, &paths);
         ApplyError::ReloadFailed { detail }
     })?;
@@ -309,6 +338,8 @@ fn apply_dry(
 
 /// Writes the staging file with an fsync of both file and directory.
 fn write_staging(run: &mut Run, staging: &Path, config_text: &str) -> Result<(), ApplyError> {
+    use std::io::Write;
+
     if let Some(parent) = staging.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -387,11 +418,28 @@ fn reload(run: &mut Run, paths: &ApplyPaths) -> Result<(), String> {
     }
 }
 
+/// Flushes a directory entry so the rename/removal survives a power loss.
+fn sync_parent_dir(path: &Path) -> Result<(), ApplyError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(parent)
+        .map_err(|e| io_error(&format!("open {} for sync", parent.display()), e))?;
+    dir.sync_all()
+        .map_err(|e| io_error(&format!("sync {}", parent.display()), e))?;
+    Ok(())
+}
+
 /// Puts the previous file back: rename the backup over the target, or remove
-/// the target if there was no previous file. Removes a leftover staging file.
+/// the target if there was no previous file. Removes the staging file this run
+/// created.
 fn restore(
     run: &mut Run,
     paths: &ApplyPaths,
+    staging: &Path,
     had_target: bool,
     backup: &Path,
 ) -> Result<(), ApplyError> {
@@ -402,6 +450,7 @@ fn restore(
                 e,
             )
         })?;
+        sync_parent_dir(&paths.target)?;
         record_fs(
             run,
             "apply-restore",
@@ -415,6 +464,7 @@ fn restore(
     } else {
         fs::remove_file(&paths.target)
             .map_err(|e| io_error(&format!("remove untested {}", paths.target.display()), e))?;
+        sync_parent_dir(&paths.target)?;
         record_fs(
             run,
             "apply-restore",
@@ -423,9 +473,8 @@ fn restore(
         )?;
     }
 
-    let staging = paths.staging();
     if staging.exists() {
-        let _ = fs::remove_file(&staging);
+        let _ = fs::remove_file(staging);
     }
     Ok(())
 }
@@ -530,14 +579,12 @@ exit 2
     /// Process-global lock for the fake's environment variables.
     ///
     /// `NGINX_JOURNAL` and friends are inherited by children, so they are
-    /// process-global by nature. Tests run on threads, so every test that uses
-    /// a `Harness` must hold this for its whole body, or one test's fake writes
-    /// into another test's journal. A poisoned lock is recovered rather than
-    /// propagated: a panicking test must not fail the rest of the suite.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// process-global by nature. Every test that uses a `Harness` holds this
+    /// for its whole body, or one test's fake writes into another test's
+    /// journal. The writes themselves are serialized against spawns by
+    /// `test_env`.
     fn hold_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_env::own()
     }
 
     struct Harness {
@@ -546,7 +593,7 @@ exit 2
         journal: PathBuf,
         /// Environment to prepend for the fake. Set per-test via `env`.
         extra_env: Vec<(String, String)>,
-        /// Holds `ENV_LOCK` until the test ends, including `Drop` cleanup.
+        /// Holds the environment owned by this test, including `Drop` cleanup.
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -602,14 +649,13 @@ exit 2
             }
             // The fake reads its behaviour from the process environment.
             for (k, v) in &self.extra_env {
-                // SAFETY: tests are single-threaded here; no other thread reads env.
-                unsafe { std::env::set_var(k, v) };
+                crate::test_env::set_var(k, v);
             }
-            // SAFETY: same as above.
-            unsafe {
-                std::env::set_var("NGINX_JOURNAL", &self.journal);
-                std::env::set_var("NGINX_PID_FILE", self.paths.pid_file.as_ref().unwrap());
-            }
+            crate::test_env::set_var("NGINX_JOURNAL", &self.journal);
+            crate::test_env::set_var(
+                "NGINX_PID_FILE",
+                self.paths.pid_file.as_ref().expect("test pid file"),
+            );
             run
         }
 
@@ -636,14 +682,27 @@ exit 2
                 "NGINX_FAIL_RELOAD",
                 "NGINX_NEW_PID",
             ] {
-                // SAFETY: test-only cleanup; no other thread depends on these.
-                unsafe { std::env::remove_var(key) };
+                crate::test_env::remove_var(key);
             }
         }
     }
 
     const NEW: &str = "# new config\nserver { listen 8001; }\n";
     const OLD: &str = "# old config\nserver { listen 8001; }\n";
+
+    /// Leftover staging files in `dir`, whatever pid/counter suffix they carry.
+    fn staging_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".staging."))
+            })
+            .collect()
+    }
 
     #[test]
     fn happy_path_writes_tests_and_reloads() {
@@ -699,7 +758,11 @@ exit 2
         );
 
         assert_eq!(h.target_text().as_deref(), Some(OLD), "restored");
-        assert!(!h.paths.staging().exists(), "no staging file left behind");
+        assert!(
+            staging_files(h.dir.path()).is_empty(),
+            "no staging file left behind: {:?}",
+            staging_files(h.dir.path())
+        );
         let journal = h.journal_lines();
         assert_eq!(
             journal.len(),
@@ -796,7 +859,10 @@ exit 2
 
         assert!(!outcome.reloaded);
         assert_eq!(h.target_text().as_deref(), Some(OLD), "untouched");
-        assert!(!h.paths.staging().exists(), "no staging file");
+        assert!(
+            staging_files(h.dir.path()).is_empty(),
+            "no staging file was written"
+        );
         assert!(!h.dir.path().join("journal").exists(), "nginx never ran");
 
         let read = TraceLog::read(h.dir.path().join("swapdock.jsonl")).unwrap();
@@ -890,19 +956,46 @@ exit 2
             target: PathBuf::from("/etc/nginx/conf.d/front-door.conf"),
             ..ApplyPaths::default()
         };
-        assert_eq!(
-            paths.staging(),
-            PathBuf::from(
-                "/etc/nginx/conf.d/front-door.conf.staging.".to_string()
-                    + &std::process::id().to_string()
-            )
+        let staging = paths.staging();
+        let prefix = format!(
+            "/etc/nginx/conf.d/front-door.conf.staging.{}.",
+            std::process::id()
+        );
+        assert!(
+            staging.display().to_string().starts_with(&prefix),
+            "unexpected staging path: {staging:?}"
         );
         assert_eq!(
             paths.backup(),
             PathBuf::from("/etc/nginx/conf.d/front-door.conf.bak")
         );
         // Same directory, so the rename never crosses a filesystem.
-        assert_eq!(paths.staging().parent(), paths.target.parent());
+        assert_eq!(staging.parent(), paths.target.parent());
+    }
+
+    #[test]
+    fn staging_paths_are_unique_per_call() {
+        // Two applies in one process (CLI + API, or two API jobs) must not share
+        // a staging file, or one can remove the other's half-written config.
+        let paths = ApplyPaths {
+            target: PathBuf::from("/etc/nginx/conf.d/front-door.conf"),
+            ..ApplyPaths::default()
+        };
+        let first = paths.staging();
+        let second = paths.staging();
+        assert_ne!(first, second, "staging names must not be shared");
+        assert_eq!(first.parent(), second.parent());
+        assert_ne!(paths.staging(), paths.staging());
+    }
+
+    #[test]
+    fn sync_parent_dir_flushes_a_real_directory() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("front-door.conf");
+        std::fs::write(&file, NEW).unwrap();
+        sync_parent_dir(&file).unwrap();
+        // A path with no parent component is a no-op rather than an error.
+        sync_parent_dir(Path::new("front-door.conf")).unwrap();
     }
 
     #[test]

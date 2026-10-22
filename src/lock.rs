@@ -94,6 +94,16 @@ pub fn app_lock_name(app: &str) -> String {
     format!("swapdock-{app}")
 }
 
+/// Lock file name for the whole estate.
+///
+/// One deploy holds this from the registry read through the registry commit, so
+/// two deploys of different apps cannot render each other's pre-commit ports.
+/// It is always taken before the app lock; the app lock before the nginx lock.
+/// No path takes them in another order, so the three cannot deadlock.
+pub fn estate_lock_name() -> &'static str {
+    "swapdock-estate"
+}
+
 /// Lock file name for the nginx critical section.
 pub fn nginx_lock_name() -> &'static str {
     "swapdock-nginx"
@@ -176,6 +186,27 @@ mod tests {
     #[test]
     fn lock_names_follow_the_convention() {
         assert_eq!(app_lock_name("portfolio"), "swapdock-portfolio");
+        assert_eq!(estate_lock_name(), "swapdock-estate");
         assert_eq!(nginx_lock_name(), "swapdock-nginx");
+    }
+
+    #[test]
+    fn the_estate_lock_is_global_while_app_locks_stay_per_app() {
+        // The order the deploy path uses: estate, then app, then nginx.
+        let dir = TempDir::new().unwrap();
+        let _estate =
+            Lock::acquire(dir.path(), estate_lock_name(), Duration::from_secs(5)).unwrap();
+        let _a = Lock::acquire(dir.path(), &app_lock_name("a"), Duration::from_secs(5)).unwrap();
+        let _b = Lock::acquire(dir.path(), &app_lock_name("b"), Duration::from_secs(5)).unwrap();
+
+        // A second estate holder must wait, even though its app name is new:
+        // this is what serializes different apps.
+        let err =
+            Lock::acquire(dir.path(), estate_lock_name(), Duration::from_millis(200)).unwrap_err();
+        assert!(matches!(err, LockError::Timeout { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("swapdock-estate.lock"),
+            "the error must name the estate lock: {err}"
+        );
     }
 }

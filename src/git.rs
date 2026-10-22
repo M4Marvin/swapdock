@@ -46,6 +46,29 @@ pub fn merge_ff_only(dir: &Path, branch: &str) -> StepSpec {
         .args(["merge", "--ff-only", &format!("origin/{branch}")])
 }
 
+/// Counts commits in `range` (for example `live..origin/main`).
+///
+/// Read-only: it never fetches. A count is only meaningful against the refs the
+/// checkout already knows, which is why the UI labels the source as
+/// "last fetched" when it is not freshly updated.
+pub fn rev_list_count(dir: &Path, range: &str) -> StepSpec {
+    StepSpec::new("git-rev-list-count", "git")
+        .arg("-C")
+        .arg(dir.display().to_string())
+        .args(["rev-list", "--count", range])
+}
+
+/// Reads one commit's subject and committer time.
+///
+/// Format is NUL-separated so a subject containing spaces, pipes or newlines
+/// cannot be mis-split: `<subject>\0<committed-at>`.
+pub fn log_one(dir: &Path, rev: &str) -> StepSpec {
+    StepSpec::new("git-log-one", "git")
+        .arg("-C")
+        .arg(dir.display().to_string())
+        .args(["log", "-1", "--format=%s%x00%cI", rev])
+}
+
 /// Lists uncommitted changes, empty when clean.
 pub fn status_porcelain(dir: &Path) -> StepSpec {
     StepSpec::new("git-status", "git")
@@ -134,6 +157,33 @@ mod tests {
                 "https://github.com/ExampleOrg/main-site.git",
                 "/srv/src/main-site"
             ]
+        );
+    }
+
+    #[test]
+    fn rev_list_counts_a_range() {
+        let argv = rev_list_count(&dir(), "f437c8a..origin/main").full_argv();
+        assert!(
+            argv.ends_with(&[
+                "rev-list".to_string(),
+                "--count".to_string(),
+                "f437c8a..origin/main".to_string()
+            ]),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn log_one_reads_subject_and_time() {
+        let argv = log_one(&dir(), "origin/main").full_argv();
+        assert!(
+            argv.ends_with(&[
+                "log".to_string(),
+                "-1".to_string(),
+                "--format=%s%x00%cI".to_string(),
+                "origin/main".to_string()
+            ]),
+            "{argv:?}"
         );
     }
 

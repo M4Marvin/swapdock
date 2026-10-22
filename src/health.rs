@@ -43,6 +43,7 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 pub const PROBE_ATTEMPTS: u32 = 30;
 
 /// Why a gate did not open.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum HealthError {
     #[error("no container publishes port {port}; nothing to gate on")]
@@ -79,16 +80,81 @@ pub enum HealthError {
 
 /// Waits for the container publishing `port` to report healthy, then probes
 /// `path` on that port. Returns the container name that was gated.
+///
+/// The Host header sent to the candidate is `127.0.0.1`. Apps whose framework
+/// rejects a foreign Host (Django's `ALLOWED_HOSTS`, Rails' host checks) need
+/// [`gate_container_with_host`] so a healthy release is not failed for the wrong
+/// reason.
 pub fn gate_container(
     run: &mut Run,
     step_prefix: &str,
     port: u16,
     path: &str,
 ) -> Result<String, HealthError> {
+    gate_container_with_host(run, step_prefix, port, path, None)
+}
+
+/// [`gate_container`] with an explicit `Host` header for the candidate probe.
+///
+/// The socket still goes to `127.0.0.1:<port>`; only the header changes. `None`
+/// keeps the `Host: 127.0.0.1` fallback.
+pub fn gate_container_with_host(
+    run: &mut Run,
+    step_prefix: &str,
+    port: u16,
+    path: &str,
+    host_header: Option<&str>,
+) -> Result<String, HealthError> {
+    if run.mode() == crate::trace::RunMode::DryRun {
+        return record_dry_run_gate(run, step_prefix, port, path, host_header);
+    }
     let container = discover(run, step_prefix, port)?;
     wait_healthy(run, step_prefix, &container)?;
-    probe(run, step_prefix, port, path)?;
+    probe(run, step_prefix, port, path, host_header)?;
     Ok(container)
+}
+
+/// Records the four gate phases without probing or spawning anything.
+///
+/// A dry run has no container and no listener, so the real gate would fail at
+/// `docker ps` with "nothing to gate on". The plan is still worth showing:
+/// these are the exact steps a live run would take.
+fn record_dry_run_gate(
+    run: &mut Run,
+    step_prefix: &str,
+    port: u16,
+    path: &str,
+    host_header: Option<&str>,
+) -> Result<String, HealthError> {
+    let names = [
+        discover_step_name(step_prefix),
+        "health-wait-inspect",
+        "health-wait-healthy",
+        probe_step_name(step_prefix),
+    ];
+    for name in names {
+        let seq = run.next_seq();
+        run.record_step(
+            crate::trace::StepRecord::new(seq, name, crate::trace::StepStatus::DryRun, &[])
+                .with_detail(json!({
+                    "dry_run": true,
+                    "port": port,
+                    "path": path,
+                    "host": host_header,
+                })),
+        )
+        .map_err(|e| HealthError::Exec(ExecError::Trace(e)))?;
+    }
+    Ok(format!("<dry-run>:{port}"))
+}
+
+/// Step name for the container-discovery phase of a gate.
+fn discover_step_name(step_prefix: &str) -> &'static str {
+    match step_prefix {
+        "health-wait" => "health-wait-discover",
+        "probe-front" => "probe-front-discover",
+        _ => "docker-ps",
+    }
 }
 
 /// Finds the one container publishing `port`.
@@ -97,11 +163,7 @@ pub fn gate_container(
 /// the green gate and any later use without the log going ambiguous.
 fn discover(run: &mut Run, step_prefix: &str, port: u16) -> Result<String, HealthError> {
     let mut spec = docker::ps_publishing(port);
-    spec.name = match step_prefix {
-        "health-wait" => "health-wait-discover",
-        "probe-front" => "probe-front-discover",
-        _ => spec.name,
-    };
+    spec.name = discover_step_name(step_prefix);
     let outcome = run.exec(&spec)?;
     let mut names: Vec<String> = outcome
         .stdout
@@ -185,8 +247,18 @@ fn wait_healthy(run: &mut Run, step_prefix: &str, container: &str) -> Result<(),
 }
 
 /// GETs `path` on `port` until it returns 2xx.
-fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), HealthError> {
+///
+/// `host_header` is what the candidate sees in the `Host` header; the connection
+/// always goes to `127.0.0.1`. `None` sends `127.0.0.1`, the old behaviour.
+fn probe(
+    run: &mut Run,
+    step_prefix: &str,
+    port: u16,
+    path: &str,
+    host_header: Option<&str>,
+) -> Result<(), HealthError> {
     let url = format!("http://127.0.0.1:{port}{path}");
+    let header = host_header.unwrap_or("127.0.0.1");
     // Intentional initial value, shown if no poll ever completes: the assignment
     // is dead by construction (every use follows an assignment in the same
     // iteration), but spelling it out beats `#[allow]`.
@@ -194,7 +266,7 @@ fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), 
     let mut last = String::from("<no poll completed>");
 
     for attempt in 1..=PROBE_ATTEMPTS {
-        match http_status("127.0.0.1", port, path) {
+        match http_status_with_host("127.0.0.1", port, path, header) {
             Ok(code) if (200..300).contains(&code) => {
                 let seq = run.next_seq();
                 run.record_step(
@@ -208,6 +280,7 @@ fn probe(run: &mut Run, step_prefix: &str, port: u16, path: &str) -> Result<(), 
                         "url": url,
                         "status": code,
                         "attempt": attempt,
+                        "host": header,
                     })),
                 )
                 .map_err(|e| HealthError::Exec(ExecError::Trace(e)))?;
@@ -264,6 +337,11 @@ pub fn http_status_with_host(
     if !is_safe_probe_path(path) {
         return Err(format!(
             "refusing unsafe health path {path:?}: CR, LF, space or control character"
+        ));
+    }
+    if !is_safe_host_header(host_header) {
+        return Err(format!(
+            "refusing unsafe Host header {host_header:?}: empty, CR, LF, space or control character"
         ));
     }
     let host = dial;
@@ -349,6 +427,14 @@ pub fn is_safe_probe_path(path: &str) -> bool {
             .any(|c| c == '\r' || c == '\n' || c == ' ' || c.is_control())
 }
 
+/// True when `host` is safe to place in a `Host:` header.
+fn is_safe_host_header(host: &str) -> bool {
+    !host.is_empty()
+        && !host
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == ' ' || c.is_control())
+}
+
 /// [`probe_path`] with the header-injection check applied.
 ///
 /// The API uses this so a hostile `health_url` becomes a 409 rather than a
@@ -367,6 +453,7 @@ pub fn checked_probe_path(health_url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::{RunMode, RunStatus, StepStatus, TraceEvent, TraceLog};
     use std::net::TcpListener;
 
     // ---- pure helpers ----
@@ -476,6 +563,89 @@ mod tests {
         let raw = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
         assert!(raw.starts_with("GET /api/healthz HTTP/1.0\r\n"), "{raw:?}");
         assert!(raw.contains("Host: 127.0.0.1\r\n"), "{raw:?}");
+    }
+
+    #[test]
+    fn http_status_with_host_dials_loopback_but_sends_the_app_hostname() {
+        // The candidate is reachable on 127.0.0.1:<back port>, but frameworks
+        // like Django/Rails reject a Host that is not in their allowlist.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            *seen2.lock().unwrap() = buf[..n].to_vec();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+        });
+
+        assert_eq!(
+            http_status_with_host("127.0.0.1", port, "/up", "app.example.com"),
+            Ok(200)
+        );
+        let raw = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+        assert!(raw.starts_with("GET /up HTTP/1.0\r\n"), "{raw:?}");
+        assert!(raw.contains("Host: app.example.com\r\n"), "{raw:?}");
+        assert!(
+            !raw.contains("Host: 127.0.0.1"),
+            "the app hostname replaces the fallback: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn http_status_refuses_an_unsafe_host_header() {
+        // Host header injection is the same class as path injection: refuse it
+        // before a byte reaches the socket (port 1 is never bound).
+        let err =
+            http_status_with_host("127.0.0.1", 1, "/", "app.example.com\r\nX-Evil: 1").unwrap_err();
+        assert!(err.contains("unsafe Host header"), "{err}");
+        assert!(http_status_with_host("127.0.0.1", 1, "/", "").is_err());
+    }
+
+    #[test]
+    fn a_dry_run_gate_records_the_plan_without_dialing_or_spawning() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = TraceLog::open(dir.path().join("swapdock.jsonl")).unwrap();
+        let mut run = Run::start(
+            log,
+            RunMode::DryRun,
+            Some("test".into()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+
+        // Port 1 is not bound and docker is never invoked: the dry-run gate
+        // returns before both the probe and the process spawn.
+        let container = gate_container(&mut run, "health-wait", 1, "/up").unwrap();
+        assert!(container.contains('1'), "{container}");
+        run.finish(RunStatus::DryRun).unwrap();
+
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
+        let steps: Vec<(&str, StepStatus)> = read
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Step { step, status, .. } if step.starts_with("health-wait") => {
+                    Some((step.as_str(), *status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                ("health-wait-discover", StepStatus::DryRun),
+                ("health-wait-inspect", StepStatus::DryRun),
+                ("health-wait-healthy", StepStatus::DryRun),
+                ("health-wait-probe", StepStatus::DryRun),
+            ],
+            "{steps:?}"
+        );
     }
 
     #[test]

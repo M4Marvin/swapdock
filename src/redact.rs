@@ -33,6 +33,7 @@ pub struct Redactor {
 /// `Debug` is written by hand rather than derived: a derived `Debug` would print
 /// the secret value, and `Redactor` is `#[derive(Debug)]`. A log line or a test
 /// failure containing `{:?}` of a redactor must never leak a credential.
+#[derive(Clone)]
 struct LiteralSecret {
     value: String,
     /// Short non-reversible tag, so log lines stay distinguishable.
@@ -47,15 +48,6 @@ impl std::fmt::Debug for LiteralSecret {
             self.value.len(),
             self.fingerprint
         )
-    }
-}
-
-impl Clone for LiteralSecret {
-    fn clone(&self) -> Self {
-        Self {
-            value: self.value.clone(),
-            fingerprint: self.fingerprint.clone(),
-        }
     }
 }
 
@@ -178,6 +170,26 @@ impl Redactor {
         out = mask_jwt(&out);
         out = mask_aws(&out);
         mask_bearer(&out)
+    }
+
+    /// Masks every string inside a structured step `detail`.
+    ///
+    /// `detail` is free-form JSON written by handlers (probe URLs, backup
+    /// commands, image references). It must not be a side channel around the
+    /// redaction applied to argv and output.
+    pub fn json(&self, value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => serde_json::Value::String(self.text(text)),
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(|v| self.json(v)).collect())
+            }
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), self.json(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
 
     fn mask_literals(&self, haystack: &str) -> String {
@@ -541,6 +553,22 @@ mod tests {
         assert!(masked[0].1.starts_with("[REDACTED:"), "{:?}", masked);
         assert!(!masked[0].1.contains("realsecret"), "{:?}", masked);
         assert_eq!(masked[1].1, "9004", "safe values pass through: {masked:?}");
+    }
+
+    #[test]
+    fn masks_strings_inside_step_detail() {
+        let r = Redactor::new();
+        let detail = serde_json::json!({
+            "url": "https://example.com/?token=ghp_abcdefghijklmnop1234",
+            "nested": ["Bearer aaaaaaaaaa.bbbbbbbbbb.cccccccccc", {"safe": "plain"}],
+            "count": 2
+        });
+        let masked = r.json(&detail);
+        let text = masked.to_string();
+        assert!(!text.contains("ghp_abcdefghijklmnop1234"), "{text}");
+        assert!(!text.contains("aaaaaaaaaa.bbbbbbbbbb.cccccccccc"), "{text}");
+        assert!(text.contains("\"count\":2"), "{text}");
+        assert!(text.contains("\"safe\":\"plain\""), "{text}");
     }
 
     #[test]

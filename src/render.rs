@@ -163,11 +163,8 @@ fn render_app(out: &mut String, app: &App) {
 
     for addr in app.listen_addrs() {
         out.push_str(INDENT);
-        out.push_str("listen ");
-        out.push_str(&addr);
-        out.push(':');
-        out.push_str(&app.front_port.to_string());
-        out.push_str(";\n");
+        out.push_str(&listen_directive(&addr, app.front_port));
+        out.push('\n');
     }
 
     out.push_str(INDENT);
@@ -181,6 +178,12 @@ fn render_app(out: &mut String, app: &App) {
     }
 
     out.push('\n');
+    out.push_str(INDENT);
+    out.push_str(
+        "add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;\n",
+    );
+    out.push_str(INDENT);
+    out.push_str("add_header X-Content-Type-Options \"nosniff\" always;\n");
     out.push_str(INDENT);
     out.push_str("access_log ");
     out.push_str(ACCESS_LOG);
@@ -237,6 +240,18 @@ fn render_app(out: &mut String, app: &App) {
     }
 
     out.push_str("}\n");
+}
+
+/// Renders one `listen` directive.
+///
+/// nginx needs an IPv6 address in square brackets: `listen [::1]:8001;`. The
+/// registry stores the bare address (`::1`), so the brackets are added here.
+fn listen_directive(addr: &str, port: u16) -> String {
+    if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("listen [{addr}]:{port};")
+    } else {
+        format!("listen {addr}:{port};")
+    }
 }
 
 /// Every hostname the rendered config claims, normalised, sorted and deduplicated.
@@ -417,6 +432,29 @@ mod tests {
         let out = render(&[app]);
         assert!(out.contains("listen 127.0.0.1:8001;"), "{out}");
         assert!(out.contains("listen 192.0.2.10:8001;"), "{out}");
+    }
+
+    #[test]
+    fn an_ipv6_listen_address_is_bracketed() {
+        // `listen ::1:8001;` is not valid nginx; the port would be parsed as
+        // part of the address. nginx needs `[::1]:8001`.
+        let mut app = container();
+        app.listen = vec!["::1".into()];
+        let out = render(&[app]);
+        assert!(out.contains("listen [::1]:8001;"), "{out}");
+        assert!(
+            !out.contains("listen ::1:8001;"),
+            "unbracketed IPv6 must never be emitted: {out}"
+        );
+    }
+
+    #[test]
+    fn ipv6_and_ipv4_listeners_can_share_a_block() {
+        let mut app = container();
+        app.listen = vec!["127.0.0.1".into(), "::1".into()];
+        let out = render(&[app]);
+        assert!(out.contains("listen 127.0.0.1:8001;"), "{out}");
+        assert!(out.contains("listen [::1]:8001;"), "{out}");
     }
 
     // ---- determinism ----
@@ -698,6 +736,8 @@ server {
     listen 127.0.0.1:8006;
     server_name shop.example.com;
 
+    add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
+    add_header X-Content-Type-Options \"nosniff\" always;
     access_log /var/log/nginx/front-door.access.log swapdock;
 
     location / {
@@ -712,6 +752,8 @@ server {
     listen 127.0.0.1:8001;
     server_name example.com;
 
+    add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
+    add_header X-Content-Type-Options \"nosniff\" always;
     access_log /var/log/nginx/front-door.access.log swapdock;
 
     location / {

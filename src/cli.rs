@@ -13,7 +13,6 @@
 //! `status`, `verify`, `render`) arrive in later milestones. Their subcommands
 //! are listed in `lib.rs` so the shape of the tool is fixed early.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -22,7 +21,7 @@ use clap::{Parser, Subcommand};
 
 use crate::apply::{self, ApplyPaths};
 use crate::builder;
-use crate::deploy::{self, Ctx};
+use crate::deploy::{self, DeployContext};
 use crate::exec::{ExecError, StepSpec};
 use crate::id::RunId;
 use crate::redact::Redactor;
@@ -71,6 +70,56 @@ pub struct DeployPaths {
     pub drain_secs: u64,
 }
 
+/// Arguments for `swapdock import`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ImportArgs {
+    /// Directory that holds the compose file. Defaults to the current directory.
+    #[arg(long, value_name = "DIR")]
+    pub compose_dir: Option<PathBuf>,
+
+    /// Compose service to import. Inferred when the file defines exactly one.
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
+
+    /// App name (slug). Defaults to the service name, slugified.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Hostname to route to the app. May be omitted and added later.
+    #[arg(long, value_name = "HOST")]
+    pub domain: Option<String>,
+
+    /// Front port. Defaults to the first free port from 8001.
+    #[arg(long, value_name = "PORT")]
+    pub front_port: Option<u16>,
+
+    /// Slot owning the back-end port pair. Defaults to the first free slot.
+    #[arg(long, value_name = "SLOT")]
+    pub slot: Option<u8>,
+
+    /// Container-side port. Detected from ports/expose, else 80.
+    #[arg(long, value_name = "PORT")]
+    pub container_port: Option<u16>,
+
+    /// Healthcheck command to install when the service has none.
+    #[arg(long, value_name = "CMD")]
+    pub healthcheck: Option<String>,
+
+    /// Local checkout of the app source, for `swapdock build`/`sync`.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+
+    /// Green state directory; the override lands in its sibling `overrides/`.
+    #[arg(
+        long,
+        default_value = crate::import::DEFAULT_STATE_DIR,
+        value_name = "DIR"
+    )]
+    pub state_dir: PathBuf,
+}
+
+/// Parsed command line: global paths, an optional run label, and one
+/// subcommand.
 #[derive(Debug, Parser)]
 #[command(name = "swapdock", version, about = ABOUT, long_about = None)]
 pub struct Cli {
@@ -112,6 +161,7 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// The subcommand to run.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run a fixed set of commands through the chokepoint and show the results.
@@ -206,7 +256,7 @@ pub enum Command {
 
     /// Write a commented registry template for a new app. Changes nothing existing.
     Init {
-        /// App name. Becomes <name>.toml in the directory.
+        /// App name. Becomes `<name>.toml` in the directory.
         name: String,
         /// Where to write the file. Defaults to the current directory.
         #[arg(long, value_name = "DIR")]
@@ -214,6 +264,21 @@ pub enum Command {
         /// Kind of app: container or static.
         #[arg(long, default_value = "container", value_name = "KIND")]
         kind: String,
+    },
+
+    /// Import an existing Compose service as a registry entry.
+    ///
+    /// Reads the merged model with `docker compose config`, allocates a front
+    /// port and slot from the existing registry, and writes `<name>.toml` plus a
+    /// generated override. It never edits the compose file, starts a container
+    /// or deploys anything.
+    ///
+    /// `--dry-run` still runs the read-only `docker compose config` probe (it is
+    /// what the plan is derived from), but writes no registry file, override or
+    /// run record.
+    Import {
+        #[command(flatten)]
+        args: ImportArgs,
     },
 
     /// Fetch the app source and fast-forward it. Prints the new HEAD.
@@ -234,10 +299,59 @@ pub enum Command {
         build_host: Option<String>,
     },
 
-    /// Run the app's configured [backup] command once.
+    /// Run the app's configured `[backup]` command once.
     Backup {
         /// App name, as in the registry.
+        app: Option<String>,
+        /// Back up every app that has a `[backup]` command.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Restore one snapshot with the app's `[backup]` restore_command.
+    Restore {
+        /// App name, as in the registry.
         app: String,
+        /// Snapshot file to restore.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+    },
+
+    /// Reconcile a crash between the nginx flip and the registry commit.
+    ///
+    /// Proves the host is serving the pending release and its health path, then
+    /// advances the registry. Refuses and leaves the pending record if nginx is
+    /// not on that release or the release is unhealthy.
+    Reconcile {
+        /// App name, as in the registry.
+        app: String,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
+
+    /// Run the privileged apply broker. Internal; started by the broker unit.
+    #[command(hide = true)]
+    Broker {
+        /// Unix socket to listen on.
+        #[arg(long, default_value = "/run/swapdock/broker.sock", value_name = "PATH")]
+        socket: PathBuf,
+        /// Docker binary the broker executes (tests use a fake).
+        #[arg(long, default_value = "docker", value_name = "PATH")]
+        docker_bin: PathBuf,
+        #[command(flatten)]
+        paths: DeployPaths,
+    },
+
+    /// Check live app ports, disk pressure and certificate expiry.
+    ///
+    /// Read-only. Sends de-duplicated alerts through SWAPDOCK_WEBHOOK_URL when
+    /// run by the optional monitor timer.
+    Monitor {
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        paths: DeployPaths,
     },
 
     /// Probe an app's public URL over HTTPS (or --url).
@@ -277,11 +391,39 @@ pub enum Command {
         keep: usize,
     },
 
+    /// Install the host integration from a packaged dist directory.
+    ///
+    /// This is a thin root-only wrapper around the reviewed installer script;
+    /// it does not reimplement the install.
+    Setup {
+        /// Print the installer plan without changing the host.
+        #[arg(long)]
+        dry_run: bool,
+        /// Dist tree containing install-swapdock.sh. Defaults to $SWAPDOCK_DIST
+        /// or /usr/local/lib/swapdock/dist.
+        #[arg(long, value_name = "DIR")]
+        dist: Option<PathBuf>,
+    },
+
     /// Serve the HTTP API instead of one-shot CLI commands.
+    ///
+    /// Requires `SWAPDOCK_API_TOKEN` (at least 16 characters) unless
+    /// `--allow-unauthenticated` is passed for local development. Bind loopback
+    /// and terminate TLS at a reverse proxy; a query token is accepted only for
+    /// SSE clients that cannot set headers.
     Serve {
         /// Address to bind, e.g. 127.0.0.1:8088.
         #[arg(long, default_value = "127.0.0.1:8088", value_name = "ADDR")]
         bind: String,
+        /// Development only: run without a token. Never use on a shared host.
+        #[arg(long)]
+        allow_unauthenticated: bool,
+        /// PEM certificate chain for HTTPS (requires --tls-key).
+        #[arg(long, value_name = "PATH", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for HTTPS (requires --tls-cert).
+        #[arg(long, value_name = "PATH", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
         #[command(flatten)]
         paths: DeployPaths,
     },
@@ -321,6 +463,7 @@ impl Command {
                 &paths.main_config,
                 &paths.pid_file,
                 &paths.nginx_bin,
+                &paths.lock_dir,
             ),
             Command::Adopt {
                 app,
@@ -347,12 +490,21 @@ impl Command {
             Command::Inspect { app } => inspect_app(cli, app),
             Command::Sync { app } => sync_app(cli, app),
             Command::Init { name, dir, kind } => init_app(name, dir.clone(), kind),
+            Command::Import { args } => import_app(cli, args),
             Command::Build {
                 app,
                 release,
                 build_host,
             } => build_app(cli, app, release.as_deref(), build_host.as_deref()),
-            Command::Backup { app } => backup_app(cli, app),
+            Command::Backup { app, all } => backup_app(cli, app.as_deref(), *all),
+            Command::Restore { app, file } => restore_app(cli, app, file),
+            Command::Reconcile { app, paths } => reconcile_app(cli, app, paths),
+            Command::Broker {
+                socket,
+                docker_bin,
+                paths,
+            } => broker_app(cli, socket, docker_bin, paths),
+            Command::Monitor { json, paths } => monitor_app(cli, *json, paths),
             Command::Probe { app, url } => probe_app(cli, app, url.as_deref()),
             Command::Verify {
                 app,
@@ -360,7 +512,21 @@ impl Command {
                 access_log,
             } => verify_app(cli, app, since, access_log),
             Command::Prune { app, keep } => prune_app(cli, app.as_deref(), *keep),
-            Command::Serve { bind, paths } => serve(cli, bind, paths),
+            Command::Setup { dry_run, dist } => setup_app(*dry_run, dist.as_deref()),
+            Command::Serve {
+                bind,
+                allow_unauthenticated,
+                tls_cert,
+                tls_key,
+                paths,
+            } => serve(
+                cli,
+                bind,
+                paths,
+                *allow_unauthenticated,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+            ),
         }
     }
 }
@@ -368,7 +534,118 @@ impl Command {
 /// `swapdock serve` — the same operations over HTTP. Everything else about the
 /// CLI (paths, dry-run, the run log) already lives on `Cli`, so the server
 /// just forwards it.
-fn serve(cli: &Cli, bind: &str, paths: &DeployPaths) -> anyhow::Result<()> {
+fn setup_app(dry_run: bool, dist: Option<&Path>) -> anyhow::Result<()> {
+    if !is_root() {
+        anyhow::bail!("swapdock setup must run as root (use sudo)");
+    }
+    let dist = dist
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("SWAPDOCK_DIST").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/usr/local/lib/swapdock/dist"));
+    let installer = dist.join("install-swapdock.sh");
+    if !installer.is_file() {
+        anyhow::bail!(
+            "installer not found at {}; pass --dist or set SWAPDOCK_DIST",
+            installer.display()
+        );
+    }
+    let mut args = vec![installer.display().to_string()];
+    if dry_run {
+        args.push("--dry-run".into());
+    }
+    args.push(dist.display().to_string());
+    let mut spec = crate::exec::StepSpec::new("setup", "bash")
+        .args(args)
+        .timeout(std::time::Duration::from_secs(600));
+    // The installer uses SUDO_USER to pick the deploy user; exec clears the
+    // environment, so forward this one explicitly.
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        spec = spec.env("SUDO_USER", user);
+    }
+    let outcome = crate::exec::run_capture(&spec)?;
+    print!("{}", outcome.stdout);
+    eprint!("{}", outcome.stderr);
+    if !outcome.success() {
+        anyhow::bail!("setup failed with exit code {:?}", outcome.exit_code);
+    }
+    Ok(())
+}
+
+fn is_root() -> bool {
+    // `/proc/self` is owned by the process user, not root; read the effective
+    // uid from /proc/self/status instead.
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("Uid:")?;
+        rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+    }) == Some(0)
+}
+
+fn serve(
+    cli: &Cli,
+    bind: &str,
+    paths: &DeployPaths,
+    allow_unauthenticated: bool,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+) -> anyhow::Result<()> {
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            for (kind, path) in [("certificate", cert), ("private key", key)] {
+                if !path.is_file() {
+                    anyhow::bail!("TLS {kind} {} does not exist", path.display());
+                }
+            }
+            Some(crate::api::TlsConfig {
+                cert: cert.to_path_buf(),
+                key: key.to_path_buf(),
+            })
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key must be supplied together"),
+    };
+    let auth = crate::auth::AuthConfig::try_from_env(allow_unauthenticated)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    if auth.allows_unauthenticated() && !crate::auth::AuthConfig::loopback_bind(bind) {
+        anyhow::bail!(
+            "--allow-unauthenticated is a loopback-only development escape hatch; \
+             {bind:?} is not a loopback literal. Set SWAPDOCK_API_TOKEN instead."
+        );
+    }
+    if auth.allows_unauthenticated() {
+        tracing::warn!(
+            "API authentication is disabled (--allow-unauthenticated); \
+             bind loopback only and never use this on a shared host"
+        );
+    }
+    // A process that died between the nginx flip and the registry commit left a
+    // pending journal. Reconcile it before opening the API, so the first request
+    // cannot see a registry that disagrees with the host.
+    let startup_ctx = crate::deploy::DeployContext {
+        registry_dir: cli.registry.clone(),
+        state_dir: paths.state_dir.clone(),
+        lock_dir: paths.lock_dir.clone(),
+        apply_paths: crate::apply::ApplyPaths {
+            nginx_bin: paths.nginx_bin.clone(),
+            main_config: paths.main_config.clone(),
+            target: paths.target.clone(),
+            pid_file: Some(paths.pid_file.clone()),
+        },
+        drain_secs: paths.drain_secs,
+        lock_timeout: crate::lock::ACQUIRE_TIMEOUT,
+    };
+    for outcome in crate::reconcile::reconcile_pending(&startup_ctx, &cli.trace) {
+        match outcome.result {
+            Ok(result) => eprintln!("startup reconcile {}: {result:?}", outcome.app),
+            Err(e) => eprintln!(
+                "startup reconcile {} refused (journal kept): {e}",
+                outcome.app
+            ),
+        }
+    }
+
     // The async runtime exists only for the HTTP listener; the handlers block
     // on their own threads, so nothing inside the runtime needs to be Send.
     let rt = tokio::runtime::Runtime::new()?;
@@ -384,8 +661,10 @@ fn serve(cli: &Cli, bind: &str, paths: &DeployPaths) -> anyhow::Result<()> {
         lock_dir: paths.lock_dir.clone(),
         drain_secs: paths.drain_secs,
         transfer_dir: std::env::temp_dir().join("swapdock-transfer"),
+        auth,
+        rate: std::sync::Arc::new(crate::api::RateLimiter::new(240, 60)),
     };
-    rt.block_on(crate::api::serve(state, bind))
+    rt.block_on(crate::api::serve(state, bind, tls))
 }
 
 fn mode(cli: &Cli) -> RunMode {
@@ -543,6 +822,9 @@ struct RunSummary {
     /// proof that the run stopped there, so it is counted rather than used to
     /// name a stopping point.
     non_ok: u32,
+    pid: Option<u32>,
+    boot: Option<String>,
+    ended: bool,
 }
 
 /// `swapdock runs`
@@ -562,7 +844,12 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
     for ev in &read.events {
         match ev {
             TraceEvent::RunStart {
-                run_id, ts, mode, ..
+                run_id,
+                ts,
+                mode,
+                pid,
+                boot,
+                ..
             } => {
                 summaries.push(RunSummary {
                     run_id: run_id.clone(),
@@ -570,6 +857,9 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
                     status: format!("{mode:?}"),
                     steps: 0,
                     non_ok: 0,
+                    pid: *pid,
+                    boot: boot.clone(),
+                    ended: false,
                 });
             }
             TraceEvent::Step { run_id, status, .. } => {
@@ -584,6 +874,7 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
             TraceEvent::RunEnd { run_id, status, .. } => {
                 if let Some(current) = summaries.iter_mut().rev().find(|s| &s.run_id == run_id) {
                     current.status = format!("{status:?}");
+                    current.ended = true;
                 }
             }
         }
@@ -603,7 +894,14 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
             vec![
                 s.run_id.clone(),
                 s.started.clone(),
-                s.status.clone(),
+                if s.ended {
+                    s.status.clone()
+                } else {
+                    format!(
+                        "{:?}",
+                        crate::trace::run_state(s.pid, s.boot.as_deref(), None)
+                    )
+                },
                 s.steps.to_string(),
                 if s.non_ok == 0 {
                     "-".to_string()
@@ -673,6 +971,7 @@ fn resume_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
             );
             println!("last status    {:?}", point.last_status);
             println!("non-ok steps   {}", point.non_ok_steps);
+            println!("state          {:?}", point.state());
             println!(
                 "ended          {}",
                 match point.ended {
@@ -690,8 +989,13 @@ fn resume_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
                         "the run stopped on a failed step; re-run that step before continuing"
                     );
                 }
+                (None, false) if matches!(point.state(), RunStatus::Interrupted) => {
+                    println!(
+                        "the process died before writing a final record; inspect the pending journal and run `swapdock reconcile`"
+                    );
+                }
                 (None, false) => {
-                    println!("the run has no final record; continue from the next step");
+                    println!("the run is still in flight; wait for it to finish");
                 }
             }
             println!("no step catalogue exists yet, so nothing resumes automatically");
@@ -971,7 +1275,16 @@ fn apply_config(
     main_config: &Path,
     pid_file: &Path,
     nginx_bin: &Path,
+    lock_dir: &Path,
 ) -> anyhow::Result<()> {
+    // Serialize with deploys before loading/rendering: a deploy can commit a
+    // new live_port while we wait, and a config rendered from a pre-commit
+    // snapshot would clobber it.
+    let _estate = crate::lock::Lock::acquire(
+        lock_dir,
+        crate::lock::estate_lock_name(),
+        crate::lock::ACQUIRE_TIMEOUT,
+    )?;
     let Some(loaded) = load(cli)? else {
         return Ok(());
     };
@@ -1000,8 +1313,13 @@ fn apply_config(
     match apply::apply(&mut run, &text, &paths) {
         Ok(outcome) => {
             run.finish(RunStatus::Ok)?;
-            println!("applied  {}", target.display());
-            println!("reloaded {}", outcome.reloaded);
+            if cli.dry_run {
+                println!("would apply  {}", target.display());
+                println!("would reload");
+            } else {
+                println!("applied  {}", target.display());
+                println!("reloaded {}", outcome.reloaded);
+            }
             match (outcome.master_pid_before, outcome.master_pid_after) {
                 (Some(b), Some(a)) => println!("master   before={b} after={a} (unchanged)"),
                 _ => println!("master   unknown (no pid file to compare)"),
@@ -1023,8 +1341,8 @@ fn apply_config(
 }
 
 /// Builds the strategy context from CLI flags.
-fn ctx_from(cli: &Cli, paths: &DeployPaths) -> Ctx {
-    Ctx {
+fn ctx_from(cli: &Cli, paths: &DeployPaths) -> DeployContext {
+    DeployContext {
         registry_dir: cli.registry.clone(),
         state_dir: paths.state_dir.clone(),
         lock_dir: paths.lock_dir.clone(),
@@ -1331,6 +1649,213 @@ fn init_app(name: &str, dir: Option<PathBuf>, kind: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// `swapdock import`
+///
+/// Read-only compose probe plus two file writes. No run is opened: import must
+/// work for an unprivileged user with writable `--registry`/`--state-dir`, and
+/// `--dry-run` must write nothing at all, including a log.
+fn import_app(cli: &Cli, args: &ImportArgs) -> anyhow::Result<()> {
+    let compose_dir = match &args.compose_dir {
+        Some(path) => path.clone(),
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("could not read the working directory: {e}"))?,
+    };
+    let options = crate::import::Options {
+        compose_dir,
+        service: args.service.clone(),
+        name: args.name.clone(),
+        domain: args.domain.clone(),
+        front_port: args.front_port,
+        slot: args.slot,
+        container_port: args.container_port,
+        healthcheck: args.healthcheck.clone(),
+        repo: args.repo.clone(),
+        state_dir: args.state_dir.clone(),
+        dry_run: cli.dry_run,
+    };
+    let report = crate::import::run(&options, &cli.registry, cli.tunnel_config.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    print_import_report(cli, args, &report);
+    Ok(())
+}
+
+fn print_import_report(cli: &Cli, args: &ImportArgs, report: &crate::import::Report) {
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    println!("app          {}", report.app.name);
+    println!("compose      {}", report.compose_file.display());
+    println!(
+        "service      {} (project {})",
+        report.service,
+        report.app.compose_project()
+    );
+    println!(
+        "image        {} (image_repo {})",
+        report.image,
+        report.app.image_repo.as_deref().unwrap_or("-")
+    );
+    println!(
+        "container    {}/tcp (from {})",
+        report.container_port, report.container_port_source
+    );
+    match &report.healthcheck {
+        Some(command) => {
+            let path = report
+                .app
+                .health_url
+                .as_deref()
+                .map(crate::health::probe_path)
+                .unwrap_or_else(|| "/".to_string());
+            println!(
+                "health       {}: {} -> GET {path}",
+                report.healthcheck_source.label(),
+                first_line(command)
+            );
+        }
+        None => println!("health       none (the deploy gate will refuse until one is added)"),
+    }
+    println!("strategy     {}", report.strategy_reason);
+    let back = crate::ports::pair(report.app.slot)
+        .map(|(a, b)| format!("{a}, {b}"))
+        .unwrap_or_else(|_| "-".to_string());
+    println!(
+        "ports        front {} / slot {} (back {back})",
+        report.app.front_port, report.app.slot
+    );
+    println!(
+        "hostnames    {}",
+        if report.app.hostnames.is_empty() {
+            "none yet".to_string()
+        } else {
+            report.app.hostnames.join(", ")
+        }
+    );
+
+    println!();
+    if report.dry_run {
+        println!("dry run      nothing written; the compose probe was read-only");
+        println!("would write  {}", report.registry_path.display());
+        println!("would write  {}", report.override_path.display());
+        println!();
+        println!("registry toml");
+        print!("{}", crate::registry::to_toml(&report.app));
+        println!();
+        println!("compose override (would write)");
+        print!("{}", report.override_text);
+    } else {
+        println!("wrote        {}", report.registry_path.display());
+        println!("override     {}", report.override_path.display());
+    }
+
+    if !report.notes.is_empty() {
+        println!();
+        for note in &report.notes {
+            println!("note         {note}");
+        }
+    }
+
+    println!();
+    print_import_next_steps(cli, args, report);
+}
+
+fn print_import_next_steps(cli: &Cli, args: &ImportArgs, report: &crate::import::Report) {
+    let mut prefix = String::from("swapdock");
+    if cli.registry != Path::new("/srv/swapdock/apps") {
+        prefix.push_str(&format!(" --registry {}", shell_path(&cli.registry)));
+    }
+    let mut up_suffix = String::new();
+    if args.state_dir != Path::new(crate::import::DEFAULT_STATE_DIR) {
+        up_suffix.push_str(&format!(" --state-dir {}", shell_path(&args.state_dir)));
+    }
+
+    if report.dry_run {
+        println!("next steps (re-run without --dry-run first):");
+    } else {
+        println!("next steps:");
+    }
+
+    let mut step = 1;
+    if report.app.hostnames.is_empty() {
+        println!("  {step}. add a hostname (traffic cannot reach the app without one):");
+        println!("       edit {} and set:", report.registry_path.display());
+        println!("         hostnames = [\"app.example.com\"]");
+    } else {
+        println!(
+            "  {step}. hostname: {} (edit {} to add more)",
+            report.app.hostnames.join(", "),
+            report.registry_path.display()
+        );
+    }
+    step += 1;
+
+    let back = crate::ports::pair(report.app.slot)
+        .map(|(back, _)| back)
+        .unwrap_or(0);
+    let health = match report.healthcheck_source {
+        crate::import::HealthcheckSource::Compose => "keeps the compose healthcheck".to_string(),
+        crate::import::HealthcheckSource::Flag => "installs the --healthcheck command".to_string(),
+        crate::import::HealthcheckSource::Missing => {
+            "installs no healthcheck (the deploy gate will refuse until one is added)".to_string()
+        }
+    };
+    println!(
+        "  {step}. the generated override {} pins ${{IMAGE}} (default {}) and publishes",
+        report.override_path.display(),
+        report.app.image_repo.as_deref().unwrap_or("<repo>")
+    );
+    println!(
+        "     127.0.0.1:${{{}:-{back}}}:{} and {health}; your compose file was not edited.",
+        report.app.env_name, report.container_port
+    );
+    step += 1;
+
+    println!("  {step}. make the release image (the release tag is appended at deploy time):");
+    println!("       {prefix} build {} --release SHA", report.app.name);
+    if report.app.repo.is_none() {
+        println!(
+            "     (`build` needs a source checkout; set repo in {} or tag instead)",
+            report.registry_path.display()
+        );
+    }
+    println!("     or tag the image the service already runs:");
+    println!(
+        "       docker tag {} {}:SHA",
+        report.image,
+        report.app.image_repo.as_deref().unwrap_or("<repo>")
+    );
+    println!("     (SHA is the 7-64 character commit you are deploying)");
+    step += 1;
+
+    println!("  {step}. deploy:");
+    println!(
+        "       {prefix} up {} --release SHA{up_suffix}",
+        report.app.name
+    );
+    step += 1;
+
+    println!("  {step}. check the host wiring first (read-only):");
+    println!("       {prefix} doctor {}", report.app.name);
+
+    println!();
+    println!("import does not deploy, start or stop anything. The first `up` is the deploy.");
+}
+
+/// A path quoted for a shell only when it needs it.
+fn shell_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if !text.is_empty()
+        && text.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+        })
+    {
+        text
+    } else {
+        format!("{text:?}")
+    }
+}
+
 /// `swapdock sync <app>`
 fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     let app = load_app(cli, name)?;
@@ -1363,7 +1888,7 @@ fn build_app(
         .or(app.release.clone())
         .ok_or_else(|| anyhow::anyhow!("no release: pass --release, or sync the source first"))?;
     if !crate::registry::is_valid_release_arg(&release) {
-        anyhow::bail!("invalid release {release:?}: must be a commit SHA (hex, 4-64 chars)");
+        anyhow::bail!("invalid release {release:?}: must be a commit SHA (hex, 7-64 chars)");
     }
 
     let env_host = std::env::var("SWAPDOCK_BUILD_HOST").ok();
@@ -1393,7 +1918,58 @@ fn build_app(
 }
 
 /// `swapdock backup <app>`
-fn backup_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
+fn backup_app(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<()> {
+    if all {
+        let Some(loaded) = load(cli)? else {
+            anyhow::bail!("no registry found at {}", cli.registry.display());
+        };
+        let apps: Vec<App> = loaded
+            .sorted()
+            .into_iter()
+            .filter(|app| app.backup.is_some())
+            .collect();
+        if apps.is_empty() {
+            anyhow::bail!("no app has a [backup] command");
+        }
+        let mut run = start(cli)?;
+        let run_id = run.id().to_string();
+        let mut failed = 0usize;
+        for app in &apps {
+            match crate::backup::run_backup(&mut run, app, app.release.as_deref()) {
+                Ok(file) => match file {
+                    Some(path) => println!("backup   {} {}", app.name, path.display()),
+                    None => println!("backup   {} command completed", app.name),
+                },
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("backup   {} failed: {e}", app.name);
+                    if !cli.dry_run
+                        && let Err(notify_err) =
+                            crate::notify::send_failure(Some(&app.name), &run_id, &e.to_string())
+                    {
+                        tracing::warn!(app = %app.name, "failure webhook failed: {notify_err}");
+                    }
+                }
+            }
+        }
+        let status = if failed > 0 {
+            RunStatus::Failed
+        } else if cli.dry_run {
+            RunStatus::DryRun
+        } else {
+            RunStatus::Ok
+        };
+        run.finish(status)?;
+        println!("apps     {} ({} failed)", apps.len(), failed);
+        println!("run      {run_id}");
+        if failed > 0 {
+            anyhow::bail!("{failed} of {} backup(s) failed", apps.len());
+        }
+        return Ok(());
+    }
+    let Some(name) = name else {
+        anyhow::bail!("pass an app name, or --all to back up every configured app");
+    };
     let app = load_app(cli, name)?;
     let mut run = start(cli)?;
     let run_id = run.id().to_string();
@@ -1418,7 +1994,155 @@ fn backup_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
     }
 }
 
-/// `swapdock prune [--app] [--keep N]`
+/// `swapdock restore <app> --file <snapshot>`
+fn restore_app(cli: &Cli, name: &str, file: &Path) -> anyhow::Result<()> {
+    let app = load_app(cli, name)?;
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    match crate::backup::run_restore(&mut run, &app, file) {
+        Ok(()) => {
+            run.finish(if cli.dry_run {
+                RunStatus::DryRun
+            } else {
+                RunStatus::Ok
+            })?;
+            println!("restore  {}", file.display());
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// `swapdock reconcile <app>`
+fn reconcile_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()> {
+    if cli.dry_run {
+        anyhow::bail!(
+            "reconcile repairs a crashed deploy; it has no dry-run because proving the host \
+             state is the point. Inspect `swapdock status` and the pending record first."
+        );
+    }
+    let mut app = load_app(cli, name)?;
+    let ctx = ctx_from(cli, paths);
+    let mut run = start(cli)?;
+    let run_id = run.id().to_string();
+    match crate::reconcile::reconcile(&mut run, &ctx, &mut app) {
+        Ok(outcome) => {
+            run.finish(RunStatus::Ok)?;
+            match outcome {
+                crate::reconcile::Outcome::Committed { release, live_port } => {
+                    println!("reconciled {release}");
+                    if let Some(port) = live_port {
+                        println!("live port  :{port}");
+                    }
+                }
+                crate::reconcile::Outcome::NotFlipped {
+                    release,
+                    expected_port,
+                } => {
+                    println!("not flipped {release} (expected upstream :{expected_port})");
+                }
+            }
+            println!("run      {run_id}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = run.finish(RunStatus::Failed);
+            if !cli.dry_run
+                && let Err(notify_err) =
+                    crate::notify::send_failure(Some(name), &run_id, &e.to_string())
+            {
+                tracing::warn!(app = %name, "failure webhook failed: {notify_err}");
+            }
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// `swapdock broker`
+fn broker_app(
+    cli: &Cli,
+    socket: &Path,
+    docker_bin: &Path,
+    paths: &DeployPaths,
+) -> anyhow::Result<()> {
+    let token = std::env::var("SWAPDOCK_BROKER_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("SWAPDOCK_API_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("broker requires SWAPDOCK_BROKER_TOKEN or SWAPDOCK_API_TOKEN")
+        })?;
+    let apply_paths = crate::apply::ApplyPaths {
+        nginx_bin: paths.nginx_bin.clone(),
+        main_config: paths.main_config.clone(),
+        target: paths.target.clone(),
+        pid_file: Some(paths.pid_file.clone()),
+    };
+    crate::broker::serve(
+        socket,
+        cli.trace.clone(),
+        apply_paths,
+        token,
+        docker_bin.to_path_buf(),
+    )
+}
+
+/// `swapdock monitor [--json]`/// `swapdock monitor [--json]`
+fn monitor_app(cli: &Cli, json: bool, paths: &DeployPaths) -> anyhow::Result<()> {
+    let apps = load(cli)?.map(|loaded| loaded.sorted()).unwrap_or_default();
+    let report = crate::monitor::run(
+        &apps,
+        &paths.state_dir,
+        crate::monitor::disk_threshold_from_env(),
+        &crate::monitor::certs_from_env(),
+        crate::monitor::repeat_secs_from_env(),
+        !cli.dry_run,
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "findings": report.findings.iter().map(|f| serde_json::json!({
+                    "key": f.key,
+                    "kind": f.kind,
+                    "message": f.message,
+                    "detail": f.detail,
+                })).collect::<Vec<_>>(),
+                "sent": report.sent,
+                "suppressed": report.suppressed,
+                "errors": report.errors,
+            }))?
+        );
+    } else {
+        for finding in &report.findings {
+            println!("{}  {}  {}", finding.kind, finding.key, finding.message);
+        }
+        for error in &report.errors {
+            eprintln!("monitor  {error}");
+        }
+        if report.findings.is_empty() {
+            println!("monitor  no findings");
+        }
+        println!(
+            "monitor  {} finding(s), {} sent, {} suppressed, {} error(s)",
+            report.findings.len(),
+            report.sent,
+            report.suppressed,
+            report.errors.len()
+        );
+    }
+    if !report.errors.is_empty() {
+        anyhow::bail!("{} monitor error(s)", report.errors.len());
+    }
+    Ok(())
+}
+
+/// `swapdock prune [--app] [--keep N]`/// `swapdock prune [--app] [--keep N]`
 fn prune_app(cli: &Cli, only: Option<&str>, keep: usize) -> anyhow::Result<()> {
     let Some(loaded) = load(cli)? else {
         return Ok(());
@@ -1642,6 +2366,8 @@ fn run_started_at(cli: &Cli, id: &crate::id::RunId) -> Option<i64> {
 
 /// Prints an aligned table to stdout.
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    use std::io::Write;
+
     let cols = headers.len();
     let cells: Vec<Vec<String>> = rows
         .iter()
@@ -1907,7 +2633,58 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from(["swapdock", "backup", "chats"]).unwrap();
-        assert!(matches!(cli.command, Command::Backup { .. }));
+        match cli.command {
+            Command::Backup { app, all } => {
+                assert_eq!(app.as_deref(), Some("chats"));
+                assert!(!all);
+            }
+            _ => panic!("expected Backup"),
+        }
+        let cli = Cli::try_parse_from(["swapdock", "backup", "--all"]).unwrap();
+        assert!(matches!(cli.command, Command::Backup { all: true, .. }));
+
+        let cli =
+            Cli::try_parse_from(["swapdock", "restore", "chats", "--file", "/tmp/chats.dump"])
+                .unwrap();
+        match cli.command {
+            Command::Restore { app, file } => {
+                assert_eq!(app, "chats");
+                assert_eq!(file, PathBuf::from("/tmp/chats.dump"));
+            }
+            _ => panic!("expected Restore"),
+        }
+
+        let cli = Cli::try_parse_from(["swapdock", "reconcile", "chats"]).unwrap();
+        assert!(matches!(cli.command, Command::Reconcile { .. }));
+
+        let cli = Cli::try_parse_from([
+            "swapdock",
+            "serve",
+            "--tls-cert",
+            "/tmp/cert.pem",
+            "--tls-key",
+            "/tmp/key.pem",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve {
+                tls_cert, tls_key, ..
+            } => {
+                assert_eq!(tls_cert.as_deref(), Some(Path::new("/tmp/cert.pem")));
+                assert_eq!(tls_key.as_deref(), Some(Path::new("/tmp/key.pem")));
+            }
+            _ => panic!("expected Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["swapdock", "serve", "--tls-cert", "/tmp/cert.pem"]).is_err(),
+            "TLS cert without key must be refused"
+        );
+
+        let cli = Cli::try_parse_from(["swapdock", "monitor", "--json"]).unwrap();
+        match cli.command {
+            Command::Monitor { json, .. } => assert!(json),
+            _ => panic!("expected Monitor"),
+        }
 
         let cli = Cli::try_parse_from(["swapdock", "probe", "chat"]).unwrap();
         assert!(matches!(cli.command, Command::Probe { .. }));

@@ -63,8 +63,11 @@ pub enum BuildError {
     #[error("release {release} is not in the daemon as {image_ref}")]
     Missing { release: String, image_ref: String },
 
-    #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
+    #[error("invalid release {0:?}: must be a commit SHA (hex, 7-64 chars)")]
     InvalidRelease(String),
+
+    #[error("invalid SSH build host {0:?}: must be [user@]host, not an ssh option")]
+    InvalidHost(String),
 
     #[error("could not run a build step: {0}")]
     Exec(#[from] crate::exec::ExecError),
@@ -219,6 +222,9 @@ pub fn remote_build_script(repo_url: &str, release: &str, image_ref: &str, push:
 /// Builds `release` of `app` on `host` over SSH.
 pub fn build_ssh(run: &mut Run, app: &App, release: &str, host: &str) -> Result<Built, BuildError> {
     check_release(release)?;
+    if !crate::ssh::is_valid_destination(host) {
+        return Err(BuildError::InvalidHost(host.to_string()));
+    }
     let repo_url = remote_url(app)?;
     let image_ref = app
         .image_ref(release)
@@ -226,7 +232,7 @@ pub fn build_ssh(run: &mut Run, app: &App, release: &str, host: &str) -> Result<
     let script = remote_build_script(&repo_url, release, &image_ref, app.needs_pull());
 
     let spec = StepSpec::new("ssh-build", "ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, "--"])
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "--", host])
         .arg(script)
         .timeout(BUILD_TIMEOUT);
     let outcome = run.exec(&spec)?;
@@ -389,7 +395,7 @@ mod tests {
             );
         }
         assert!(check_release("9c1f2ab").is_ok());
-        assert!(check_release("abcd").is_ok());
+        assert!(check_release("abc1234").is_ok());
     }
 
     #[test]

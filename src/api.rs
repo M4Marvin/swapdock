@@ -5,32 +5,40 @@
 //! report the run id — the JSONL run log stays the observability query:
 //! poll `GET /runs/{id}` for steps, or tail them live from `GET /events`.
 //!
-//! Routes are served under `/api` and, for compatibility with existing clients,
-//! also at the legacy un-prefixed paths: `/api/health` and `/health` are the
-//! same handler.
+//! Routes are served under `/api`. `GET /health` is the only unauthenticated
+//! route; every other request needs a bearer token from `SWAPDOCK_API_TOKEN`
+//! (or `?token=` for `EventSource`). The server refuses to start without a
+//! token unless `--allow-unauthenticated` was passed for local development.
 //!
-//! Bind loopback by default; put authentication in front (nginx basic-auth,
-//! Tailscale ACL) before exposing this anywhere.
+//! Bind loopback by default and terminate TLS at a reverse proxy. CORS is off
+//! unless `SWAPDOCK_ALLOWED_ORIGINS` names the console's origin; the console is
+//! expected to be same-origin.
 
-use std::collections::VecDeque;
+use anyhow::Context;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use serde::Deserialize;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::deploy::{self, Ctx};
+use crate::auth::AuthConfig;
+use crate::deploy::{self, DeployContext};
 use crate::registry::{App, Loaded, Problem};
 use crate::trace::{Run, RunMode, RunStatus, TraceEvent, TraceLog};
-use crate::{apply, builder, exec, git, transfer, validator};
+use crate::{apply, builder, exec, git, import, transfer, validator};
 
 /// How often the SSE handler re-reads the run log for new lines.
 const EVENTS_POLL: Duration = Duration::from_millis(300);
@@ -53,6 +61,27 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on listing images for `/build/apps/{name}/images`.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many mutations may run at once. Every job is a real deploy/build and can
+/// take minutes; an unauthenticated or compromised client must not be able to
+/// exhaust the host by opening hundreds of them.
+#[cfg(not(test))]
+const MAX_CONCURRENT_JOBS: usize = 8;
+#[cfg(test)]
+const MAX_CONCURRENT_JOBS: usize = 64;
+
+static JOB_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS)));
+
+/// How many EventSource tails may be open at once. Each one holds a task and
+/// polls the log; unbounded connections are a cheap resource-exhaustion path.
+#[cfg(not(test))]
+const MAX_EVENT_STREAMS: usize = 64;
+#[cfg(test)]
+const MAX_EVENT_STREAMS: usize = 8;
+
+static EVENT_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_EVENT_STREAMS)));
+
 /// Everything the handlers need that the CLI flags used to carry.
 #[derive(Debug, Clone)]
 pub struct ServerState {
@@ -68,27 +97,197 @@ pub struct ServerState {
     pub drain_secs: u64,
     /// Where a build-server transfer stages its tarball before sending it.
     pub transfer_dir: PathBuf,
+    /// Bearer-token auth and browser-origin policy.
+    pub auth: AuthConfig,
+    /// Per-client request rate limit and request timeout.
+    pub rate: Arc<RateLimiter>,
+}
+
+/// A small fixed-window request limiter keyed by the forwarded client address.
+/// This is deliberately process-local: one operator, one API process.
+#[derive(Debug)]
+pub struct RateLimiter {
+    max: usize,
+    window: Duration,
+    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl RateLimiter {
+    pub fn new(max: usize, window_secs: u64) -> Self {
+        Self {
+            max,
+            window: Duration::from_secs(window_secs),
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound the key map: a spoofed forwarded header must not grow it
+        // without limit. Unknown keys are refused once the map is full rather
+        // than evicting active clients.
+        if hits.len() >= 4096 && !hits.contains_key(key) {
+            return false;
+        }
+        let queue = hits.entry(key.to_string()).or_default();
+        while queue
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > self.window)
+        {
+            queue.pop_front();
+        }
+        if queue.len() >= self.max {
+            return false;
+        }
+        queue.push_back(now);
+        true
+    }
 }
 
 type Shared = Arc<ServerState>;
 
 pub fn router(state: ServerState) -> Router {
     let state: Shared = Arc::new(state);
-    let api = api_router();
-    // Mount the same routes under `/api` (the frontend contract) and at the
-    // legacy un-prefixed paths, so existing clients keep working.
-    Router::new()
-        .nest("/api", api.clone())
-        .merge(api)
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+    let mut router = Router::new()
+        // `/health` stays unprefixed for external monitors. Everything else is
+        // under `/api`, so a proxy rule cannot accidentally leave a mutation
+        // route unprotected at the root.
+        .route("/health", get(health))
+        .nest("/api", api_router());
+
+    if state.auth.is_required() {
+        router = router.layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    }
+
+    if !state.auth.allowed_origins().is_empty() {
+        let origins: Vec<HeaderValue> = state
+            .auth
+            .allowed_origins()
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect();
+        if !origins.is_empty() {
+            router = router.layer(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(origins))
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::PUT,
+                        Method::DELETE,
+                        Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        header::AUTHORIZATION,
+                        header::CONTENT_TYPE,
+                        header::HeaderName::from_static("x-csrf-token"),
+                    ])
+                    .allow_credentials(true),
+            );
+        }
+    }
+
+    // JSON bodies are small; a large body must not occupy memory before a
+    // handler can reject it. This does not bound response streaming (SSE).
+    router = router.layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
+    router = router.layer(middleware::from_fn_with_state(state.clone(), rate_limit));
+
+    router.with_state(state)
 }
 
-/// The routes, without state or layers, so they can be mounted at both paths.
+/// Applies a process-local per-client rate limit and a request timeout. SSE is
+/// exempt from the timeout because it is intentionally long-lived.
+async fn rate_limit(
+    State(state): State<Shared>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let key = login_key(request.headers());
+    if !state.rate.allow(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "too many requests; retry later",
+        )
+            .into_response();
+    }
+    if request.uri().path() == "/api/events" {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "request timed out after 30 seconds",
+        )
+            .into_response(),
+    }
+}
+
+/// Auth middleware. Health and `POST /api/login` are the only unauthenticated
+/// routes; cookie sessions need a CSRF header on mutations.
+async fn require_auth(
+    State(state): State<Shared>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if path == "/health" || path == "/api/health" {
+        return next.run(request).await;
+    }
+    if !state.auth.host_origin_ok(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Host or Origin is not allowed; set SWAPDOCK_ALLOWED_HOSTS/ORIGINS"
+            })),
+        )
+            .into_response();
+    }
+    if path == "/api/login" {
+        return next.run(request).await;
+    }
+    if state.auth.authorized(request.headers(), request.uri()) {
+        // A cookie session needs a CSRF header on mutations. Bearer clients are
+        // exempt: a custom Authorization header is not sent by a cross-site
+        // form, and tooling cannot obtain a CSRF token from a cookie it does
+        // not use.
+        let mutation = matches!(
+            *request.method(),
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        );
+        if mutation
+            && !state.auth.bearer_valid(request.headers())
+            && !state.auth.csrf_valid(request.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "CSRF token missing or invalid; refresh the console session"
+                })),
+            )
+                .into_response();
+        }
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(serde_json::json!({"error": "authentication required"})),
+    )
+        .into_response()
+}
+
+/// The API routes, mounted under `/api`.
 fn api_router() -> Router<Shared> {
     Router::new()
         .route("/health", get(health))
+        .route("/login", post(login))
+        .route("/session", get(session_info))
+        .route("/logout", post(logout))
         .route("/apps", get(list_apps).post(init_app))
+        .route("/import", post(import_app))
         .route("/apps/{name}", get(show_app).put(update_app))
         .route("/apps/{name}/status", get(app_status))
         .route("/apps/{name}/inspect", get(app_inspect))
@@ -98,6 +297,7 @@ fn api_router() -> Router<Shared> {
         .route("/apps/{name}/probe", post(probe_app))
         .route("/apps/{name}/prune", post(prune_app))
         .route("/apps/{name}/latest", get(app_latest))
+        .route("/apps/{name}/drift", get(app_drift))
         .route("/apps/{name}/deploys", post(deploy_app))
         .route("/apps/{name}/rollback", post(rollback_app))
         .route("/apps/{name}/build", post(build_app))
@@ -110,7 +310,7 @@ fn api_router() -> Router<Shared> {
         .route("/build/apps/{name}/builds", post(build_app))
         .route("/build/apps/{name}/transfers", post(transfer_app))
         .route("/doctor", get(doctor_all))
-        .route("/validate", post(validate))
+        .route("/validate", get(validate).post(validate))
         .route("/render", get(render_config))
         .route("/apply", post(apply_config))
         .route("/events", get(run_events))
@@ -119,16 +319,135 @@ fn api_router() -> Router<Shared> {
         .route("/runs/{id}/resume", get(resume_run))
 }
 
-/// Starts the server. Returns when the listener fails to bind.
-pub async fn serve(state: ServerState, bind: &str) -> anyhow::Result<()> {
+/// Optional TLS material for the API listener.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+/// Serves the API over HTTP, or HTTPS when both TLS paths are supplied.
+///
+/// TLS here terminates on the API listener itself; the console can still be
+/// served by the nginx front door. Supplying a certificate does not obtain or
+/// renew it — use certbot/Caddy/Cloudflare for that.
+pub async fn serve(state: ServerState, bind: &str, tls: Option<TlsConfig>) -> anyhow::Result<()> {
+    let app = router(state);
+    if let Some(tls) = tls {
+        // axum-server's no-provider build leaves the rustls provider to us.
+        // `ring` is used explicitly so a static musl build does not need the
+        // aws-lc C toolchain.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await?;
+        let addr: std::net::SocketAddr = bind.parse().with_context(|| {
+            format!("TLS bind {bind:?} must be an IP:port (use a reverse proxy for a hostname)")
+        })?;
+        axum_server::bind_rustls(addr, config)
+            .serve(app.into_make_service())
+            .await?;
+        return Ok(());
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // health
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LoginBody {
+    password: String,
+}
+
+fn secure_cookies(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+}
+
+fn login_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+async fn login(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> impl IntoResponse {
+    let key = login_key(&headers);
+    if !state.auth.login_allowed(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "300")],
+            Json(serde_json::json!({"error": "too many failed logins; retry later"})),
+        )
+            .into_response();
+    }
+    let Some((id, csrf)) = state.auth.login(&body.password) else {
+        state.auth.login_failed(&key);
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "the access token was not accepted, or console sessions are disabled",
+        );
+    };
+    state.auth.login_succeeded(&key);
+    let cookie = AuthConfig::session_cookie(&id, secure_cookies(&headers));
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({
+            "csrf_token": csrf,
+            "expires_in": 12 * 60 * 60,
+        })),
+    )
+        .into_response()
+}
+
+async fn session_info(State(state): State<Shared>, headers: HeaderMap) -> impl IntoResponse {
+    match state.auth.session_csrf(&headers) {
+        Some(csrf) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"authenticated": true, "mode": "session", "csrf_token": csrf})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"authenticated": true, "mode": "bearer"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn logout(State(state): State<Shared>, headers: HeaderMap) -> impl IntoResponse {
+    state.auth.logout(&headers);
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            AuthConfig::clear_cookie(secure_cookies(&headers)),
+        )],
+        Json(serde_json::json!({"ok": true})),
+    )
+        .into_response()
+}
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
@@ -174,6 +493,85 @@ fn collect_problems(state: &ServerState, loaded: &Loaded) -> Vec<Problem> {
     problems.extend(validator::validate(&apps, &routes));
     validator::sort_problems(&mut problems);
     problems
+}
+
+#[derive(Deserialize)]
+struct ImportBody {
+    compose_dir: String,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    front_port: Option<u16>,
+    #[serde(default)]
+    slot: Option<u8>,
+    #[serde(default)]
+    container_port: Option<u16>,
+    #[serde(default)]
+    healthcheck: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /api/import` — the console's Compose importer.
+///
+/// This is the same engine as `swapdock import`; it writes a registry entry and
+/// generated override, never the Compose file, and does not deploy.
+async fn import_app(
+    State(state): State<Shared>,
+    Json(body): Json<ImportBody>,
+) -> impl IntoResponse {
+    let opts = import::Options {
+        compose_dir: PathBuf::from(body.compose_dir),
+        service: body.service,
+        name: body.name,
+        domain: body.domain,
+        front_port: body.front_port,
+        slot: body.slot,
+        container_port: body.container_port,
+        healthcheck: body.healthcheck,
+        repo: body.repo.map(PathBuf::from),
+        state_dir: state.state_dir.clone(),
+        dry_run: body.dry_run,
+    };
+    let registry_dir = state.registry.clone();
+    match tokio::task::spawn_blocking(move || import::run(&opts, &registry_dir, None)).await {
+        Ok(Ok(report)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "app": report.app,
+                "wrote": report.wrote,
+                "dry_run": report.dry_run,
+                "registry_path": report.registry_path,
+                "override_path": report.override_path,
+                "override_text": report.override_text,
+                "service": report.service,
+                "image": report.image,
+                "container_port": report.container_port,
+                "healthcheck": report.healthcheck,
+                "strategy_reason": report.strategy_reason,
+                "notes": report.notes,
+                "warnings": report.warnings,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            let status = match e {
+                import::ImportError::Refused(_) => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            error_response(status, &e.to_string())
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("import task failed: {e}"),
+        ),
+    }
 }
 
 async fn list_apps(State(state): State<Shared>) -> impl IntoResponse {
@@ -223,6 +621,30 @@ async fn update_app(
             &format!("path name {name:?} does not match body name {:?}", app.name),
         );
     }
+    // Serialize the read-modify-write with deploys and other edits. Without
+    // this, an operator save can write back a pre-deploy live_port/old_release
+    // after a deploy committed, silently reverting the registry.
+    let lock_dir = state.lock_dir.clone();
+    let _estate = match tokio::task::spawn_blocking(move || {
+        crate::lock::Lock::acquire(
+            &lock_dir,
+            crate::lock::estate_lock_name(),
+            crate::lock::ACQUIRE_TIMEOUT,
+        )
+    })
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(e)) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, &e.to_string());
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("lock task failed: {e}"),
+            );
+        }
+    };
     let loaded = match load(&state) {
         Ok(l) => l,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -295,6 +717,10 @@ async fn app_status(State(state): State<Shared>, Path(name): Path<String>) -> im
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
+    // A pending record means a previous run stopped between the flip and the
+    // commit. Report it alongside the recorded state; the record is advisory,
+    // but a confident "up" without it would be a lie.
+    let pending = crate::journal::read(&state.state_dir, &name).ok().flatten();
     // The probe is blocking socket I/O; keep it off the async workers.
     match tokio::task::spawn_blocking(move || deploy::live_status(&app)).await {
         Ok(Ok(s)) => (
@@ -305,6 +731,7 @@ async fn app_status(State(state): State<Shared>, Path(name): Path<String>) -> im
                 "live_port": s.live_port,
                 "release": s.release,
                 "old_release": s.old_release,
+                "pending": pending,
             })),
         )
             .into_response(),
@@ -497,6 +924,7 @@ struct AdoptBody {
 async fn adopt_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<AdoptBody>>,
 ) -> impl IntoResponse {
     let Some(body) = body else {
@@ -508,18 +936,24 @@ async fn adopt_app(
     };
     let ctx = ctx_for(&state);
     let mut app = app;
-    spawn_job(&state, Some(&name), body.dry_run, move |run| {
-        deploy::adopt(
-            run,
-            &ctx,
-            &mut app,
-            &body.release,
-            body.healthcheck.as_deref(),
-            body.container_port,
-        )
-        .map(|()| serde_json::json!({}))
-        .map_err(|e| e.to_string())
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        body.dry_run,
+        Some(api_actor(&headers)),
+        move |run| {
+            deploy::adopt(
+                run,
+                &ctx,
+                &mut app,
+                &body.release,
+                body.healthcheck.as_deref(),
+                body.container_port,
+            )
+            .map(|()| serde_json::json!({}))
+            .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
@@ -532,6 +966,7 @@ struct BackupBody {
 async fn backup_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<BackupBody>>,
 ) -> impl IntoResponse {
     let dry = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
@@ -539,11 +974,17 @@ async fn backup_app(
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    spawn_job(&state, Some(&name), dry, move |run| {
-        crate::backup::run_backup(run, &app, app.release.as_deref())
-            .map(|file| serde_json::json!({"file": file}))
-            .map_err(|e| e.to_string())
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        dry,
+        Some(api_actor(&headers)),
+        move |run| {
+            crate::backup::run_backup(run, &app, app.release.as_deref())
+                .map(|file| serde_json::json!({"file": file}))
+                .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
@@ -574,7 +1015,25 @@ async fn probe_app(
             "url must start with http:// or https://",
         );
     }
+    if !probe_target_allowed(&app, &url) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "{name} can only probe its own hostnames/public_url; set SWAPDOCK_PROBE_ALLOWLIST for another target"
+            ),
+        );
+    }
     match tokio::task::spawn_blocking(move || {
+        // Pin curl to a public address we resolved here. The older code let
+        // curl resolve the hostname itself, so an allowlisted name could rebind
+        // to loopback/RFC1918 between the allowlist check and the request.
+        let (host, port) = url_host_port(&url).ok_or("url has no usable host")?;
+        let ip = public_ip_for_host(&host, port)?;
+        let pinned = if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
         let spec = exec::StepSpec::new("probe-public", "curl")
             .args([
                 "-fsS",
@@ -584,6 +1043,10 @@ async fn probe_app(
                 "%{http_code}",
                 "--max-time",
                 "15",
+                "--proto",
+                "=http,https",
+                "--resolve",
+                &format!("{host}:{port}:{pinned}"),
                 &url,
             ])
             .timeout(Duration::from_secs(20));
@@ -602,6 +1065,133 @@ async fn probe_app(
     }
 }
 
+/// Extracts a lower-case host from an http(s) URL without a URL crate.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            // Keep the host, drop the port. Bracketed IPv6 is accepted as-is.
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        })
+        .unwrap_or(authority);
+    Some(host.trim_matches(['[', ']']).to_ascii_lowercase())
+}
+
+/// Host and port from an http(s) URL, defaulting to 80/443.
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let scheme_https = url.starts_with("https://");
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(if scheme_https { 443 } else { 80 });
+        (host.to_string(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':')
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        (host.to_string(), port.parse().ok()?)
+    } else {
+        (authority.to_string(), if scheme_https { 443 } else { 80 })
+    };
+    Some((host.to_ascii_lowercase(), port))
+}
+
+/// Resolve once, reject non-public addresses, and return the address curl must
+/// use. This is the DNS-rebinding guard; the caller passes it via `--resolve`.
+fn public_ip_for_host(host: &str, port: u16) -> Result<IpAddr, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_public_ip(ip) {
+            Ok(ip)
+        } else {
+            Err(format!("refusing non-public probe address {ip}"))
+        };
+    }
+    let addresses: Vec<IpAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .map(|addr| addr.ip())
+        .collect();
+    addresses
+        .into_iter()
+        .find(|ip| is_public_ip(*ip))
+        .ok_or_else(|| format!("{host} resolves only to non-public addresses"))
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_unspecified()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+                && !(v4.octets()[0] == 0)
+                && !(v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+                && !(v4.octets()[0] == 198 && (18..=19).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !v6.is_unique_local()
+                && !v6.is_unicast_link_local()
+        }
+    }
+}
+
+/// The probe is an SSRF surface if it accepts arbitrary URLs. Restrict it to
+/// the app's own hostnames, its configured public_url, or an explicit operator
+/// allowlist in `SWAPDOCK_PROBE_ALLOWLIST`.
+fn probe_target_allowed(app: &App, url: &str) -> bool {
+    let Some(host) = url_host(url) else {
+        return false;
+    };
+    if app
+        .hostnames
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&host))
+    {
+        return true;
+    }
+    if app
+        .public_url
+        .as_deref()
+        .and_then(url_host)
+        .is_some_and(|candidate| candidate == host)
+    {
+        return true;
+    }
+    std::env::var("SWAPDOCK_PROBE_ALLOWLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry == "*" || entry.eq_ignore_ascii_case(&host))
+}
+
 #[derive(Deserialize, Default)]
 struct PruneBody {
     #[serde(default = "default_keep")]
@@ -617,6 +1207,7 @@ fn default_keep() -> usize {
 async fn prune_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<PruneBody>>,
 ) -> impl IntoResponse {
     let body = body.unwrap_or_default();
@@ -627,35 +1218,41 @@ async fn prune_app(
     let Some(repo) = app.image_repo.clone() else {
         return error_response(StatusCode::CONFLICT, "app has no image_repo");
     };
-    spawn_job(&state, Some(&name), body.dry_run, move |run| {
-        if run.mode() == RunMode::DryRun {
-            return Ok(serde_json::json!({"would_prune": repo, "keep": body.keep}));
-        }
-        let listed = run
-            .exec(&crate::docker::image_tags(&repo))
-            .map_err(|e| e.to_string())?;
-        let tags: Vec<String> = listed
-            .stdout
-            .lines()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .collect();
-        let keep = crate::prune::Keep {
-            current: app.release.clone(),
-            old: app.old_release.clone(),
-        };
-        let mut removed = 0usize;
-        let mut failed = 0usize;
-        for tag in crate::prune::select_removals(&tags, &keep, body.keep) {
-            let image = format!("{repo}:{tag}");
-            match run.exec(&crate::docker::rmi(&image)) {
-                Ok(o) if o.success() => removed += 1,
-                _ => failed += 1,
+    spawn_job(
+        &state,
+        Some(&name),
+        body.dry_run,
+        Some(api_actor(&headers)),
+        move |run| {
+            if run.mode() == RunMode::DryRun {
+                return Ok(serde_json::json!({"would_prune": repo, "keep": body.keep}));
             }
-        }
-        Ok(serde_json::json!({"removed": removed, "failed": failed}))
-    })
+            let listed = run
+                .exec(&crate::docker::image_tags(&repo))
+                .map_err(|e| e.to_string())?;
+            let tags: Vec<String> = listed
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            let keep = crate::prune::Keep {
+                current: app.release.clone(),
+                old: app.old_release.clone(),
+            };
+            let mut removed = 0usize;
+            let mut failed = 0usize;
+            for tag in crate::prune::select_removals(&tags, &keep, body.keep) {
+                let image = format!("{repo}:{tag}");
+                match run.exec(&crate::docker::rmi(&image)) {
+                    Ok(o) if o.success() => removed += 1,
+                    _ => failed += 1,
+                }
+            }
+            Ok(serde_json::json!({"removed": removed, "failed": failed}))
+        },
+    )
     .into_response()
 }
 
@@ -737,6 +1334,207 @@ fn resolve_latest(app: &App, repo: &std::path::Path) -> Result<(String, String),
         app.name,
         repo.display()
     )))
+}
+
+/// `GET /apps/{name}/drift` — how far the live deployment is from the newest
+/// source version, and whether that version is already built.
+///
+/// This is the read model behind the app page's "current vs latest" card. It
+/// deliberately reports the *fetched* `origin/<branch>`, not a network fetch:
+/// a read must not mutate the checkout, and a stale checkout must be visible as
+/// "last fetched" rather than silently claimed as current.
+async fn app_drift(State(state): State<Shared>, Path(name): Path<String>) -> impl IntoResponse {
+    let app = match load_app(&state, &name) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    };
+    let repo = app.build_repo.clone().or(app.repo.clone());
+    match tokio::task::spawn_blocking(move || compute_drift(&app, repo.as_deref())).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("drift query failed: {e}"),
+        ),
+    }
+}
+
+/// The pure state machine behind the drift card. Kept separate so it can be
+/// tested without a git checkout or Docker.
+fn drift_state(
+    live: Option<&str>,
+    latest: Option<&str>,
+    built: bool,
+    has_source: bool,
+    live_image_present: bool,
+) -> &'static str {
+    if live.is_none() {
+        return "not_deployed";
+    }
+    if !live_image_present {
+        return "live_unbuilt";
+    }
+    if !has_source {
+        return "no_source";
+    }
+    let Some(latest) = latest else {
+        return "unknown";
+    };
+    let Some(live) = live else {
+        return "not_deployed";
+    };
+    if live == latest || live.starts_with(latest) || latest.starts_with(live) {
+        return "up_to_date";
+    }
+    if built {
+        "behind_built"
+    } else {
+        "behind_unbuilt"
+    }
+}
+
+fn same_commit(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a == b || a.starts_with(b) || b.starts_with(a))
+}
+
+/// Reads `<subject>\0<committed-at>` for one revision. Missing values become
+/// null; a git failure never fails the whole drift response.
+fn git_summary(repo: &std::path::Path, rev: &str) -> (Option<String>, Option<String>) {
+    let spec = git::log_one(repo, rev).timeout(GIT_TIMEOUT);
+    match exec::run_capture(&spec) {
+        Ok(out) if out.success() => {
+            let text = out.stdout_trimmed();
+            match text.split_once('\0') {
+                Some((subject, committed_at)) => (
+                    (!subject.trim().is_empty()).then(|| subject.trim().to_string()),
+                    (!committed_at.trim().is_empty()).then(|| committed_at.trim().to_string()),
+                ),
+                None => (
+                    (!text.trim().is_empty()).then(|| text.trim().to_string()),
+                    None,
+                ),
+            }
+        }
+        _ => (None, None),
+    }
+}
+
+fn compute_drift(app: &App, repo: Option<&std::path::Path>) -> serde_json::Value {
+    let live_release = app.release.clone();
+    let live_up = deploy::live_status(app).map(|s| s.up).unwrap_or(false);
+
+    let images = app
+        .image_repo
+        .as_deref()
+        .and_then(|repo| list_images(repo).ok())
+        .unwrap_or_default();
+
+    let live_image_present = match (app.kind, app.root.as_deref(), live_release.as_deref()) {
+        (crate::registry::Kind::Static, Some(root), Some(live)) => {
+            crate::static_site::ensure_release(std::path::Path::new(root), live).is_ok()
+        }
+        _ => live_release
+            .as_deref()
+            .is_some_and(|live| image_for(&images, live).is_some()),
+    };
+
+    let latest = repo.and_then(|repo| {
+        resolve_latest(app, repo).ok().map(|(release, source)| {
+            let (subject, committed_at) = git_summary(repo, &source);
+            (release, source, subject, committed_at)
+        })
+    });
+
+    let commits_behind = match (repo, live_release.as_deref(), latest.as_ref()) {
+        (Some(repo), Some(live), Some((_, source, _, _))) if !same_commit(live, source) => {
+            let range = format!("{live}..{source}");
+            exec::run_capture(&git::rev_list_count(repo, &range).timeout(GIT_TIMEOUT))
+                .ok()
+                .filter(|o| o.success())
+                .and_then(|o| o.stdout_trimmed().parse::<u64>().ok())
+        }
+        _ => Some(0),
+    };
+
+    let built = latest.as_ref().and_then(|(release, _, _, _)| {
+        if app.kind == crate::registry::Kind::Static {
+            app.root.as_deref().and_then(|root| {
+                crate::static_site::ensure_release(std::path::Path::new(root), release)
+                    .ok()
+                    .map(|path| {
+                        serde_json::json!({
+                            "release": release,
+                            "tag": release,
+                            "path": path,
+                            "size": null,
+                            "created": null,
+                        })
+                    })
+            })
+        } else {
+            image_for(&images, release).cloned()
+        }
+    });
+
+    let state = drift_state(
+        live_release.as_deref(),
+        latest.as_ref().map(|(release, _, _, _)| release.as_str()),
+        built.is_some(),
+        repo.is_some(),
+        live_image_present,
+    );
+
+    let message = match state {
+        "not_deployed" => "Not deployed yet".to_string(),
+        "no_source" => "No source checkout configured".to_string(),
+        "unknown" => "Could not resolve the latest source version".to_string(),
+        "up_to_date" => "Up to date with the fetched source".to_string(),
+        "behind_built" => match commits_behind {
+            Some(n) => format!(
+                "{n} commit{} behind; the latest image is ready",
+                if n == 1 { "" } else { "s" }
+            ),
+            None => "Newer source is available and already built".to_string(),
+        },
+        "behind_unbuilt" => match commits_behind {
+            Some(n) => format!(
+                "{n} commit{} behind; build the latest version to deploy",
+                if n == 1 { "" } else { "s" }
+            ),
+            None => "Newer source is available but not built yet".to_string(),
+        },
+        _ => "Unknown version state".to_string(),
+    };
+
+    serde_json::json!({
+        "live": {
+            "release": live_release,
+            "live_port": app.live_port,
+            "up": live_up,
+            "image_present": live_image_present,
+        },
+        "latest": latest.map(|(release, source, subject, committed_at)| serde_json::json!({
+            "release": release,
+            "source": source,
+            "subject": subject,
+            "committed_at": committed_at,
+        })),
+        "built": built,
+        "commits_behind": commits_behind,
+        "state": state,
+        "message": message,
+        "source": repo.map(|p| p.display().to_string()),
+    })
+}
+
+/// Finds the image record for a release, using the same prefix rule as the web
+/// client: a short tag and a long commit are the same release.
+fn image_for<'a>(images: &'a [serde_json::Value], release: &str) -> Option<&'a serde_json::Value> {
+    images.iter().find(|image| {
+        image
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .is_some_and(|tag| same_commit(tag, release))
+    })
 }
 
 #[derive(Deserialize)]
@@ -859,31 +1657,35 @@ struct ApplyBody {
 
 async fn apply_config(
     State(state): State<Shared>,
+    headers: HeaderMap,
     Json(body): Json<Option<ApplyBody>>,
 ) -> impl IntoResponse {
     let dry = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
-    let loaded = match load(&state) {
-        Ok(l) => l,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let problems = collect_problems(&state, &loaded);
-    let (errors, _) = validator::counts(&problems);
-    if errors > 0 {
-        // Keep the structured problem list, but also carry the standard
-        // `{"error": ...}` field every other non-2xx response uses.
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("{errors} error(s) in the registry; nothing was applied"),
-                "errors": errors,
-                "problems": problems,
-            })),
-        )
-            .into_response();
-    }
-    let apps = loaded.sorted();
     let state2 = state.clone();
-    spawn_job(&state, None, dry, move |run| {
+    spawn_job(&state, None, dry, Some(api_actor(&headers)), move |run| {
+        let _estate = crate::lock::Lock::acquire(
+            &state2.lock_dir,
+            crate::lock::estate_lock_name(),
+            crate::lock::ACQUIRE_TIMEOUT,
+        )
+        .map_err(|e| e.to_string())?;
+        // Load after the lock. A pre-lock snapshot can be stale if a deploy
+        // committed while we waited; applying it would write old live_ports.
+        let loaded = load(&state2).map_err(|e| e.to_string())?;
+        let problems = collect_problems(&state2, &loaded);
+        let (errors, _) = validator::counts(&problems);
+        if errors > 0 {
+            return Err(format!(
+                "{errors} error(s) in the registry; nothing was applied: {}",
+                problems
+                    .iter()
+                    .filter(|p| p.severity == crate::registry::Severity::Error)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let apps = loaded.sorted();
         let text = crate::render::render(&apps);
         let paths = crate::apply::ApplyPaths {
             target: state2.target.clone(),
@@ -903,8 +1705,8 @@ async fn apply_config(
 // mutations: deploy / rollback / build / sync
 // ---------------------------------------------------------------------------
 
-fn ctx_for(state: &ServerState) -> Ctx {
-    Ctx {
+fn ctx_for(state: &ServerState) -> DeployContext {
+    DeployContext {
         registry_dir: state.registry.clone(),
         state_dir: state.state_dir.clone(),
         lock_dir: state.lock_dir.clone(),
@@ -921,10 +1723,34 @@ fn ctx_for(state: &ServerState) -> Ctx {
 
 /// Opens the log, starts the run, detaches the work into a thread, and
 /// returns the run id to the caller.
-fn spawn_job<F>(state: &ServerState, app: Option<&str>, dry_run: bool, work: F) -> impl IntoResponse
+fn api_actor(headers: &HeaderMap) -> String {
+    let key = login_key(headers);
+    if key == "unknown" {
+        "api".to_string()
+    } else {
+        format!("api:{key}")
+    }
+}
+
+fn spawn_job<F>(
+    state: &ServerState,
+    app: Option<&str>,
+    dry_run: bool,
+    actor: Option<String>,
+    work: F,
+) -> impl IntoResponse
 where
     F: FnOnce(&mut Run) -> Result<serde_json::Value, String> + Send + 'static,
 {
+    let permit = match JOB_SLOTS.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent operations; wait for one to finish",
+            );
+        }
+    };
     let argv: Vec<String> = vec!["swapdock".into(), "api".into()];
     let mode = if dry_run {
         RunMode::DryRun
@@ -935,12 +1761,14 @@ where
         Ok(l) => l,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let mut run = match Run::start(
+    let app_name = app.map(str::to_string);
+    let mut run = match Run::start_as(
         log,
         mode,
-        app.map(str::to_string),
+        app_name.clone(),
         &argv,
         crate::redact::Redactor::new(),
+        Some(actor.unwrap_or_else(|| "api".to_string())),
     ) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -948,6 +1776,7 @@ where
     let run_id = run.id().to_string();
     let run_id2 = run_id.clone();
     std::thread::spawn(move || {
+        let _permit = permit;
         // A panic in the job must not leave a dangling run in the log: catch it,
         // finish the run as failed, then let the panic continue to the thread
         // boundary. `AssertUnwindSafe` is sound here because the run is closed
@@ -960,14 +1789,27 @@ where
                     Ok(_) => RunStatus::Ok,
                     Err(_) => RunStatus::Failed,
                 };
+                let failure = result.as_ref().err().cloned();
                 let _ = run.finish(status);
-                if let Err(e) = &result {
-                    tracing::warn!(run = %run_id2, "job failed: {e}");
+                if let Some(error) = failure {
+                    tracing::warn!(run = %run_id2, "job failed: {error}");
+                    if !dry_run
+                        && let Err(e) =
+                            crate::notify::send_failure(app_name.as_deref(), &run_id2, &error)
+                    {
+                        tracing::warn!(run = %run_id2, "failure webhook failed: {e}");
+                    }
                 }
             }
             Err(payload) => {
                 let _ = run.finish(RunStatus::Failed);
                 tracing::error!(run = %run_id2, "job panicked; run closed as failed");
+                if !dry_run
+                    && let Err(e) =
+                        crate::notify::send_failure(app_name.as_deref(), &run_id2, "job panicked")
+                {
+                    tracing::warn!(run = %run_id2, "failure webhook failed: {e}");
+                }
                 std::panic::resume_unwind(payload);
             }
         }
@@ -992,6 +1834,7 @@ struct DeployBody {
 async fn deploy_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<DeployBody>>,
 ) -> impl IntoResponse {
     let body = body.unwrap_or_default();
@@ -1005,11 +1848,17 @@ async fn deploy_app(
     };
     let ctx = ctx_for(&state);
     let mut deploy_app = app;
-    spawn_job(&state, Some(&name), body.dry_run, move |run| {
-        deploy::deploy(run, &ctx, &mut deploy_app, &release)
-            .map(|()| serde_json::json!({}))
-            .map_err(|e| e.to_string())
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        body.dry_run,
+        Some(api_actor(&headers)),
+        move |run| {
+            deploy::deploy(run, &ctx, &mut deploy_app, &release)
+                .map(|()| serde_json::json!({}))
+                .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
@@ -1022,6 +1871,7 @@ struct DryBody {
 async fn rollback_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<DryBody>>,
 ) -> impl IntoResponse {
     let dry = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
@@ -1030,11 +1880,17 @@ async fn rollback_app(
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
     let ctx = ctx_for(&state);
-    spawn_job(&state, Some(&name), dry, move |run| {
-        deploy::rollback(run, &ctx, &mut app)
-            .map(|old| serde_json::json!({"rolled_back_to": old}))
-            .map_err(|e| e.to_string())
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        dry,
+        Some(api_actor(&headers)),
+        move |run| {
+            deploy::rollback(run, &ctx, &mut app)
+                .map(|old| serde_json::json!({"rolled_back_to": old}))
+                .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
@@ -1049,6 +1905,7 @@ struct BuildBody {
 async fn build_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<BuildBody>>,
 ) -> impl IntoResponse {
     let body = body.unwrap_or_default();
@@ -1066,21 +1923,27 @@ async fn build_app(
     if !crate::registry::is_valid_release_arg(&release) {
         return error_response(
             StatusCode::CONFLICT,
-            &format!("invalid release {release:?}: must be a commit SHA (hex, 4-64 chars)"),
+            &format!("invalid release {release:?}: must be a commit SHA (hex, 7-64 chars)"),
         );
     }
     let env_host = std::env::var("SWAPDOCK_BUILD_HOST").ok();
     let host = builder::resolve_host(body.build_host.as_deref(), env_host.as_deref(), &app);
-    spawn_job(&state, Some(&name), body.dry_run, move |run| {
-        let built = if builder::is_local(&host) {
-            let work_parent = std::env::temp_dir().join("swapdock-build");
-            builder::build_local(run, &app, &release, &work_parent)
-        } else {
-            builder::build_ssh(run, &app, &release, &host)
-        }
-        .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({"image_ref": built.image_ref, "release": built.release}))
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        body.dry_run,
+        Some(api_actor(&headers)),
+        move |run| {
+            let built = if builder::is_local(&host) {
+                let work_parent = std::env::temp_dir().join("swapdock-build");
+                builder::build_local(run, &app, &release, &work_parent)
+            } else {
+                builder::build_ssh(run, &app, &release, &host)
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"image_ref": built.image_ref, "release": built.release}))
+        },
+    )
     .into_response()
 }
 
@@ -1268,6 +2131,7 @@ struct TransferBody {
 async fn transfer_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<TransferBody>>,
 ) -> impl IntoResponse {
     let body = body.unwrap_or_default();
@@ -1281,7 +2145,7 @@ async fn transfer_app(
     if !crate::registry::is_valid_release_arg(&release) {
         return error_response(
             StatusCode::CONFLICT,
-            &format!("invalid release {release:?}: must be a commit SHA (hex, 4-64 chars)"),
+            &format!("invalid release {release:?}: must be a commit SHA (hex, 7-64 chars)"),
         );
     }
     let Some(target) = body.target.clone().filter(|t| !t.trim().is_empty()) else {
@@ -1300,23 +2164,30 @@ async fn transfer_app(
         );
     }
     let dir = state.transfer_dir.clone();
-    spawn_job(&state, Some(&name), false, move |run| {
-        transfer::transfer(run, &app, &release, &target, &dir)
-            .map(|outcome| {
-                serde_json::json!({
-                    "image_ref": outcome.image_ref,
-                    "target": outcome.target,
-                    "method": outcome.method,
+    spawn_job(
+        &state,
+        Some(&name),
+        false,
+        Some(api_actor(&headers)),
+        move |run| {
+            transfer::transfer(run, &app, &release, &target, &dir)
+                .map(|outcome| {
+                    serde_json::json!({
+                        "image_ref": outcome.image_ref,
+                        "target": outcome.target,
+                        "method": outcome.method,
+                    })
                 })
-            })
-            .map_err(|e| e.to_string())
-    })
+                .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
 async fn sync_app(
     State(state): State<Shared>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Option<DryBody>>,
 ) -> impl IntoResponse {
     let dry = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
@@ -1324,11 +2195,17 @@ async fn sync_app(
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e.to_string()),
     };
-    spawn_job(&state, Some(&name), dry, move |run| {
-        deploy::sync_repo(run, &app)
-            .map(|sha| serde_json::json!({"head": sha}))
-            .map_err(|e| e.to_string())
-    })
+    spawn_job(
+        &state,
+        Some(&name),
+        dry,
+        Some(api_actor(&headers)),
+        move |run| {
+            deploy::sync_repo(run, &app)
+                .map(|sha| serde_json::json!({"head": sha}))
+                .map_err(|e| e.to_string())
+        },
+    )
     .into_response()
 }
 
@@ -1357,9 +2234,9 @@ async fn verify_app(
     };
     let since_ms = match crate::id::RunId::parse(&q.since) {
         Some(id) => {
-            let read = match TraceLog::read(&state.trace) {
+            let read = match read_trace(state.trace.clone()).await {
                 Ok(r) => r,
-                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
             };
             match read.events.iter().find_map(|e| match e {
                 TraceEvent::RunStart { run_id, ts_ms, .. } if run_id == id.as_str() => Some(*ts_ms),
@@ -1391,18 +2268,72 @@ async fn verify_app(
         .access_log
         .clone()
         .unwrap_or_else(|| PathBuf::from(crate::verify::DEFAULT_ACCESS_LOG));
-    match crate::verify::read_lines(&log_path) {
-        Ok(lines) => {
-            let report = crate::verify::verify(&app.hostnames, since_ms, lines.into_iter());
-            (StatusCode::OK, Json(serde_json::to_value(report).unwrap())).into_response()
+    // The API must not be an arbitrary-file reader. Only the nginx log tree is
+    // allowed, only a regular file, and only up to a bounded size. `/dev/zero`
+    // and a multi-gigabyte file are both rejected before any read.
+    const MAX_ACCESS_LOG_BYTES: u64 = 64 * 1024 * 1024;
+    let canonical = match std::fs::canonicalize(&log_path) {
+        Ok(path) => path,
+        Err(e) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!("access log {} is not readable: {e}", log_path.display()),
+            );
         }
-        Err(e) => error_response(StatusCode::CONFLICT, &e.to_string()),
+    };
+    // Path::starts_with is component-aware; a string prefix would also accept
+    // `/var/log/nginx-old/...`. Canonicalize first, then compare components.
+    if !canonical.starts_with(std::path::Path::new("/var/log/nginx")) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "access_log must be under /var/log/nginx",
+        );
     }
+    match std::fs::metadata(&canonical) {
+        Ok(meta) if !meta.is_file() => {
+            return error_response(StatusCode::BAD_REQUEST, "access_log must be a regular file");
+        }
+        Ok(meta) if meta.len() > MAX_ACCESS_LOG_BYTES => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "access_log exceeds the 64 MiB limit",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!("access log {} is not readable: {e}", canonical.display()),
+            );
+        }
+    }
+    let log = canonical.clone();
+    let lines = match tokio::task::spawn_blocking(move || crate::verify::read_lines(&log)).await {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(e)) => return error_response(StatusCode::CONFLICT, &e.to_string()),
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("log read task failed: {e}"),
+            );
+        }
+    };
+    let report = crate::verify::verify(&app.hostnames, since_ms, lines.into_iter());
+    let body = serde_json::to_value(report).expect("verify report is always serializable");
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // runs
 // ---------------------------------------------------------------------------
+
+/// Reads the trace log off the async runtime. `TraceLog::read` is a blocking
+/// file read; large logs must not stall unrelated requests on a worker thread.
+async fn read_trace(path: PathBuf) -> Result<crate::trace::Read, String> {
+    tokio::task::spawn_blocking(move || TraceLog::read(&path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
 
 #[derive(Deserialize)]
 struct RunsQuery {
@@ -1411,7 +2342,7 @@ struct RunsQuery {
 
 async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(20);
-    match TraceLog::read(&state.trace) {
+    match read_trace(state.trace.clone()).await {
         Ok(read) => {
             let mut summaries: Vec<serde_json::Value> = Vec::new();
             for ev in &read.events {
@@ -1421,14 +2352,26 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
                         ts,
                         mode,
                         app,
+                        actor,
+                        pid,
+                        boot,
                         ..
                     } => summaries.push(serde_json::json!({
                         "run_id": run_id,
                         "started": ts,
                         "app": app,
+                        "actor": actor,
                         // Serialize rather than `format!("{mode:?}")`: the
                         // frontend contract is the serde spelling ("live").
                         "status": serde_json::to_value(mode).unwrap_or(serde_json::Value::Null),
+                        // `state` is the run's lifecycle, not its mode: a run
+                        // whose process died must not read as "live" forever.
+                        "state": serde_json::to_value(crate::trace::run_state(
+                            *pid,
+                            boot.as_deref(),
+                            None,
+                        ))
+                        .unwrap_or(serde_json::Value::Null),
                         "steps": 0,
                         "non_ok": 0,
                     })),
@@ -1454,6 +2397,8 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
                         {
                             cur["status"] =
                                 serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
+                            cur["state"] =
+                                serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
                         }
                     }
                 }
@@ -1467,9 +2412,9 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
 }
 
 async fn show_run(State(state): State<Shared>, Path(id): Path<String>) -> impl IntoResponse {
-    let read = match TraceLog::read(&state.trace) {
+    let read = match read_trace(state.trace.clone()).await {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     let events: Vec<&TraceEvent> = read
         .events
@@ -1477,7 +2422,7 @@ async fn show_run(State(state): State<Shared>, Path(id): Path<String>) -> impl I
         .filter(|e| match e {
             TraceEvent::RunStart { run_id, .. }
             | TraceEvent::Step { run_id, .. }
-            | TraceEvent::RunEnd { run_id, .. } => run_id == &id,
+            | TraceEvent::RunEnd { run_id, .. } => run_id.as_str() == id.as_str(),
         })
         .collect();
     if events.is_empty() {
@@ -1493,7 +2438,15 @@ async fn resume_run(State(state): State<Shared>, Path(id): Path<String>) -> impl
     let Some(id) = crate::id::RunId::parse(&id) else {
         return error_response(StatusCode::BAD_REQUEST, "not a valid run id");
     };
-    match TraceLog::resume_point(&state.trace, &id) {
+    let path = state.trace.clone();
+    let resume_id = id.clone();
+    let resume = tokio::task::spawn_blocking(move || {
+        TraceLog::resume_point(&path, &resume_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|result| result);
+    match resume {
         Ok(Some(p)) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1502,12 +2455,13 @@ async fn resume_run(State(state): State<Shared>, Path(id): Path<String>) -> impl
                 "last_step": p.last_step,
                 "last_status": format!("{:?}", p.last_status),
                 "non_ok_steps": p.non_ok_steps,
+                "state": format!("{:?}", p.state()),
                 "ended": p.ended.map(|s| format!("{s:?}")),
             })),
         )
             .into_response(),
         Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("no steps for run {id}")),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -1557,8 +2511,17 @@ async fn run_events(
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
         }
     }
+    let permit = match EVENT_SLOTS.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many open event streams; close one and retry",
+            );
+        }
+    };
     let stream = stream::unfold(
-        EventsState::new(state.trace.clone(), run_id.as_str().to_string()),
+        EventsState::new(state.trace.clone(), run_id.as_str().to_string(), permit),
         |mut st| async move {
             loop {
                 if let Some(event) = st.pending.pop_front() {
@@ -1573,7 +2536,7 @@ async fn run_events(
                     st.done = true;
                     continue;
                 }
-                if let Err(e) = st.poll() {
+                if let Err(e) = st.poll().await {
                     // A read failure is terminal for this stream; report it as
                     // an SSE event rather than a bare disconnect.
                     st.pending
@@ -1618,6 +2581,8 @@ fn run_exists(path: &std::path::Path, run_id: &str) -> bool {
 
 /// Cursor over the run log for one SSE client.
 struct EventsState {
+    /// Held until the stream is dropped; caps concurrent SSE tails.
+    _permit: tokio::sync::OwnedSemaphorePermit,
     path: PathBuf,
     run_id: String,
     /// Byte offset of the last complete line already forwarded.
@@ -1630,8 +2595,9 @@ struct EventsState {
 }
 
 impl EventsState {
-    fn new(path: PathBuf, run_id: String) -> Self {
+    fn new(path: PathBuf, run_id: String, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
         Self {
+            _permit: permit,
             path,
             run_id,
             offset: 0,
@@ -1642,8 +2608,19 @@ impl EventsState {
     }
 
     /// Reads newly appended lines and queues the ones for this run.
-    fn poll(&mut self) -> std::io::Result<()> {
-        let events = read_appended(&self.path, &mut self.offset, &self.run_id)?;
+    ///
+    /// The file I/O runs on the blocking pool so a large log or a slow disk
+    /// cannot stall unrelated HTTP/SSE tasks on an async worker.
+    async fn poll(&mut self) -> std::io::Result<()> {
+        let path = self.path.clone();
+        let run_id = self.run_id.clone();
+        let mut offset = self.offset;
+        let (events, new_offset) = tokio::task::spawn_blocking(move || {
+            read_appended(&path, &mut offset, &run_id).map(|events| (events, offset))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
+        self.offset = new_offset;
         for event in events {
             let ended = matches!(event, TraceEvent::RunEnd { .. });
             self.last_event = Instant::now();
@@ -1764,6 +2741,8 @@ mod tests {
             lock_dir: dir.path().join("lock"),
             drain_secs: 0,
             transfer_dir: dir.path().join("transfer"),
+            auth: AuthConfig::unauthenticated_for_tests(),
+            rate: Arc::new(RateLimiter::new(240, 60)),
         };
         (state, dir)
     }
@@ -1775,7 +2754,7 @@ mod tests {
         let res = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/apps/blog/inspect")
+                    .uri("/api/apps/blog/inspect")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1807,11 +2786,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_refuses_missing_material_before_binding() {
+        let (state, _dir) = test_state();
+        let err = serve(
+            state,
+            "127.0.0.1:0",
+            Some(TlsConfig {
+                cert: std::path::PathBuf::from("/missing/cert.pem"),
+                key: std::path::PathBuf::from("/missing/key.pem"),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cert.pem"), "{err}");
+    }
+
+    #[tokio::test]
     async fn health_is_also_served_under_api() {
         let (state, _dir) = test_state();
         let (status, json) = get_json(state, "/api/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn auth_is_required_except_for_health() {
+        let (mut state, _dir) = test_state();
+        state.auth = AuthConfig::for_tests("0123456789abcdef");
+        let app = router(state);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/apps")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let health = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/apps")
+                    .header("authorization", "Bearer 0123456789abcdef")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bearer.status(), StatusCode::OK);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/apps?token=0123456789abcdef")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // `?token=` is SSE-only; a normal API call must use the header.
+        assert_eq!(query.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn session_login_sets_cookie_and_csrf_protects_mutations() {
+        let (mut state, _dir) = test_state();
+        state.auth = AuthConfig::for_tests("0123456789abcdef");
+        let app = router(state);
+
+        let login = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"password":"0123456789abcdef"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let bytes = axum::body::to_bytes(login.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = json["csrf_token"].as_str().unwrap().to_string();
+
+        let session = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+
+        let body = r#"{"name":"session-created","kind":"container"}"#;
+        let without_csrf = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/apps")
+                    .header("content-type", "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(without_csrf.status(), StatusCode::FORBIDDEN);
+
+        let garbage_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/apps")
+                    .header("content-type", "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::AUTHORIZATION, "Bearer not-the-token")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            garbage_bearer.status(),
+            StatusCode::FORBIDDEN,
+            "a syntactically valid but wrong bearer must not skip CSRF"
+        );
+
+        let with_csrf = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/apps")
+                    .header("content-type", "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(with_csrf.status(), StatusCode::FORBIDDEN);
+        assert_ne!(with_csrf.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn drift_reports_not_deployed_for_a_fresh_app() {
+        let (state, _dir) = test_state();
+        let (status, json) = get_json(state, "/apps/blog/drift").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["state"], "not_deployed");
+        assert!(json["live"]["release"].is_null(), "{json}");
     }
 
     #[tokio::test]
@@ -1821,7 +2982,7 @@ mod tests {
         let res = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/apps")
+                    .uri("/api/apps")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1835,6 +2996,65 @@ mod tests {
         assert_eq!(json[0]["app"]["name"], "blog");
     }
 
+    #[test]
+    fn probe_address_classes_are_public_or_refused() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::1",
+            "fd00::1",
+        ] {
+            assert!(!super::is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(super::is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn probe_url_ports_default_and_parse() {
+        assert_eq!(
+            super::url_host_port("https://example.com/x"),
+            Some(("example.com".into(), 443))
+        );
+        assert_eq!(
+            super::url_host_port("http://example.com:8080/x"),
+            Some(("example.com".into(), 8080))
+        );
+        assert_eq!(
+            super::url_host_port("http://[::1]:9000/"),
+            Some(("::1".into(), 9000))
+        );
+        assert_eq!(super::url_host_port("ftp://example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn import_reports_a_bad_compose_dir_as_a_client_error() {
+        let (state, _dir) = test_state();
+        let (status, _json) = post_json(
+            state,
+            "/import",
+            serde_json::json!({"compose_dir": "/definitely/not/a/compose/dir"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_run_is_reported_as_interrupted() {
+        let (state, _dir) = test_state();
+        std::fs::write(
+            &state.trace,
+            "{\"event\":\"run_start\",\"run_id\":\"01J0ORPHAN\",\"ts\":\"2026-10-22T00:00:00Z\",\"ts_ms\":1,\"version\":\"0.2.0\",\"mode\":\"live\",\"app\":null,\"actor\":\"api\",\"pid\":0,\"argv\":[\"swapdock\"]}\n",
+        )
+        .unwrap();
+        let (status, json) = get_json(state, "/runs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json[0]["state"], "interrupted", "{json}");
+    }
+
     #[tokio::test]
     async fn runs_is_empty_for_a_fresh_log() {
         let (state, _dir) = test_state();
@@ -1842,7 +3062,7 @@ mod tests {
         let res = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/runs")
+                    .uri("/api/runs")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1878,11 +3098,21 @@ mod tests {
     // ---- helpers ----
 
     /// Drives one request through the router and decodes a JSON body.
+    /// Tests that predate the `/api` mount keep their short paths; the helper
+    /// adds the prefix unless the caller already supplied it.
+    fn api_uri(uri: &str) -> String {
+        if uri.starts_with("/api") || uri == "/health" {
+            uri.to_string()
+        } else {
+            format!("/api{uri}")
+        }
+    }
+
     async fn get_json(state: ServerState, uri: &str) -> (StatusCode, serde_json::Value) {
         let res = router(state)
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(uri)
+                    .uri(api_uri(uri))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1906,7 +3136,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("PUT")
-                    .uri(uri)
+                    .uri(api_uri(uri))
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
@@ -1929,7 +3159,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri(uri)
+                    .uri(api_uri(uri))
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
@@ -2042,7 +3272,7 @@ mod tests {
         let res = router(state)
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!("/events?run={run_id}"))
+                    .uri(format!("/api/events?run={run_id}"))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2443,16 +3673,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_routes_are_served_at_both_prefixes() {
+    async fn build_routes_are_served_under_api_only() {
         let (state, _dir) = test_state();
-        for uri in ["/api/build/apps/blog/git", "/build/apps/blog/git"] {
-            let (status, _) = get_json(state.clone(), uri).await;
-            assert_eq!(
-                status,
-                StatusCode::CONFLICT,
-                "{uri} must route to the handler (no repo → 409, not 404)"
-            );
-        }
+        let (status, _) = get_json(state.clone(), "/api/build/apps/blog/git").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/build/apps/blog/git")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "the un-prefixed compatibility route must be gone"
+        );
     }
 
     #[tokio::test]
@@ -2487,5 +3725,102 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json[0]["app"], "blog");
         assert_eq!(json[0]["status"], "ok", "serde snake_case, not \"Ok\"");
+    }
+
+    #[test]
+    fn drift_state_covers_every_card_state() {
+        assert_eq!(
+            drift_state(None, Some("abc1234"), false, true, true),
+            "not_deployed"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), Some("def5678"), true, false, true),
+            "no_source"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), None, false, true, true),
+            "unknown"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), Some("abc1234"), false, true, true),
+            "up_to_date"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), Some("abcdef0"), true, true, true),
+            "behind_built"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), Some("abcdef0"), false, true, true),
+            "behind_unbuilt"
+        );
+        assert_eq!(
+            drift_state(Some("abc1234"), Some("abcdef0"), false, true, false),
+            "live_unbuilt"
+        );
+    }
+
+    #[test]
+    fn drift_image_lookup_accepts_short_and_long_commits() {
+        let images = vec![serde_json::json!({
+            "ref": "app:9c1f2ab",
+            "tag": "9c1f2ab",
+            "size": "1MB",
+            "created": "2026-10-21 00:00:00 +0000 UTC"
+        })];
+        assert!(image_for(&images, "9c1f2ab").is_some());
+        assert!(image_for(&images, "9c1f2ab1234567890").is_some());
+        assert!(image_for(&images, "deadbee").is_none());
+    }
+
+    #[test]
+    fn probe_host_parsing_rejects_userinfo_and_keeps_the_host() {
+        assert_eq!(
+            url_host("https://example.com/up").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("http://example.com:8080/up").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(url_host("http://[::1]:8080/up").as_deref(), Some("::1"));
+        assert!(url_host("http://user:pass@example.com/up").is_none());
+        assert!(url_host("ftp://example.com/up").is_none());
+    }
+
+    #[test]
+    fn probe_is_limited_to_the_apps_own_hosts() {
+        let app = crate::registry::tests::sample();
+        assert!(probe_target_allowed(&app, "https://example.com/health"));
+        assert!(probe_target_allowed(&app, "http://example.com:8080/health"));
+        assert!(!probe_target_allowed(
+            &app,
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!probe_target_allowed(&app, "http://127.0.0.1:8088/health"));
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::RateLimiter;
+
+    #[test]
+    fn the_api_actor_carries_the_forwarded_client_ip() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("203.0.113.9, 10.0.0.1"),
+        );
+        assert_eq!(super::api_actor(&headers), "api:203.0.113.9");
+        assert_eq!(super::api_actor(&axum::http::HeaderMap::new()), "api");
+    }
+
+    #[test]
+    fn a_client_is_refused_after_the_fixed_window_budget() {
+        let limiter = RateLimiter::new(2, 60);
+        assert!(limiter.allow("127.0.0.1"));
+        assert!(limiter.allow("127.0.0.1"));
+        assert!(!limiter.allow("127.0.0.1"));
+        assert!(limiter.allow("127.0.0.2"));
     }
 }

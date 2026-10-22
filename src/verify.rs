@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::registry::normalize_hostname;
+use crate::registry;
 use crate::time::parse_rfc3339;
 
 /// Default location of the front-door access log on the swapdock host.
@@ -113,7 +113,10 @@ pub struct Flip {
 /// Hostnames compare case-insensitively after the same normalization the
 /// registry uses, because the log records what the client sent.
 pub fn verify(hostnames: &[String], since_ms: i64, lines: impl Iterator<Item = String>) -> Report {
-    let wanted: BTreeSet<String> = hostnames.iter().map(|h| normalize_hostname(h)).collect();
+    let wanted: BTreeSet<String> = hostnames
+        .iter()
+        .map(|h| registry::normalize_hostname(h))
+        .collect();
     let mut report = Report::default();
     // Upstream serving each consecutive request; a change is a flip candidate.
     let mut current: Option<String> = None;
@@ -127,7 +130,7 @@ pub fn verify(hostnames: &[String], since_ms: i64, lines: impl Iterator<Item = S
         if entry.ts_ms < since_ms {
             continue;
         }
-        if !wanted.contains(&normalize_hostname(&entry.host)) {
+        if !wanted.contains(&registry::normalize_hostname(&entry.host)) {
             continue;
         }
 

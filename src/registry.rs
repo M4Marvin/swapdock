@@ -152,6 +152,24 @@ pub struct Backup {
     /// Run this before every deploy. `swapdock backup <app>` always runs it.
     #[serde(default)]
     pub before_deploy: bool,
+    /// Optional argv to restore a snapshot. `{file}` is the snapshot path.
+    ///
+    /// Kept separate from `command` because a dump and a restore are different
+    /// programs: `pg_dump` does not restore, and a snapshot without a tested
+    /// restore path is not a backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_command: Option<Vec<String>>,
+    /// Optional argv that checks a fresh snapshot without restoring it.
+    /// `{file}` is the snapshot path; a non-zero exit fails the backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_command: Option<Vec<String>>,
+    /// Keep the newest N snapshots in `dir`. `None` disables pruning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
+    /// Optional argv that copies a snapshot off the host. `{file}` is the
+    /// snapshot path; a non-zero exit fails the backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offsite_command: Option<Vec<String>>,
 }
 
 /// One app's registry entry.
@@ -393,12 +411,22 @@ impl App {
 
         // --- listen addresses ---
         for addr in self.listen_addrs() {
-            if addr.parse::<IpAddr>().is_err() {
-                out.push(Problem::error(
+            match addr.parse::<IpAddr>() {
+                Err(_) => out.push(Problem::error(
                     "listen-invalid",
                     Some(name),
                     format!("listen address {addr:?} is not an IP address"),
-                ));
+                )),
+                Ok(ip) if !listen_is_private_or_loopback(ip) => out.push(Problem::error(
+                    "listen-not-private",
+                    Some(name),
+                    format!(
+                        "listen address {addr:?} is not loopback or a private network address; \
+                         bind loopback and put a reverse proxy or tunnel in front, or use an \
+                         explicit private interface"
+                    ),
+                )),
+                Ok(_) => {}
             }
         }
 
@@ -431,26 +459,31 @@ impl App {
         } else {
             let slot = self.slot;
             let (a, b) = ports::pair(slot).expect("slot checked above");
-            for (label, port) in [("live_port", self.live_port), ("old_port", self.old_port)] {
-                if let Some(p) = port
-                    && p != a
-                    && p != b
+            // Static apps record the front port in `live_port` for status/probe;
+            // it is not a back-end slot port. Only containers alternate within
+            // the slot pair.
+            if self.kind == Kind::Container {
+                for (label, port) in [("live_port", self.live_port), ("old_port", self.old_port)] {
+                    if let Some(p) = port
+                        && p != a
+                        && p != b
+                    {
+                        out.push(Problem::error(
+                            "port-not-in-slot",
+                            Some(name),
+                            format!("{label} {p} is not in the slot {slot} pair ({a} or {b})"),
+                        ));
+                    }
+                }
+                if let (Some(live), Some(old)) = (self.live_port, self.old_port)
+                    && live == old
                 {
                     out.push(Problem::error(
-                        "port-not-in-slot",
+                        "live-equals-old",
                         Some(name),
-                        format!("{label} {p} is not in the slot {slot} pair ({a} or {b})"),
+                        format!("live_port and old_port are both {live}"),
                     ));
                 }
-            }
-            if let (Some(live), Some(old)) = (self.live_port, self.old_port)
-                && live == old
-            {
-                out.push(Problem::error(
-                    "live-equals-old",
-                    Some(name),
-                    format!("live_port and old_port are both {live}"),
-                ));
             }
         }
 
@@ -489,20 +522,37 @@ impl App {
                              or a backslash, any of which would break the nginx directive"
                         ),
                     )),
+                    Some(r) if root_is_sensitive(r) => out.push(Problem::error(
+                        "root-sensitive",
+                        Some(name),
+                        format!(
+                            "root {r:?} is a system or sensitive directory; a static app must \
+                             serve a dedicated web root (for example /srv/www/<app>/current)"
+                        ),
+                    )),
                     Some(_) => {}
                 }
-                for (label, present) in [
-                    ("live_port", self.live_port.is_some()),
-                    ("image_repo", self.image_repo.is_some()),
-                    ("release", self.release.is_some()),
-                ] {
-                    if present {
-                        out.push(Problem::warning(
-                            "field-unused-for-static",
-                            Some(name),
-                            format!("{label} has no meaning for a static app"),
-                        ));
-                    }
+                // A static app uses `live_port` as the front port to probe and
+                // `release` as the version in the symlink target. Only an image
+                // tag has no meaning, because nginx serves files directly.
+                if self.image_repo.is_some() {
+                    out.push(Problem::warning(
+                        "field-unused-for-static",
+                        Some(name),
+                        "image_repo has no meaning for a static app",
+                    ));
+                }
+                if let Some(port) = self.live_port
+                    && port != self.front_port
+                {
+                    out.push(Problem::error(
+                        "static-live-port",
+                        Some(name),
+                        format!(
+                            "live_port {port} must equal front_port {} for a static app:                              the front port is what nginx serves and what status probes",
+                            self.front_port
+                        ),
+                    ));
                 }
                 if self.strategy != Strategy::Swap {
                     out.push(Problem::error(
@@ -588,7 +638,7 @@ impl App {
                 out.push(Problem::error(
                     "release-not-a-commit-name",
                     Some(name),
-                    format!("{label} {v:?} must be a hex commit name of 7 to 40 characters"),
+                    format!("{label} {v:?} must be a hex commit name of 7 to 64 characters"),
                 ));
             }
         }
@@ -698,6 +748,90 @@ impl App {
                     Some(name),
                     "backup.command[0] must name a program",
                 ));
+            } else if let Some(problem) =
+                backup_argv_problem(&backup.command[0], &backup.command[1..])
+            {
+                out.push(Problem::error(
+                    "backup-unsafe-argv",
+                    Some(name),
+                    format!("backup.command is not safe to run as root: {problem}"),
+                ));
+            }
+            if let Some(verify) = &backup.verify_command {
+                if verify.is_empty() {
+                    out.push(Problem::error(
+                        "backup-verify-empty",
+                        Some(name),
+                        "backup.verify_command must contain at least a program",
+                    ));
+                } else if verify[0].trim().is_empty() {
+                    out.push(Problem::error(
+                        "backup-verify-empty",
+                        Some(name),
+                        "backup.verify_command[0] must name a program",
+                    ));
+                } else if let Some(problem) = backup_argv_problem(&verify[0], &verify[1..]) {
+                    out.push(Problem::error(
+                        "backup-unsafe-argv",
+                        Some(name),
+                        format!("backup.verify_command is not safe to run as root: {problem}"),
+                    ));
+                }
+            }
+            if backup.keep == Some(0) {
+                out.push(Problem::error(
+                    "backup-keep-zero",
+                    Some(name),
+                    "backup.keep must be at least 1; use None to disable pruning",
+                ));
+            } else if backup.keep.is_some_and(|keep| keep > 365) {
+                out.push(Problem::warning(
+                    "backup-keep-large",
+                    Some(name),
+                    "backup.keep above 365 may retain a lot of snapshots",
+                ));
+            }
+            if let Some(restore) = &backup.restore_command {
+                if restore.is_empty() {
+                    out.push(Problem::error(
+                        "backup-restore-empty",
+                        Some(name),
+                        "backup.restore_command must contain at least a program",
+                    ));
+                } else if restore[0].trim().is_empty() {
+                    out.push(Problem::error(
+                        "backup-restore-empty",
+                        Some(name),
+                        "backup.restore_command[0] must name a program",
+                    ));
+                } else if let Some(problem) = backup_argv_problem(&restore[0], &restore[1..]) {
+                    out.push(Problem::error(
+                        "backup-unsafe-argv",
+                        Some(name),
+                        format!("backup.restore_command is not safe to run as root: {problem}"),
+                    ));
+                }
+            }
+            if let Some(offsite) = &backup.offsite_command {
+                if offsite.is_empty() {
+                    out.push(Problem::error(
+                        "backup-offsite-empty",
+                        Some(name),
+                        "backup.offsite_command must contain at least a program",
+                    ));
+                } else if offsite[0].trim().is_empty() {
+                    out.push(Problem::error(
+                        "backup-offsite-empty",
+                        Some(name),
+                        "backup.offsite_command[0] must name a program",
+                    ));
+                } else if let Some(problem) = backup_argv_problem(&offsite[0], &offsite[1..]) {
+                    out.push(Problem::error(
+                        "backup-unsafe-argv",
+                        Some(name),
+                        format!("backup.offsite_command is not safe to run as root: {problem}"),
+                    ));
+                }
             }
             if let Some(dir) = &backup.dir
                 && !dir.is_absolute()
@@ -844,6 +978,9 @@ pub fn save_app(dir: &Path, app: &App) -> std::io::Result<()> {
         let _ = std::os::unix::fs::chown(&staging, Some(meta.uid()), Some(meta.gid()));
     }
     std::fs::rename(&staging, &target)?;
+    // The rename is the commit point; without a parent-directory fsync it can
+    // be lost on power failure while the journal clear survives.
+    std::fs::File::open(dir)?.sync_all()?;
 
     // Prove the write: parse the file back and compare.
     let raw = std::fs::read_to_string(&target)?;
@@ -873,6 +1010,299 @@ pub fn normalize_hostname(host: &str) -> String {
         .strip_suffix('.')
         .unwrap_or(trimmed)
         .to_ascii_lowercase()
+}
+
+/// True when nginx may bind this address without publishing the app directly
+/// to the internet.
+///
+/// Loopback, RFC1918, CGNAT, IPv6 ULA/link-local, and the documentation ranges
+/// (so examples and tests remain usable) are allowed. `0.0.0.0`, `::`, global
+/// unicast, multicast and broadcast are refused. Public exposure belongs at a
+/// reverse proxy or tunnel, not at a registry field that the HTTP API can write.
+fn listen_is_private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() {
+                return false;
+            }
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT / tailnet
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2) // TEST-NET-1
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // benchmarking
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100) // TEST-NET-2
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113) // TEST-NET-3
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let s = v6.segments();
+            v6.is_loopback()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local
+                || (s[0] & 0xffc0) == 0xfe80 // link-local
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+        }
+    }
+}
+
+/// Programs that may run as a root backup/restore command.
+///
+/// This is a positive allowlist, not a shell/interpreter denylist. `tar` and
+/// `rsync` are allowed only through the argument checks below: both can execute
+/// helper programs from options (`--checkpoint-action`, `-e`, ...), so a program
+/// name alone is not a safety proof.
+const BACKUP_PROGRAMS: &[&str] = &[
+    "borg",
+    "gzip",
+    "mariadb-dump",
+    "mongodump",
+    "mysqldump",
+    "pg_dump",
+    "pg_dumpall",
+    "rclone",
+    "redis-cli",
+    "restic",
+    "rsync",
+    "sqlite3",
+    "tar",
+    "xz",
+    "zstd",
+];
+
+/// True when a backup argv is safe enough to run as root.
+///
+/// The registry is HTTP-writable, so this must fail closed. We reject:
+/// * a program containing a path separator (only a bare name from the
+///   allowlist is accepted, so a user cannot point at `/tmp/pg_dump`);
+/// * control characters in any argument;
+/// * known command-execution options for `tar`, `rsync`, `sqlite3`, `restic`
+///   and `borg`.
+pub(crate) fn backup_argv_problem(program: &str, args: &[String]) -> Option<String> {
+    if program.contains('/') {
+        return Some(format!(
+            "{program:?} must be a bare program name from the allowlist"
+        ));
+    }
+    if !BACKUP_PROGRAMS.contains(&program) {
+        return Some(format!(
+            "{program:?} is not an allowlisted backup/restore program; use one of {}",
+            BACKUP_PROGRAMS.join(", ")
+        ));
+    }
+    for arg in args {
+        if arg.chars().any(|c| c.is_control()) {
+            return Some("arguments must not contain control characters".into());
+        }
+        if let Some(problem) = backup_flag_problem(program, arg) {
+            return Some(problem);
+        }
+    }
+    None
+}
+
+/// Flags that may appear after each backup program. Anything outside this
+/// positive table is refused, including GNU long-option abbreviations such as
+/// `--to-comm` and short bundles such as `tar -I`.
+const SAFE_TAR_LONG: &[&str] = &[
+    "--create",
+    "--extract",
+    "--file",
+    "--directory",
+    "--gzip",
+    "--xz",
+    "--zstd",
+    "--exclude",
+    "--format",
+    "--numeric-owner",
+    "--same-permissions",
+    "--preserve-permissions",
+    "--absolute-names",
+    "--one-file-system",
+    "--listed-incremental",
+    "--verbose",
+    "--verify",
+    "--no-recursion",
+];
+const SAFE_RSYNC_LONG: &[&str] = &[
+    "--archive",
+    "--delete",
+    "--numeric-ids",
+    "--exclude",
+    "--include",
+    "--link-dest",
+    "--checksum",
+    "--partial",
+    "--progress",
+    "--compress",
+    "--verbose",
+    "--recursive",
+    "--perms",
+    "--times",
+    "--group",
+    "--owner",
+    "--devices",
+    "--specials",
+    "--hard-links",
+    "--acls",
+    "--xattrs",
+    "--filter",
+    "--chmod",
+];
+const SAFE_COMPRESS_LONG: &[&str] = &[
+    "--stdout",
+    "--decompress",
+    "--force",
+    "--best",
+    "--fast",
+    "--threads",
+    "--keep",
+    "--no-name",
+];
+const SAFE_DB_LONG: &[&str] = &[
+    "--file",
+    "--format",
+    "--no-owner",
+    "--clean",
+    "--inserts",
+    "--column-inserts",
+    "--if-exists",
+    "--no-acl",
+    "--no-comments",
+    "--schema",
+    "--table",
+    "--exclude-table",
+    "--section",
+    "--compress",
+    "--verbose",
+    "--archive",
+    "--out",
+    "--uri",
+    "--dbpath",
+    "--quiet",
+    "--single-transaction",
+    "--routines",
+    "--events",
+    "--triggers",
+    "--add-drop-database",
+    "--databases",
+    "--result-file",
+];
+
+fn backup_flag_problem(program: &str, arg: &str) -> Option<String> {
+    if !arg.starts_with('-') {
+        // Positional arguments are paths, DB names or SQL. `sqlite3` dot
+        // commands still need their own check because `.shell` is execution.
+        if program == "sqlite3" && arg.starts_with('.') {
+            let lower = arg.to_ascii_lowercase();
+            if !(lower.starts_with(".backup") || lower.starts_with(".restore")) {
+                return Some(format!("{arg:?} is not a safe sqlite3 dot command"));
+            }
+        }
+        return None;
+    }
+    if arg.starts_with("--") {
+        let name = arg.split('=').next().unwrap_or(arg);
+        let allowed = match program {
+            "tar" => SAFE_TAR_LONG.contains(&name),
+            "rsync" => SAFE_RSYNC_LONG.contains(&name),
+            "gzip" | "xz" | "zstd" => SAFE_COMPRESS_LONG.contains(&name),
+            "pg_dump" | "pg_dumpall" | "mysqldump" | "mariadb-dump" | "mongodump" | "redis-cli" => {
+                SAFE_DB_LONG.contains(&name)
+            }
+            _ => false,
+        };
+        return if allowed {
+            None
+        } else {
+            Some(format!("{arg:?} is not an allowlisted {program} option"))
+        };
+    }
+    // Short options: refuse bundles containing any character not explicitly
+    // safe. This is what closes `tar -I`, `tar -F` and `rsync -e`.
+    let safe = match program {
+        "tar" => "cxtfzjJvpkOCPh",
+        "rsync" => "avzHArlptgoDPcnu",
+        "gzip" | "xz" | "zstd" => "cdfkh123456789TVqZ",
+        _ => "",
+    };
+    let chars = arg.trim_start_matches('-');
+    if chars.is_empty() || !chars.chars().all(|c| safe.contains(c)) {
+        return Some(format!("{arg:?} contains a non-allowlisted {program} flag"));
+    }
+    None
+}
+
+/// Rejects static roots that would expose the host's system files through
+/// nginx. The dangerous case is `root = "/"`, but `/etc`, `/root`, `/home` and
+/// the Docker state directory are no better. A web root belongs under a
+/// dedicated directory such as `/srv/www/<app>/current`.
+fn root_is_sensitive(path: &str) -> bool {
+    let Some(normalized) = normalize_root(path) else {
+        return true;
+    };
+    if normalized == "/" {
+        return true;
+    }
+    // `root="//etc"`, `///root` and `/srv/www/../etc` are not allowed to hide
+    // behind a prefix check: normalize first.
+    if sensitive_path(&normalized) {
+        return true;
+    }
+    // A symlinked root can point at /etc even when the string looks safe.
+    if let Ok(real) = std::fs::canonicalize(&normalized)
+        && let Some(real) = real.to_str()
+        && sensitive_path(real)
+    {
+        return true;
+    }
+    false
+}
+
+/// Collapses repeated separators and rejects `.`/`..` components.
+fn normalize_root(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
+fn sensitive_path(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return true;
+    }
+    const SENSITIVE: &[&str] = &[
+        "/etc",
+        "/root",
+        "/home",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/boot",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/run",
+        "/var/lib/docker",
+        "/var/run",
+        "/tmp",
+    ];
+    SENSITIVE.iter().any(|prefix| {
+        trimmed == *prefix
+            || trimmed
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// True when a value can be interpolated into one nginx directive unchanged.
@@ -952,7 +1382,7 @@ pub fn is_valid_env_name(name: &str) -> bool {
 
 /// True for a hex commit name of 7 to 40 characters.
 pub fn is_valid_release(release: &str) -> bool {
-    (7..=40).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
+    (7..=64).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// True for a release supplied on the command line or in an API body.
@@ -961,7 +1391,7 @@ pub fn is_valid_release(release: &str) -> bool {
 /// SHA-256). Anything else — a branch, a tag, a shell fragment — is refused
 /// before it can reach a build script or an image tag.
 pub fn is_valid_release_arg(release: &str) -> bool {
-    (4..=64).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
+    (7..=64).contains(&release.len()) && release.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -1050,6 +1480,21 @@ pub(crate) mod tests {
             ..app
         };
         assert_eq!(app.problems(), vec![], "expected a clean static entry");
+    }
+
+    #[test]
+    fn a_static_app_uses_the_front_port_as_its_live_port() {
+        let mut app = sample_static();
+        app.release = Some("abc1234".into());
+        app.live_port = Some(app.front_port);
+        assert!(app.problems().is_empty(), "{:?}", app.problems());
+
+        app.live_port = Some(9000);
+        assert!(
+            codes(&app).contains(&"static-live-port"),
+            "{:?}",
+            codes(&app)
+        );
     }
 
     // ---- round trip ----
@@ -1369,7 +1814,7 @@ pub(crate) mod tests {
         let long_40 = "a".repeat(40);
         let long_64 = "f".repeat(64);
         for good in [
-            "abcd",
+            "abc1234",
             "9c1f2ab",
             "9C1F2AB",
             long_40.as_str(),
@@ -1454,6 +1899,10 @@ pub(crate) mod tests {
             command: vec![],
             dir: Some(PathBuf::from("relative")),
             before_deploy: false,
+            restore_command: None,
+            verify_command: None,
+            keep: None,
+            offsite_command: None,
         });
         let found = codes(&app);
         assert!(
@@ -1468,9 +1917,17 @@ pub(crate) mod tests {
         clean.compose_override = Some(PathBuf::from("/srv/swapdock/overrides/portfolio.yml"));
         clean.public_url = Some("https://example.com/health".into());
         clean.backup = Some(Backup {
-            command: vec!["true".into()],
+            command: vec![
+                "sqlite3".into(),
+                "/data/app.db".into(),
+                ".backup {file}".into(),
+            ],
             dir: Some(PathBuf::from("/var/backups/portfolio")),
             before_deploy: true,
+            restore_command: None,
+            verify_command: None,
+            keep: None,
+            offsite_command: None,
         });
         assert!(clean.problems().is_empty(), "{:?}", clean.problems());
     }
@@ -1510,6 +1967,191 @@ pub(crate) mod tests {
         for good in ["/srv/www/portfolio/current", "/var/www/docsdata"] {
             assert!(is_safe_nginx_value(good), "{good:?}");
         }
+    }
+
+    #[test]
+    fn public_and_wildcard_listeners_are_refused() {
+        for bad in ["0.0.0.0", "::", "8.8.8.8", "2001:4860:4860::8888"] {
+            let mut app = sample();
+            app.listen = vec![bad.into()];
+            assert!(
+                codes(&app).contains(&"listen-not-private"),
+                "{bad:?} must be refused, got {:?}",
+                codes(&app)
+            );
+        }
+        for good in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.2",
+            "100.80.96.4",
+            "fc00::1",
+            "::1",
+        ] {
+            let mut app = sample();
+            app.listen = vec![good.into()];
+            assert!(app.problems().is_empty(), "{good:?}: {:?}", app.problems());
+        }
+    }
+
+    #[test]
+    fn a_system_root_is_refused() {
+        for bad in [
+            "/",
+            "/etc",
+            "//etc",
+            "///root",
+            "/etc/nginx",
+            "/root",
+            "/home/marvin",
+            "/var/lib/docker",
+            "/srv/www/../etc",
+            "/srv/www/./../etc",
+        ] {
+            let mut app = sample_static();
+            app.root = Some(bad.into());
+            assert!(
+                codes(&app).contains(&"root-sensitive"),
+                "{bad:?} must be refused, got {:?}",
+                codes(&app)
+            );
+        }
+        let mut app = sample_static();
+        app.root = Some("/srv/www/docs/current".into());
+        assert!(app.problems().is_empty(), "{:?}", app.problems());
+    }
+
+    #[test]
+    fn a_symlinked_root_is_resolved_before_the_sensitivity_check() {
+        let Ok(dir) = tempfile::TempDir::new_in("/var/tmp") else {
+            return;
+        };
+        let root = dir.path().join("current");
+        std::os::unix::fs::symlink("/etc", &root).unwrap();
+        // The string looks harmless; canonicalize catches the symlink target.
+        assert!(root_is_sensitive(root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_shell_backup_is_refused_without_an_escape_hatch() {
+        let mut app = sample();
+        app.backup = Some(Backup {
+            command: vec!["/bin/sh".into(), "-c".into(), "id".into()],
+            dir: Some(PathBuf::from("/var/backups/portfolio")),
+            before_deploy: false,
+            restore_command: None,
+            verify_command: None,
+            keep: None,
+            offsite_command: None,
+        });
+        assert!(
+            codes(&app).contains(&"backup-unsafe-argv"),
+            "{:?}",
+            codes(&app)
+        );
+    }
+
+    #[test]
+    fn backup_retention_and_verify_argv_are_validated() {
+        let mut app = sample();
+        app.backup = Some(Backup {
+            command: vec![
+                "sqlite3".into(),
+                "/data/app.db".into(),
+                ".backup {file}".into(),
+            ],
+            dir: Some(PathBuf::from("/var/backups/portfolio")),
+            before_deploy: false,
+            restore_command: None,
+            verify_command: Some(vec!["sh".into(), "-c".into(), "true".into()]),
+            keep: Some(0),
+            offsite_command: None,
+        });
+        let found = codes(&app);
+        assert!(found.contains(&"backup-unsafe-argv"), "{found:?}");
+        assert!(found.contains(&"backup-keep-zero"), "{found:?}");
+    }
+
+    #[test]
+    fn backup_flag_allowlist_rejects_tar_exec_and_abbreviations() {
+        for args in [
+            vec!["-I", "/bin/sh -c id"],
+            vec!["-F", "/tmp/script"],
+            vec!["--to-comm", "sh"],
+            vec!["--to-command=sh"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(
+                backup_argv_problem("tar", &args).is_some(),
+                "tar {args:?} must be refused"
+            );
+        }
+        let safe: Vec<String> = ["-c", "-f", "/tmp/a.tar", "/data"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(backup_argv_problem("tar", &safe).is_none(), "{safe:?}");
+    }
+
+    #[test]
+    fn sqlite_dot_command_abbreviations_are_refused() {
+        for command in [".shel id", ".shel", ".system id", ".read /etc/shadow"] {
+            let args = vec!["/data/db".to_string(), command.to_string()];
+            assert!(backup_argv_problem("sqlite3", &args).is_some(), "{command}");
+        }
+        let safe = vec![
+            "/data/db".to_string(),
+            ".backup {file}".to_string(),
+            "PRAGMA integrity_check;".to_string(),
+        ];
+        assert!(backup_argv_problem("sqlite3", &safe).is_none());
+    }
+
+    #[test]
+    fn tar_and_rsync_command_execution_options_are_refused() {
+        let mut app = sample();
+        app.backup = Some(Backup {
+            command: vec![
+                "tar".into(),
+                "--checkpoint=1".into(),
+                "--checkpoint-action=exec=sh -c id".into(),
+                "-cf".into(),
+                "{file}".into(),
+                "/tmp/data".into(),
+            ],
+            dir: None,
+            before_deploy: false,
+            restore_command: None,
+            verify_command: None,
+            keep: None,
+            offsite_command: None,
+        });
+        assert!(
+            codes(&app).contains(&"backup-unsafe-argv"),
+            "{:?}",
+            codes(&app)
+        );
+
+        app.backup.as_mut().unwrap().command = vec![
+            "rsync".into(),
+            "-e".into(),
+            "sh -c id".into(),
+            "/tmp/a".into(),
+            "/tmp/b".into(),
+        ];
+        assert!(
+            codes(&app).contains(&"backup-unsafe-argv"),
+            "{:?}",
+            codes(&app)
+        );
+
+        app.backup.as_mut().unwrap().command =
+            vec!["sqlite3".into(), "/data/db".into(), ".shell id".into()];
+        assert!(
+            codes(&app).contains(&"backup-unsafe-argv"),
+            "{:?}",
+            codes(&app)
+        );
     }
 
     #[test]

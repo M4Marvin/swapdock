@@ -63,6 +63,9 @@ pub enum RunStatus {
     Ok,
     Failed,
     DryRun,
+    /// Still in flight: the opening process is alive on this boot.
+    Running,
+    /// The process died before writing `run_end`.
     Interrupted,
 }
 
@@ -80,6 +83,19 @@ pub enum TraceEvent {
         version: String,
         mode: RunMode,
         app: Option<String>,
+        /// Who started the run: a CLI user, or the API job source. Older logs
+        /// have no field and deserialize to `None`.
+        #[serde(default)]
+        actor: Option<String>,
+        /// Process that opened the run. With `boot` this distinguishes a run
+        /// that is still in flight from one whose process died, so `runs` can
+        /// say `interrupted` instead of leaving it "live" forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        /// Kernel boot id, so a recycled pid after a reboot is not mistaken for
+        /// the original process.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<String>,
         argv: Vec<String>,
     },
     Step {
@@ -132,6 +148,57 @@ pub struct ResumePoint {
     /// Distinguishes "finished" from "died mid-way", which is the whole point
     /// of asking where a run stopped.
     pub ended: Option<RunStatus>,
+    /// Process that opened the run, and its boot id, for the interrupted check.
+    pub pid: Option<u32>,
+    pub boot: Option<String>,
+}
+
+impl ResumePoint {
+    /// Lifecycle state, resolving an unfinished run to `running` or `interrupted`.
+    pub fn state(&self) -> RunStatus {
+        run_state(self.pid, self.boot.as_deref(), self.ended)
+    }
+}
+
+/// Kernel boot id, cached for the life of the process.
+///
+/// Reading it per run would be wasteful, and on a host without the file the
+/// value is simply absent: a run is then judged by its pid alone.
+fn current_boot_id() -> Option<String> {
+    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+    .clone()
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// What a reader should say about a run.
+///
+/// A run with a `run_end` record is finished. Without one, the process that
+/// opened it decides: alive on the same boot means still running; anything else
+/// means the process died mid-run and nothing will ever close it. That is the
+/// difference between "Running for 3 days" and "interrupted", and the reason
+/// the pid and boot id are recorded.
+pub fn run_state(pid: Option<u32>, boot: Option<&str>, ended: Option<RunStatus>) -> RunStatus {
+    if let Some(status) = ended {
+        return status;
+    }
+    let same_boot = match (boot, current_boot_id()) {
+        (Some(recorded), Some(current)) => recorded == current,
+        // Without a recorded boot id the pid is the only evidence available.
+        _ => true,
+    };
+    match pid {
+        Some(pid) if same_boot && pid_is_alive(pid) => RunStatus::Running,
+        _ => RunStatus::Interrupted,
+    }
 }
 
 /// A log file opened for appending.
@@ -152,12 +219,12 @@ fn at(path: &Path, e: std::io::Error) -> std::io::Error {
 impl TraceLog {
     /// Opens (or creates) the log for appending.
     ///
-    /// New files are created world-readable. The log is safe to share because
-    /// secrets are redacted before anything is written; relying on root's umask
-    /// instead left the file unreadable to the operator who needs `show`.
-    /// Existing files keep their mode: opening never rechmods.
+    /// New files are created group-readable (`0640`), not world-readable.
+    /// Secrets are redacted before anything is written, but the log still
+    /// contains argv, paths and container details; it is operator data, not
+    /// public data. Existing files keep their mode: opening never rechmods.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| at(parent, e))?;
@@ -165,9 +232,18 @@ impl TraceLog {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .mode(0o644)
+            .mode(0o640)
             .open(&path)
             .map_err(|e| at(&path, e))?;
+        // `.mode(0o640)` only applies on creation. A binary-only upgrade can
+        // inherit an old 0664 log; tighten it when the current user owns it.
+        if let Ok(metadata) = file.metadata() {
+            let mut permissions = metadata.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(0o640);
+                let _ = file.set_permissions(permissions);
+            }
+        }
         Ok(Self { path, file })
     }
 
@@ -232,9 +308,20 @@ impl TraceLog {
         let mut found: Option<ResumePoint> = None;
         let mut non_ok = 0u32;
         let mut ended: Option<RunStatus> = None;
+        let mut pid: Option<u32> = None;
+        let mut boot: Option<String> = None;
 
         for ev in &read.events {
             match ev {
+                TraceEvent::RunStart {
+                    run_id: id,
+                    pid: run_pid,
+                    boot: run_boot,
+                    ..
+                } if id == run_id.as_str() => {
+                    pid = *run_pid;
+                    boot = run_boot.clone();
+                }
                 TraceEvent::Step {
                     run_id: id,
                     seq,
@@ -252,6 +339,8 @@ impl TraceLog {
                         last_status: *status,
                         non_ok_steps: non_ok,
                         ended: None,
+                        pid,
+                        boot: boot.clone(),
                     });
                 }
                 TraceEvent::RunEnd {
@@ -304,6 +393,31 @@ impl Run {
         argv: &[String],
         redactor: Redactor,
     ) -> anyhow::Result<Self> {
+        let actor = std::env::var("SWAPDOCK_ACTOR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("SUDO_USER")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("USER")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+        Self::start_as(log, mode, app, argv, redactor, actor)
+    }
+
+    /// Starts a run with an explicit actor (used by API jobs).
+    pub fn start_as(
+        log: TraceLog,
+        mode: RunMode,
+        app: Option<String>,
+        argv: &[String],
+        redactor: Redactor,
+        actor: Option<String>,
+    ) -> anyhow::Result<Self> {
         let id = RunId::generate();
         let now = Timestamp::now();
 
@@ -323,6 +437,9 @@ impl Run {
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode,
             app: run.app.clone(),
+            actor,
+            pid: Some(std::process::id()),
+            boot: current_boot_id(),
             argv: run.redactor.argv(argv),
         })?;
 
@@ -382,7 +499,7 @@ impl Run {
             env: self.redactor.env(step.env),
             exit_code: step.exit_code,
             duration_ms: step.duration_ms,
-            detail: step.detail,
+            detail: step.detail.as_ref().map(|d| self.redactor.json(d)),
             error: step.error,
             stdout_tail: step.stdout_tail.map(|s| self.redactor.text(&s)),
             stderr_tail: step.stderr_tail.map(|s| self.redactor.text(&s)),
@@ -485,6 +602,28 @@ mod tests {
     }
 
     #[test]
+    fn a_run_can_record_an_explicit_actor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let log = TraceLog::open(&path).unwrap();
+        let run = Run::start_as(
+            log,
+            RunMode::Live,
+            None,
+            &argv_of(&["swapdock", "api"]),
+            Redactor::new(),
+            Some("api".into()),
+        )
+        .unwrap();
+        run.finish(RunStatus::Ok).unwrap();
+        let read = TraceLog::read(&path).unwrap();
+        assert!(read.events.iter().any(|event| matches!(
+            event,
+            TraceEvent::RunStart { actor, .. } if actor.as_deref() == Some("api")
+        )));
+    }
+
+    #[test]
     fn io_errors_name_the_log_path() {
         // A bare "Permission denied" is what made the host's log problem take
         // an afternoon to find; the message must name the file.
@@ -521,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn new_log_files_are_world_readable() {
+    fn new_log_files_are_group_readable() {
         // The operator runs show/runs unprivileged against a log that root
         // writes. Redaction (not file mode) is what keeps secrets out of it.
         use std::os::unix::fs::PermissionsExt;
@@ -529,7 +668,22 @@ mod tests {
         let path = dir.path().join("deploy.jsonl");
         let _ = TraceLog::open(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "new log files must be readable, got {mode:o}");
+        assert_eq!(
+            mode, 0o640,
+            "new log files must be group-readable, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn opening_tightens_an_old_world_readable_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("deploy.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let _ = TraceLog::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "an inherited 0664 log must be tightened");
     }
 
     #[test]
@@ -781,5 +935,37 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(stamps, sorted, "log lines must be in timestamp order");
         assert!(stamps.iter().all(|s| s.len() == 24 && s.ends_with('Z')));
+    }
+}
+
+#[cfg(test)]
+mod interrupted_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_pid_on_the_same_boot_is_running() {
+        assert_eq!(
+            run_state(Some(std::process::id()), current_boot_id().as_deref(), None),
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn a_dead_pid_is_interrupted() {
+        // PID 0 can never own a process, so this is deterministic.
+        assert_eq!(run_state(Some(0), None, None), RunStatus::Interrupted);
+    }
+
+    #[test]
+    fn a_different_boot_id_is_interrupted_even_if_the_pid_exists() {
+        assert_eq!(
+            run_state(Some(std::process::id()), Some("not-this-boot"), None),
+            RunStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn a_terminal_record_wins_over_pid_evidence() {
+        assert_eq!(run_state(Some(0), None, Some(RunStatus::Ok)), RunStatus::Ok);
     }
 }

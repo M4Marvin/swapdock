@@ -44,8 +44,11 @@ pub enum TransferError {
     #[error("{0} has no image_repo recorded; set image_repo before transferring")]
     NoImageRepo(String),
 
-    #[error("invalid release {0:?}: must be a commit SHA (hex, 4-64 chars)")]
+    #[error("invalid release {0:?}: must be a commit SHA (hex, 7-64 chars)")]
     InvalidRelease(String),
+
+    #[error("invalid SSH transfer target {0:?}: must be [user@]host, not an ssh option")]
+    InvalidTarget(String),
 
     #[error("could not prepare the transfer directory: {0}")]
     Io(String),
@@ -89,6 +92,9 @@ pub fn transfer(
     if !crate::registry::is_valid_release_arg(release) {
         return Err(TransferError::InvalidRelease(release.to_string()));
     }
+    if !crate::ssh::is_valid_destination(target) {
+        return Err(TransferError::InvalidTarget(target.to_string()));
+    }
     let image_ref = app
         .image_ref(release)
         .ok_or_else(|| TransferError::NoImageRepo(app.name.clone()))?;
@@ -122,8 +128,8 @@ pub fn transfer(
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=30",
-            target,
             "--",
+            target,
         ])
         .args(["docker", "load", "-i"])
         .arg(&remote_path)
@@ -142,8 +148,8 @@ pub fn transfer(
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=30",
-            target,
             "--",
+            target,
         ])
         .args(["docker", "image", "inspect", &image_ref])
         .timeout(LOAD_TIMEOUT);
@@ -201,6 +207,7 @@ fn send(
     }
 
     let scp = StepSpec::new("transfer-scp", "scp")
+        .arg("--")
         .arg(tarball.display().to_string())
         .arg(format!("{target}:/tmp/"))
         .timeout(SEND_TIMEOUT);
@@ -275,6 +282,29 @@ mod tests {
         let err = transfer(&mut r, &sample(), "main; evil", "hetzner", dir.path()).unwrap_err();
         assert!(matches!(err, TransferError::InvalidRelease(_)), "{err:?}");
 
+        let read = TraceLog::read(dir.path().join("t.jsonl")).unwrap();
+        assert!(
+            !read
+                .events
+                .iter()
+                .any(|e| matches!(e, TraceEvent::Step { .. })),
+            "validation must run before the first spawn"
+        );
+    }
+
+    #[test]
+    fn transfer_refuses_an_ssh_option_target_before_any_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut r = run(dir.path());
+        let err = transfer(
+            &mut r,
+            &sample(),
+            "9c1f2ab",
+            "-oProxyCommand=sh -c id",
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransferError::InvalidTarget(_)), "{err:?}");
         let read = TraceLog::read(dir.path().join("t.jsonl")).unwrap();
         assert!(
             !read

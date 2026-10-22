@@ -12,9 +12,136 @@
 //! * The image reads from `$IMAGE` with a local default
 //!   (`image: ${PORTFOLIO_IMAGE:-apps-portfolio}`). Same reason.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use thiserror::Error;
 
 use crate::exec::StepSpec;
+
+/// Filenames Compose v2 accepts, in the order they are tried.
+///
+/// `docker compose` itself prefers `compose.yaml`; matching that order means a
+/// directory holding both files deploys the same one the operator sees when
+/// running compose by hand.
+pub const COMPOSE_FILENAMES: [&str; 3] = ["compose.yaml", "compose.yml", "docker-compose.yml"];
+
+/// Why a compose file could not be found.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ComposeFileError {
+    #[error(
+        "no compose file in {dir}: expected one of {candidates}; \
+         create it or point compose_dir at the directory that holds it"
+    )]
+    Missing { dir: String, candidates: String },
+}
+
+/// Finds the compose file in `dir`, preferring Compose v2's names.
+///
+/// Every Compose invocation must use the same file. Resolving it once, here,
+/// keeps the deploy path, adoption and `doctor` from disagreeing when a project
+/// ships `compose.yaml` instead of the legacy `docker-compose.yml`.
+pub fn resolve_compose_file(dir: &Path) -> Result<PathBuf, ComposeFileError> {
+    for name in COMPOSE_FILENAMES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(ComposeFileError::Missing {
+        dir: dir.display().to_string(),
+        candidates: COMPOSE_FILENAMES.join(", "),
+    })
+}
+
+/// Reasons a `swap` must be refused for this service, from the merged model.
+///
+/// The green container runs in a *different* Compose project, so Compose
+/// namespaces its named volumes and default network differently: a service with
+/// `data:/var/lib/app` would mount an empty `project-green_data`, and a service
+/// with `depends_on: [db]` would have no `db` in its project. Both fail silently
+/// or reset data, so they are refused instead of guessed at.
+///
+/// Bind mounts are deliberately allowed: they point at the same host path in
+/// both projects. An anonymous volume (type `volume` with no source) is also
+/// fine to leave alone; it is fresh in either project and holds no named data.
+pub fn swap_blockers(config: &Value, service: &str) -> Vec<String> {
+    let Some(svc) = config.get("services").and_then(|s| s.get(service)) else {
+        return vec![format!(
+            "service {service:?} is missing from the merged compose model"
+        )];
+    };
+
+    let mut out = Vec::new();
+
+    for volume in svc
+        .get("volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let volume_type = volume.get("type").and_then(Value::as_str);
+        let source = volume
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if volume_type == Some("volume")
+            && let Some(source) = source
+        {
+            let target = volume
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown target>");
+            out.push(format!(
+                "service {service:?} mounts named volume {source:?} at {target:?}; \
+                 the green project would mount a new, empty {source:?}"
+            ));
+        }
+    }
+
+    let depends_on = service_references(svc.get("depends_on"));
+    if !depends_on.is_empty() {
+        out.push(format!(
+            "service {service:?} depends on {}; those services would not exist in the green project",
+            depends_on.join(", ")
+        ));
+    }
+
+    let links = service_references(svc.get("links"));
+    if !links.is_empty() {
+        out.push(format!(
+            "service {service:?} links to {}; those links would not exist in the green project",
+            links.join(", ")
+        ));
+    }
+
+    let volumes_from = service_references(svc.get("volumes_from"));
+    if !volumes_from.is_empty() {
+        out.push(format!(
+            "service {service:?} takes volumes from {}; those containers would not exist in the green project",
+            volumes_from.join(", ")
+        ));
+    }
+
+    out
+}
+
+/// Names in a `depends_on`/`links`/`volumes_from` value.
+///
+/// `docker compose config --format json` normally renders `depends_on` as a map
+/// of service names to conditions and the other two as arrays, but accepting both
+/// shapes keeps this helper honest against older daemons.
+fn service_references(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Object(map)) => map.keys().cloned().collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// Standard prelude every compose invocation carries.
 fn base(name: &'static str, compose_file: &Path, project: &str) -> StepSpec {
@@ -47,6 +174,15 @@ pub fn up_detached(
         spec = spec.arg("-f").arg(file.display().to_string());
     }
     spec.args(["up", "-d", "--no-deps", "--no-build", "--wait", service])
+}
+
+/// Removes a per-release green project and its network after the cutover.
+pub fn down(compose_file: &Path, project: &str, extra_files: &[&Path]) -> StepSpec {
+    let mut spec = base("compose-down", compose_file, project);
+    for file in extra_files {
+        spec = spec.arg("-f").arg(file.display().to_string());
+    }
+    spec.args(["down", "--volumes", "--remove-orphans"])
 }
 
 /// Stops one service.
@@ -183,5 +319,139 @@ mod tests {
         assert_eq!(up_detached(&file(), "p", &[], "s").name, "compose-up");
         assert_eq!(stop(&file(), "p", "s").name, "compose-stop");
         assert_eq!(rm(&file(), "p", "s").name, "compose-rm");
+    }
+
+    // ---- compose file discovery ----
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn every_supported_compose_filename_is_found() {
+        for name in COMPOSE_FILENAMES {
+            let dir = temp_dir();
+            let path = dir.path().join(name);
+            std::fs::write(&path, "services: {}\n").unwrap();
+            assert_eq!(
+                resolve_compose_file(dir.path()).unwrap(),
+                path,
+                "{name} must be supported"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_yaml_wins_when_several_candidates_exist() {
+        // Same precedence as `docker compose` itself, so the file this tool
+        // deploys is the file the operator sees compose use.
+        let dir = temp_dir();
+        for name in COMPOSE_FILENAMES {
+            std::fs::write(dir.path().join(name), "services: {}\n").unwrap();
+        }
+        assert_eq!(
+            resolve_compose_file(dir.path()).unwrap(),
+            dir.path().join("compose.yaml")
+        );
+
+        std::fs::remove_file(dir.path().join("compose.yaml")).unwrap();
+        assert_eq!(
+            resolve_compose_file(dir.path()).unwrap(),
+            dir.path().join("compose.yml")
+        );
+    }
+
+    #[test]
+    fn a_missing_compose_file_names_every_candidate() {
+        let dir = temp_dir();
+        let err = resolve_compose_file(dir.path()).unwrap_err();
+        let message = err.to_string();
+        for name in COMPOSE_FILENAMES {
+            assert!(message.contains(name), "{message}");
+        }
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("compose_dir"), "{message}");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_compose_file() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("compose.yaml")).unwrap();
+        assert!(resolve_compose_file(dir.path()).is_err());
+    }
+
+    // ---- swap preflight ----
+
+    fn merged(service_json: serde_json::Value) -> Value {
+        serde_json::json!({"services": {"web": service_json}})
+    }
+
+    #[test]
+    fn swap_blockers_names_named_volumes_and_dependencies() {
+        let config = merged(serde_json::json!({
+            "image": "app:abc1234",
+            "volumes": [
+                {"type": "volume", "source": "uploads", "target": "/data/uploads"},
+                {"type": "bind", "source": "/srv/uploads", "target": "/data/uploads"}
+            ],
+            "depends_on": {"db": {"condition": "service_healthy"}},
+            "links": ["redis:cache"]
+        }));
+
+        let blockers = swap_blockers(&config, "web");
+        assert_eq!(blockers.len(), 3, "{blockers:?}");
+        assert!(
+            blockers.iter().any(|b| b.contains("\"uploads\"")),
+            "{blockers:?}"
+        );
+        assert!(
+            blockers.iter().any(|b| b.contains("depends on db")),
+            "{blockers:?}"
+        );
+        assert!(
+            blockers.iter().any(|b| b.contains("redis:cache")),
+            "{blockers:?}"
+        );
+    }
+
+    #[test]
+    fn swap_allows_bind_mounts_and_anonymous_volumes() {
+        let config = merged(serde_json::json!({
+            "volumes": [
+                {"type": "bind", "source": "/srv/app/data", "target": "/data"},
+                {"type": "volume", "target": "/tmp/cache"}
+            ]
+        }));
+        assert!(
+            swap_blockers(&config, "web").is_empty(),
+            "bind mounts point at the same host path in both projects"
+        );
+    }
+
+    #[test]
+    fn swap_blockers_accepts_array_shaped_dependencies() {
+        let config = merged(serde_json::json!({"depends_on": ["db", "cache"]}));
+        let blockers = swap_blockers(&config, "web");
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("db, cache"), "{blockers:?}");
+    }
+
+    #[test]
+    fn swap_blockers_refuses_a_missing_service() {
+        let config = merged(serde_json::json!({}));
+        let blockers = swap_blockers(&config, "not-there");
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("not-there"), "{blockers:?}");
+    }
+
+    #[test]
+    fn swap_blockers_ignores_host_ipc_and_pid_modes() {
+        // Only the cases that silently change data or service discovery are
+        // refused; the rest of the compose surface is not this check's job.
+        let config = merged(serde_json::json!({"network_mode": "host", "ipc": "host"}));
+        assert!(swap_blockers(&config, "web").is_empty());
     }
 }

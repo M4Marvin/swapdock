@@ -166,6 +166,9 @@ impl Outcome {
 /// Failure of the exec machinery itself, as opposed to a non-zero exit.
 #[derive(Debug, Error)]
 pub enum ExecError {
+    #[error("privileged broker: {0}")]
+    Broker(String),
+
     #[error("could not start `{program}`: {source}")]
     Spawn {
         program: String,
@@ -218,6 +221,13 @@ impl Run {
                 );
             self.record_step(record).map_err(ExecError::Trace)?;
             return Ok(outcome);
+        }
+
+        if spec.program == "docker"
+            && let Ok(socket) = std::env::var(crate::broker::SOCKET_ENV)
+            && !socket.trim().is_empty()
+        {
+            return crate::broker::docker_exec(self, spec, std::path::Path::new(socket.trim()));
         }
 
         let started = Instant::now();
@@ -277,7 +287,7 @@ impl Run {
             }
             // `spawn_and_capture` never returns `Trace`; the arm exists so that
             // adding a variant there is a compile error rather than a silent gap.
-            Err(e @ ExecError::Trace(_)) => Err(e),
+            Err(e @ ExecError::Trace(_)) | Err(e @ ExecError::Broker(_)) => Err(e),
             Err(e @ ExecError::Spawn { .. }) | Err(e @ ExecError::Wait { .. }) => {
                 let record = StepRecord::new(seq, spec.name, StepStatus::Error, &argv)
                     .with_env(&spec.env)
@@ -297,6 +307,12 @@ impl Run {
 /// so `tests/single_spawn_point.rs` still holds. A non-zero exit is a result,
 /// exactly as in [`Run::exec`].
 pub fn run_capture(spec: &StepSpec) -> Result<Outcome, ExecError> {
+    if spec.program == "docker"
+        && let Ok(socket) = std::env::var(crate::broker::SOCKET_ENV)
+        && !socket.trim().is_empty()
+    {
+        return crate::broker::docker_capture(spec, std::path::Path::new(socket.trim()));
+    }
     let argv = spec.full_argv();
     let started = Instant::now();
     match spawn_and_capture(spec) {
@@ -317,7 +333,14 @@ pub fn run_capture(spec: &StepSpec) -> Result<Outcome, ExecError> {
 /// The two reader threads matter. Polling `try_wait` while nobody drains the
 /// pipes deadlocks as soon as the child writes more than one pipe buffer
 /// (64 KiB on Linux) — `docker compose up` does that easily.
-fn spawn_and_capture(spec: &StepSpec) -> Result<(i32, String, String, u64, u64), ExecError> {
+pub(crate) fn spawn_and_capture(
+    spec: &StepSpec,
+) -> Result<(i32, String, String, u64, u64), ExecError> {
+    // Tests mutate the process environment; the read side keeps the scan below
+    // from racing a `set_var` on another test thread.
+    #[cfg(test)]
+    let env_guard = crate::test_env::reading();
+
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
         .stdin(if spec.stdin.is_some() {
@@ -328,6 +351,32 @@ fn spawn_and_capture(spec: &StepSpec) -> Result<(i32, String, String, u64, u64),
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Do not let a child inherit the API/broker token, proxy variables, or
+    // arbitrary operator environment. A compose service can ask Docker to
+    // inject `${SWAPDOCK_API_TOKEN}` from its client environment; clearing it
+    // here is what keeps that credential out of app containers and logs.
+    cmd.env_clear();
+    for key in [
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "SSH_AUTH_SOCK",
+        "DOCKER_CONFIG",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    // The nginx test harness uses NGINX_* to script failure modes. These are
+    // not credentials and nginx does not interpret them; real deployments do
+    // not set them.
+    for (key, value) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NGINX_") {
+            cmd.env(key, value);
+        }
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -339,6 +388,9 @@ fn spawn_and_capture(spec: &StepSpec) -> Result<(i32, String, String, u64, u64),
         program: spec.program.clone(),
         source,
     })?;
+
+    #[cfg(test)]
+    drop(env_guard);
 
     if let Some(bytes) = &spec.stdin
         && let Some(mut pipe) = child.stdin.take()
@@ -951,5 +1003,23 @@ mod tests {
         let out = run_capture(&sh("failing", "exit 4")).unwrap();
         assert_eq!(out.exit_code, Some(4));
         assert!(!out.success());
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn a_child_does_not_inherit_the_api_token() {
+        // Own the environment for the whole test: another test spawning at the
+        // wrong moment would otherwise read the variable while it is set.
+        let _owner = crate::test_env::own();
+        crate::test_env::set_var("SWAPDOCK_API_TOKEN", "should-not-leak");
+        let spec = StepSpec::new("env-check", "sh")
+            .args(["-c", "printf %s \"${SWAPDOCK_API_TOKEN:-missing}\""]);
+        let result = spawn_and_capture(&spec).expect("spawn");
+        crate::test_env::remove_var("SWAPDOCK_API_TOKEN");
+        assert_eq!(result.1, "missing", "the token must not reach a child");
     }
 }

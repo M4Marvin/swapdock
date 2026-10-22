@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn per_app_and_cross_app_problems_can_be_combined() {
-        use crate::registry::load_dir;
+        use crate::registry;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -553,7 +553,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_dir(dir.path()).unwrap();
+        let loaded = registry::load_dir(dir.path()).unwrap();
         let mut problems = loaded.problems.clone();
         for app in &loaded.apps {
             problems.extend(app.problems());

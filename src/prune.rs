@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::registry::is_valid_release;
+use crate::registry;
 
 /// What must survive a prune.
 #[derive(Debug, Default, Clone)]
@@ -46,7 +46,7 @@ pub fn select_removals(tags: &[String], keep: &Keep, keep_rollbacks: usize) -> V
         {
             continue;
         }
-        if tag.starts_with("rollback-pre-") || is_valid_release(tag) {
+        if tag.starts_with("rollback-pre-") || registry::is_valid_release(tag) {
             removals.push(tag.clone());
         }
     }
