@@ -1,0 +1,14 @@
+name = "swapdock-site"
+kind = "static"
+strategy = "swap"
+hostnames = ["swapdock.m4marvin.com"]
+listen = ["127.0.0.1"]
+front_port = 8016
+slot = 10
+writes_state = false
+root = "/srv/www/swapdock-site/current"
+spa = false
+compose_dir = "/srv/swapdock/compose"
+compose_svc = "swapdock-site"
+env_name = "SWAPDOCK_SITE_PORT"
+branch = "main"
