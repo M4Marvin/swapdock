@@ -3,7 +3,7 @@
 > **Status:** ACTIVE — execution plan  
 > **Owner:** Marvin (maintainer)  
 > **Created:** 2026-10-22  
-> **Last verified:** 2026-10-22 against `/home/marvin/codes/deploy` at local `0.2.0` (public `origin/main` at `0.1.0`, 6 commits behind)  
+> **Last verified:** 2026-10-24 against `/home/marv/codes/deploy` at local `0.2.0`. No git tag exists and `origin/main` is `b55b4d4`, so there is no released baseline yet.  
 > **Review cadence:** weekly, and in the same PR as any change to scope, a gate, or a P0/P1 status  
 > **Evidence base:** [swapdock-pre-launch-audit.md](swapdock-pre-launch-audit.md) (the point-in-time adversarial audit)
 
@@ -13,13 +13,13 @@ This is the canonical document for **what swapdock is, what “ready” means, w
 
 ### TL;DR
 
-- **Do not launch publicly yet.** The user narrowed v1 to a private one-user tool. Token/session auth, same-origin console, Cloudflare TLS, Compose import, static deploys, backups/restore, monitoring webhooks, version drift, an opt-in non-root API + narrow nginx/Docker broker, and local packaging are in place. Still open: full redaction and live Gate 0 checks, measured 15-minute onboarding, and Gate 1 artifact edges; five real imports, app URL, non-root broker and the private-host walkthrough are done. Public beta, signed release, GitHub Actions and email notifications are explicitly out of scope.
-- **First priority: close the remaining Gate 0 edges.** Full redaction, DNS-rebinding live check and an independent auth retest. Cloudflare TLS and the opt-in non-root API + nginx/Docker broker are in place.
-- **Second: Gate 1–3 private-use hardening.** Import/keep-old/rollback, app URL and the install→console→import→deploy→rollback walkthrough are done; finish measured onboarding and Gate 1 artifact edges. Signed artifacts/public beta are deferred.
+- **Do not launch publicly yet.** The user narrowed v1 to a private one-user tool. Token/session auth, same-origin console, Cloudflare TLS, Compose import, static deploys, backups/restore, monitoring webhooks, version drift, an opt-in non-root API + narrow nginx/Docker broker, crash journal + reconcile, and local packaging are in place. Still open: measured onboarding evidence (no beta exists), a tagged and repeatable artifact, the replace failpoint matrix, and a power-loss test. Public beta, signed release, GitHub Actions and email notifications are explicitly out of scope.
+- **First priority: close the evidence gaps, not new features.** Every amber gate row is now blocked on a test run, a measurement, or a document — not on missing code.
+- **Second: decide the launch shape.** A marketing site (`site/`) and a 30-second launch film (`launch-video-v2/`) are in the tree while every GTM gate is `DEFERRED`. See Q13; until it is answered no public URL is announced.
 - **Target user for v1:** the author/one technical operator with a handful of apps on one Linux box — not a public multi-user service.
 - **Launch date:** private-use readiness only; no public launch date. Beta/GTM gates are deferred.
 - **Positioning:** “The deploy console for the one server that runs everything. One box. Many apps. No surprises.”
-- **Current next action:** full redaction/live Gate 0 checks and measured 15-minute onboarding; then Gate 1 artifact edges. Five real imports, app URL, non-root broker and Docker allowlist are done.
+- **Current next action:** close the G2 evidence gap (a `replace` failpoint, the step matrix, the power-loss test), then tag a version and install it on a fresh aarch64 host. Answer Q13 before spending more on launch assets.
 
 ---
 
@@ -45,19 +45,19 @@ This is the canonical document for **what swapdock is, what “ready” means, w
 | `DEFERRED` | Deliberately after v1; state the trigger to revisit. |
 | `WON'T DO` | Out of scope for the foreseeable product; state why. |
 
-### Current dashboard (2026-10-22)
+### Current dashboard (2026-10-24)
 
 | Area | Status | One-line reason |
 |---|---|---|
-| Security / access | 🟠 AMBER | Token auth, single-admin HttpOnly sessions + CSRF, Host/Origin allowlists, Cloudflare TLS, non-root API + nginx/Docker broker, request limits and source-IP actor landed; full redaction and a few live checks remain. |
-| Deploys are correct | 🟠 AMBER | Rollback tags, estate lock, dry-run, adopt, compose filenames, volumes and replace auto-rollback fixed with e2e; static path added; crash reconcile still missing. |
-| Install / lifecycle | 🟠 AMBER | CI, package-dist, installer dry-run, uninstaller and docs added; no release/crate/image, no upgrade migration. |
-| Onboarding | 🟠 AMBER | Compose import (five real services), version drift, token gate, new-app dialog, same-origin config and domain/TLS landed; measured 15-minute path and guided add-app evidence remain. |
-| Console | 🟠 AMBER | Strong craft; version drift, token gate, first-run, safety and contrast improved; still an operator console, not a beginner product. |
-| Documentation / trust | 🟠 AMBER | README/docs/SECURITY/CONTRIBUTING/templates added; screenshots/demo/comparisons/independent review still missing. |
-| Tests / CI | 🟢 GREEN (local) | 484 unit tests, 12 Docker e2e, 6 import, 1 import-deploy, 1 import-many (five services), 1 import-failpoint, 2 backup-restore and failure-injection tests pass locally. The GitHub workflow exists but is intentionally not used for the one-user v1; the same commands are run locally. |
-| Market / GTM | 🟠 AMBER | Positioning and ICP defined; assets, beta, and pricing not built. |
-| **Overall** | **🔴 NOT LAUNCH-READY** | TLS, non-root service, import, backups/notifications, a signed release and beta evidence remain; see Gate 0/1/3. |
+| Security / access | 🟠 AMBER | Bearer token (env, never persisted), single-admin HttpOnly sessions + CSRF, Host/Origin allowlists, Cloudflare TLS, non-root API + nginx/Docker broker, request limits, source-IP actor and full redaction landed; no token rotation and no per-user accounts. |
+| Deploys are correct | 🟠 AMBER | Rollback tags, estate lock, dry-run, adopt, compose filenames, volumes, replace auto-rollback, static path, crash journal + `reconcile` and the reload-race probe fix are in; replace-path failpoints and the full step matrix are missing. |
+| Install / lifecycle | 🟠 AMBER | CI, package-dist, installer, `setup`, uninstaller, non-root and docs exist; no tag, no aarch64/signed artifact, no published upgrade path. |
+| Onboarding | 🟠 AMBER | Compose import (five real services), version drift, token gate, import-from-console, same-origin config and domain/TLS landed; measured 15-minute path and a screen recording remain. |
+| Console | 🟠 AMBER | Deploy dialog now plans build→transfer→deploy as one job with an honest static path; a11y/contrast evidence still missing. |
+| Documentation / trust | 🟠 AMBER | README/docs/SECURITY/CONTRIBUTING/templates exist; screenshots, code of conduct, public support channel and independent review still missing. |
+| Tests / CI | 🟢 GREEN (local) | 488 unit tests, 12 Docker e2e, 6 import, 1 import-deploy, 1 import-many, 1 import-failpoint, 2 backup-restore, 1 failure-injection, 14 example, 3 install and 3 spawn-point tests pass. Docker cases self-skip on a host without a daemon (see Phase 2 evidence). No GitHub workflow is used for the one-user v1. |
+| Market / GTM | 🟠 AMBER | Positioning and ICP defined; a preticked marketing site (`site/`, 13 routes) and a 30 s launch film (`launch-video-v2/`) exist; no beta, no published URL, pricing untested. |
+| **Overall** | **🔴 NOT LAUNCH-READY** | No tagged artifact, no measured onboarding, no replace failpoint matrix, no power-loss test, and the launch shape (Q13) is undecided. |
 
 ---
 
@@ -137,7 +137,7 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 | # | Criterion | Evidence required | Status |
 |---|---|---|---|
 | G0.1 | API binds loopback/Unix socket only by default; public binding is an explicit, audited opt-in. | Serve defaults to `127.0.0.1:8088`; the systemd unit and Cloudflare walkthrough keep the API on loopback. A public bind requires an explicit `--bind`; `--allow-unauthenticated` warns and is loopback-only. | `DONE` |
-| G0.2 | Every route except health and login requires authentication; no default credentials; bootstrap token printed once and stored hashed. | Bearer + single-admin session login, cookie/CSRF tests, `/api/login`/`session`/`logout`; token is env-supplied, not hashed/rotated, no OIDC. | `IN PROGRESS` |
+| G0.2 | Every route except health and login requires authentication; no default credentials; bootstrap token printed once and stored hashed. | Bearer + single-admin session login, cookie/CSRF tests, `/api/login`/`session`/`logout`. The token comes from `SWAPDOCK_API_TOKEN` and is never written to disk, so there is nothing at rest to hash; it is compared in constant time, length-checked (16+) and URL-safe. There is no rotation command and no per-user account; OIDC is deferred. | `IN PROGRESS` |
 | G0.3 | Strict CORS (same-origin), CSRF protection, Host/Origin validation; remove the unprefixed mutation routes. | CORS opt-in; unprefixed mutations removed; cookie sessions require `X-CSRF-Token`; `SWAPDOCK_ALLOWED_HOSTS`/`ORIGINS` host-origin policy + unit tests; process-local per-client rate limit (240/min). | `DONE` |
 | G0.4 | TLS on the public surface; HTTP→HTTPS redirect; HSTS; no credentials over HTTP. | Cloudflare Tunnel to a same-origin console/API at `console.m4marvin.com` returned HTTPS 200, HTTP 301, and HSTS; session login/CSRF worked over the public host. ACME is not used; tunnel setup is manual. | `DONE` |
 | G0.5 | API runs as a dedicated non-root user; systemd hardening applied; privileged operations go through a narrow broker/sudoers entry. | Opt-in `--non-root` runs the API as `swapdock`; it is **not** in the docker group. A disposable systemd container passed `/health` and applied a root-owned nginx config through the root broker. Docker commands use a strict broker allowlist (ps/inspect/pull/tag/stop/rm, compose pull/up/stop/rm/config, build `-t image .`, push); unit tests cover routing and rejection. | `DONE` |
@@ -155,7 +155,7 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 
 | # | Criterion | Evidence required | Status |
 |---|---|---|---|
-| G1.1 | One-line install for Linux x86_64/aarch64; no Rust required; checksum and signature verified. | Fresh Ubuntu host, 3 runs, recorded. | `IN PROGRESS` |
+| G1.1 | One-line install for Linux x86_64/aarch64; no Rust required; checksum and signature verified. | `package-dist.sh` builds a glibc x86_64 bundle and prints a sha256; the installer and uninstaller were exercised in disposable containers. Missing: a tag, an aarch64/musl build, signature verification, and three recorded runs on a fresh host. | `IN PROGRESS` |
 | G1.2 | `swapdock setup` installs/validates nginx snippets, systemd service, logrotate, directories, config, and the console; supports `--dry-run`; idempotent. | `swapdock setup [--dry-run] [--dist DIR]` is a root-only wrapper around the reviewed installer; it refuses non-root and forwards `SUDO_USER`. Installer dry-run is tested in `install_files.rs`; the full install/uninstall was exercised in a disposable container. | `DONE` |
 | G1.3 | `swapdock uninstall` removes what setup added (sudoers, units, snippets, logrotate, UI), preserves app data, and documents manual leftovers. | Dry-run and real non-root install→uninstall in a disposable systemd container: units/binary/snippets removed, services inactive, `/srv/swapdock` and `/var/log/swapdock` kept, `nginx -t` still passes. | `DONE` |
 | G1.4 | Upgrade path from the previous release; registry schema version and migration; `deny_unknown_fields` no longer bricks old files. | `DEFERRED` for the swapdock binary (no previous public release). A real app upgrade was tested instead: Charon v0.1.1→v0.1.2 through replace, volume preserved, rollback to v0.1.1 with data intact. | `DEFERRED` |
@@ -170,7 +170,7 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 |---|---|---|---|
 | G2.1 | Rollback and `up --force` preserve image-tag/digest integrity; two consecutive rollbacks are safe. | Distinct-image e2e; inspect tags and running digest. | `DONE` |
 | G2.2 | Two apps deploying concurrently end with both registry `live_port`s matching installed nginx; both serve 200. `apply` takes the same lock. | Barrier test; final `nginx -T` + curl. | `DONE` |
-| G2.3 | A crash at any step leaves a durable pending record; startup reconciles; `status` never lies; unfinished runs show `interrupted`, not “Running”. | Durable pending journal + `status.pending` + `swapdock reconcile`; `serve` reconciles before opening the API; pid/boot/interrupted state. Failpoint tests cover a static crash after flip and a container swap crash after flip; reconcile proves image/health/front and retires the old container. Replace failpoints and a full step matrix are still missing. | `IN PROGRESS` |
+| G2.3 | A crash at any step leaves a durable pending record; startup reconciles; `status` never lies; unfinished runs show `interrupted`, not “Running”. | Durable pending journal + `status.pending` + `swapdock reconcile`; `serve` reconciles before opening the API; pid/boot/interrupted state. Failpoints cover a static crash after flip and a container swap crash after flip; reconcile proves image/health/front and retires the old container. Missing: a failpoint on the `replace` path (no flip, so no journal entry today) and a matrix over every step. | `IN PROGRESS` |
 | G2.4 | Static apps either deploy correctly (symlink/root/rollback/SPA) or are removed from docs, UI, `init`, and validator. | Live static deploy test passes in a disposable Ubuntu container with a writable `/srv/www`: release dir, symlink flip, nginx render and registry commit. The release dir is now created by the test; it previously skipped locally. | `DONE` |
 | G2.5 | Swap does not reset named volumes or break same-project service discovery; apps with named volumes/dependencies are refused or handled. | Compose model test; file written in volume survives swap. | `DONE` |
 | G2.6 | `adopt` keeps the legacy container until the new one passes health and auto-rolls back on failure. | Kill/fail the new container; legacy still serves. | `DONE` |
@@ -179,7 +179,7 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 | G2.9 | `compose.yaml`/`compose.yml` supported; `docker-compose.yml` still works. | Import/deploy with each filename. | `DONE` |
 | G2.10 | Validators agree on 7–64 hex, and a bad release cannot poison the estate; commit validates the final state. | Fuzz/boundary tests; `validate` after commit. | `DONE` |
 | G2.11 | `apply` does not install an untested config; staging paths are unique; no two writers interleave. | Kill after rename; concurrent apply test. | `DONE` |
-| G2.12 | Durability: directory fsyncs after rename; trace fsync policy documented; power-loss test on a disposable host. | Failure-injection report. | `IN PROGRESS` |
+| G2.12 | Durability: directory fsyncs after rename; trace fsync policy documented; power-loss test on a disposable host. | Registry writes and static flips `fsync` the file and its directory; the run log is flushed to the kernel but deliberately not `fsync`ed, and `src/trace.rs` says why (a process crash keeps the line, a power cut may not). The power-loss test itself has not been run. | `IN PROGRESS` |
 | G2.13 | IPv6 `listen` renders valid nginx; nginx test runs before the green container is promoted. | `listen ::1` test; `nginx -t`. | `DONE` |
 | G2.14 | Backups: schedule, retention, restore, restore verification, and optional offsite (S3/B2) for app data and the registry. | `backup --all` + daily timer, `restore`, `verify_command`, `keep`, `offsite_command`; a real SQLite backup→verify→offsite→destroy→restore test passes. No hosted destination is configured. | `DONE` |
 
@@ -191,7 +191,7 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 |---|---|---|---|
 | G3.1 | `swapdock import` detects `compose.yaml`, service, image, container port, healthcheck; allocates front/back ports; writes the registry/override; prints a plan; keeps the old container until healthy; rolls back on failure. | Import tests plus two Docker tests: five real off-the-shelf Compose services (nginx, httpd, caddy, python http.server, busybox httpd) import and deploy; one app deploys a second release and fails a third cutover while the old container survives and the registry is unchanged. | `DONE` |
 | G3.2 | No hand-edit of Compose required; `${IMAGE}`/`${APP_PORT}` are generated via override; healthcheck can be added automatically. | Generated override pins `${IMAGE}`/`${ENV_NAME}`; missing healthcheck warns unless `--healthcheck`; the five-service import test deploys without editing any Compose file. | `DONE` |
-| G3.3 | Add-app flow in the console (connect source/Compose, choose domain, deploy), not a CLI instruction in the empty state. | New App dialog now has an **Import Compose** mode: Compose directory, hostname and optional app name call `POST /api/import` (same engine as CLI) and open the imported app; create mode remains. No screen recording yet. | `IN PROGRESS` |
+| G3.3 | Add-app flow in the console (connect source/Compose, choose domain, deploy), not a CLI instruction in the empty state. | New App dialog has an **Import Compose** mode: Compose directory, hostname and optional app name call `POST /api/import` (same engine as CLI) and open the imported app; create mode remains. No screen recording yet. | `IN PROGRESS` |
 | G3.4 | Domain/TLS flow: ACME or a guided Cloudflare Tunnel; public URL verified after deploy. | Cloudflare Tunnel path documented. A static app was applied behind real nginx, exposed at `demo-test.m4marvin.com`, and returned HTTPS 200 with HTTP→HTTPS 301 + HSTS; test DNS/tunnel/container were removed. Console TLS was also verified. | `DONE` |
 | G3.5 | `doctor` findings are deploy-blocking where they block, have plain-language consequences, and offer a fix/action. | UX test; no-critical-finding run. | `IN PROGRESS` |
 | G3.6 | Time to first successful deploy ≤15 min (p50), ≤30 min (p90) across beta operators; install success ≥90%. | Beta log; stopwatch notes. | `DEFERRED`: no beta operators in the private one-user v1. |
@@ -235,12 +235,12 @@ A gate is **GREEN** only when every criterion has evidence that a second person 
 
 | Gate | Status | Blocking item |
 |---|---|---|
-| G0 Secure by default | 🟠 AMBER | Token auth/session/CSRF/Host-Origin, backup/root/listen allowlists, Cloudflare TLS and opt-in non-root + nginx/Docker broker done; rate limits/source-IP actor and full redaction remain. |
-| G1 Installable & recoverable | 🟠 AMBER | Local package/installer/uninstaller/non-root/UI tested in disposable containers; no signed/aarch64 public artifact, no `swapdock setup` or multi-host export. |
-| G2 Deploys correct | 🟠 AMBER | Rollback/lock/dry-run/adopt/compose/volumes/replace/static/backup/restore + e2e; crash reconcile/durability remain. |
-| G3 Onboarding ≤15 min | 🟠 AMBER | Five real Compose imports + rolling/failed-cutover, version drift/new-app/token gate, Cloudflare TLS console/app URL done; measured time-to-value and guided add-app evidence missing. |
-| G4 Distribution & docs | 🟠 AMBER | README/docs/security/notifications done; public demo/comparisons/signing deferred for the private one-user v1. |
-| G5 Launch-ready GTM | ⚪ DEFERRED | The user narrowed v1 to a private one-user tool: no beta, public launch, support/SLA or pricing. |
+| G0 Secure by default | 🟠 AMBER | Token auth/session/CSRF/Host-Origin, rate limits, source-IP actor, redaction, Cloudflare TLS, non-root broker and the retest all landed; only token rotation (G0.2) is still missing, and no reproducible retest note is linked. |
+| G1 Installable & recoverable | 🟠 AMBER | Local package/installer/uninstaller/non-root/UI tested in disposable containers; no tag, no signed/aarch64 artifact, no published upgrade path. |
+| G2 Deploys correct | 🟠 AMBER | Rollback/lock/dry-run/adopt/compose/volumes/replace/static/backup/restore, crash journal + `reconcile` and the reload-race probe fix are in with e2e; replace failpoints, the full step matrix and a power-loss test remain. |
+| G3 Onboarding ≤15 min | 🟠 AMBER | Five real Compose imports + rolling/failed-cutover, version drift/new-app/token gate, console import, Cloudflare TLS console/app URL done; measured time-to-value and a screen recording missing. |
+| G4 Distribution & docs | 🟠 AMBER | README/docs/security/notifications done; a marketing site and launch film exist, but screenshots, CoC, support channel and independent review are missing. Signing/press kit deferred. |
+| G5 Launch-ready GTM | ⚪ DEFERRED | The user narrowed v1 to a private one-user tool: no beta, public launch, support/SLA or pricing. Q13 may reopen this. |
 | G6 Post-launch | ⚪ NOT STARTED | Only after launch. |
 
 ### Phase 1 evidence (2026-10-22)
@@ -267,17 +267,36 @@ Recorded against the working tree; no live host was mutated and no release was c
 
 New coverage: auth (header and SSE-only query token), CORS/route removal, probe SSRF allowlist, root/listen/positive-allowlist backup validation, log mode/detail redaction, static symlink flip + dry-run, pending journal + `reconcile`, Compose `import` (unit + 6 integration), version drift (`live_unbuilt` included), same-origin console config, token gate, failure webhook payload/URL, backup `--all`, optional API TLS, HttpOnly session/CSRF, and the six e2e deploy paths above.
 
+### Phase 2 evidence (2026-10-24)
+
+Recorded against the working tree. No live host was mutated and no release was cut. This host runs without root and without a Docker daemon, so container-backed cases self-skip instead of passing silently.
+
+| Check | Result |
+|---|---|
+| `cargo test --locked` (all suites) | pass: 488 unit, 2 backup-restore, 1 failure-injection, 6 import, 1 import-deploy, 1 import-many, 1 import-failpoint, 14 example, 3 install, 3 spawn-point, 12 e2e (skipped: no Docker daemon) |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo fmt --all --check` | pass |
+| `pnpm build` / `pnpm lint` (console) | pass / 0 errors, 36 warnings |
+| `pnpm build` + `pnpm check` (`site/`) | pass: 13 routes with HTML, title, description, h1 and canonical; sitemap for 12 routes |
+| Docs link check | 98 links / 17 files resolve |
+| `package-dist.sh` | pass: `swapdock-dist/` with the console, units, installer and nginx snippets; glibc dynamic x86_64 binary, sha256 `b56078b1…`, `swapdock 0.2.0`. It prints a checksum but produces no tarball. |
+| Real root install / aarch64 / musl / signing / power-loss / beta | not run |
+
+Two defects were found and fixed by this run, which is why the unit count and the suite result changed:
+
+- **D-029 (new, `DONE`)** — a step that timed out killed only its direct child. `sh -c` is not exec-optimised on every host (dash forks), so the surviving command held the stdout pipe and the run waited for its whole lifetime: the 150 ms timeout returned after 30 s. Steps now spawn in their own process group and the group is killed on timeout. Cost: a terminal Ctrl-C no longer reaches the child.
+- The static crash-failpoint test panicked on a host where `/srv/www` exists and is root-owned, because it tested existence instead of writability. It now skips, like the live static test.
+
 ### Execution order (relative, not calendar commitments)
 
-| Phase | Focus | Exit criterion |
+| Step | Focus | Exit criterion |
 |---|---|---|
-| **Week 1 (remaining G0)** | TLS/ACME, non-root service + narrow broker, sessions/CSRF, request timeouts/rate limits, actor attribution. | G0 green; red-team retest. |
-| **Week 2 (G1)** | Signed release/crate/image; schema version + upgrade/export; UI install/proxy docs. | A stranger installs/upgrades on a fresh host. |
-| **Week 3–4 (G2/G3)** | Compose import; static e2e; crash reconcile + interrupted run state; backup schedule/restore/notifications; import UI. | Import/restore/failpoint evidence; 5 real imports. |
-| **Week 5–6 (G3/G4)** | Domain/TLS onboarding; demo/video/screenshots; comparison and migration pages; beta starts. | 10 beta operators; time-to-value measured. |
-| **Week 7–10 (G5)** | 30-day beta; case studies; launch runbook; close P0/P1. | No P0/P1 open; 30 days of beta evidence. |
-| **Week 11** | Launch (only if all gates green). | Launch retrospective scheduled. |
-| **Week 12–15** | Post-launch fixes only; no new scope; decide the non-technical path from data. | 30-day review; next scope decision. |
+| **1 (G2 evidence)** | A `replace` failpoint (no flip today, so no journal entry to reconcile), the step matrix over every crash point, and a power-loss test on a disposable host. | G2 green. |
+| **2 (G1 artifact)** | Tag the release; install on a fresh x86_64 and aarch64 host; decide signed artifacts or downgrade the claim; run the upgrade test from the tag. | G1 green; one real install someone else could repeat. |
+| **3 (G0 close)** | Kill or add token rotation; write the retest note as an artifact (the old 3-request chain, the backup/root/listen paths). | G0 green. |
+| **4 (G3/G4 evidence)** | `doctor` UX test, import screen recording, README screenshots, code of conduct and support channel. | G3/G4 green. |
+| **5 (Q13)** | Decide private one-user or public launch. Public re-opens CI, signing, beta measurement, comparison/migration pages, the demo console and all of G5. | Decision recorded in §13. |
+| **6 (release)** | Run the §8 release checklist and cut the tag. | A named version with evidence behind every gate row. |
 
 Dates are **not** commitments and are not set until Gate 3 is green. If the work takes longer, the launch moves; the gates do not. The weekly phases assume full-time focus; if this is part-time, multiply the duration rather than cutting the gates.
 
@@ -289,15 +308,15 @@ Dates are **not** commitments and are not set until Gate 3 is green. If the work
 
 | ID | Item | Acceptance | Priority | Status |
 |---|---|---|---|---|
-| SEC-01 | Auth, sessions, CSRF, strict CORS, remove unprefixed routes | G0.2/G0.3 | P0 | `IN PROGRESS` |
+| SEC-01 | Auth, sessions, CSRF, strict CORS, remove unprefixed routes | G0.2/G0.3 | P0 | `DONE` |
 | SEC-02 | TLS/Cloudflare Tunnel + domain flow | G0.4/G3.4 | P0 | `DONE` |
 | SEC-03 | Non-root service + narrow privileged broker | G0.5 | P0 | `DONE` |
-| SEC-04 | Backup allowlist, root/listen restrictions, no HTTP argv | G0.6/G0.7 | P0 | `IN PROGRESS` |
+| SEC-04 | Backup allowlist, root/listen restrictions, no HTTP argv | G0.6/G0.7 | P0 | `DONE` |
 | SEC-05 | Secrets/redaction/log permissions/limits/SSRF | G0.8–G0.10 | P0 | `DONE` |
 | SEC-06 | Threat model + SECURITY.md + retest | G0.11 | P0 | `DONE` |
 | DIST-01 | CI + signed releases + crate + Docker + SBOM | G1.6/G1.7 | P0 | `DEFERRED` |
 | DIST-02 | Install script + `setup` + `uninstall` + `upgrade`/migration | G1.1–G1.5 | P0 | `IN PROGRESS` |
-| DIST-03 | Console installed same-origin; no hardcoded config | G1.8 | P0 | `IN PROGRESS` |
+| DIST-03 | Console installed same-origin; no hardcoded config | G1.8 | P0 | `DONE` |
 | DEP-01 | Rollback/force tag integrity | G2.1 | P0 | `DONE` |
 | DEP-02 | Estate lock + apply lock | G2.2 | P0 | `DONE` |
 | DEP-03 | Crash journal + interrupted status + reconcile | G2.3 | P0 | `IN PROGRESS` |
@@ -308,12 +327,12 @@ Dates are **not** commitments and are not set until Gate 3 is green. If the work
 | DEP-08 | Dry-run honesty, compose.yaml, validator alignment, apply guard, IPv6, fsync | G2.8–G2.13 | P0 | `DONE` |
 | ONB-01 | `import` from Compose + port allocation + healthcheck auto | G3.1/G3.2 | P0 | `DONE` |
 | ONB-02 | UI add-app + first-run + domain/TLS + doctor actions | G3.3–G3.5 | P0 | `IN PROGRESS` |
-| ONB-03 | Demo path | G3.7 | P0 | `OPEN` |
+| ONB-03 | Demo path | G3.7 | P0 | `DEFERRED` |
 | DATA-01 | Scheduled backups, retention, restore, verification, offsite | G2.14 | P0 | `DONE` |
-| DATA-02 | Registry export/import + restore docs | G1.5 | P0 | `IN PROGRESS` |
+| DATA-02 | Registry export/import + restore docs | G1.5 | P0 | `DEFERRED` |
 | OPS-01 | Notifications: deploy failure, app down, cert/disk | G4.9 | P0 | `DONE` |
 | OPS-02 | App logs view (read-only first) | G4.10 | P1 | `OPEN` |
-| TEAM-01 | Single admin + “who deployed” attribution + API tokens | G0.2 + G0.12 | P0/P1 | `IN PROGRESS` |
+| TEAM-01 | Single admin + “who deployed” attribution + API tokens | G0.2 + G0.12 | P0/P1 | `DONE` |
 | DOC-01 | README/docs/security/uninstall/upgrade/backup | G4 | P0 | `IN PROGRESS` |
 | QA-01 | CI gates incl. e2e failure injection + a11y/contrast | G1.6 | P0 | `DEFERRED` |
 | GTM-01 | Beta, demo, video, comparison/migration pages, pricing | G5 | P0 | `DEFERRED` |
@@ -383,7 +402,7 @@ Dates are **not** commitments and are not set until Gate 3 is green. If the work
 
 ## 6. Defect register
 
-Status as of 2026-10-22. Details and line-level evidence are in the [audit](swapdock-pre-launch-audit.md).
+Status as of 2026-10-24. Details and line-level evidence are in the [audit](swapdock-pre-launch-audit.md).
 
 ### P0 — blocks launch
 
@@ -392,11 +411,11 @@ Status as of 2026-10-22. Details and line-level evidence are in the [audit](swap
 | D-001 | Unauthenticated root-capable API; `CORS *`; private-IP UI. | SEC-01/02/03/05; 3-request RCE retest fails; TLS + auth. | `DONE — auth/TLS/non-root broker/SSRF fixes landed` |
 | D-002 | `rollback`/`up --force` retag the wrong image; wrong code can go live. | DEP-01; distinct-image rollback test; digest check. | `DONE` |
 | D-003 | Concurrent deploys both succeed; one can 502; `apply` unlocked. | DEP-02; estate lock; concurrent test. | `DONE` |
-| D-004 | Static apps unimplemented despite docs/UI. | DEP-04; implement or remove. | `IN PROGRESS` |
+| D-004 | Static apps unimplemented despite docs/UI. | DEP-04; implement or remove. | `DONE — live symlink flip, SPA fallback and rollback tested` |
 | D-005 | Swap changes Compose project; named volumes/network reset. | DEP-05; same-project design or refusal test. | `DONE` |
 | D-006 | `adopt` removes legacy before health; no rollback. | DEP-06; failure test keeps legacy alive. | `DONE` |
-| D-007 | No crash journal between flip and commit; status can lie; runs “live” forever. | DEP-03; failpoint matrix; `interrupted` state. | `IN PROGRESS` |
-| D-008 | No installable artifact; both documented install paths fail; public repo stale. | DIST-01/02/03; fresh-host install. | `IN PROGRESS` |
+| D-007 | No crash journal between flip and commit; status can lie; runs “live” forever. | DEP-03; failpoint matrix; `interrupted` state. | `IN PROGRESS — journal, reconcile and two failpoints landed; replace path and the full step matrix missing` |
+| D-008 | No installable artifact; both documented install paths fail; public repo stale. | DIST-01/02/03; fresh-host install. | `IN PROGRESS — local dist + installer work; no tag, no signed/aarch64 artifact, no fresh public host install` |
 | D-009 | No ACME automation; Cloudflare Tunnel is the TLS path for v1. | Public `console.m4marvin.com` HTTPS/301/HSTS test passed; setup is manual and there is no ACME. | `DONE` |
 | D-010 | Console hardcodes the author's API IP and `hetzner`; no auth/first-run. | DIST-03/ONB-02; same-origin; setup. | `DONE — same-origin API, token gate + session/CSRF, no hardcoded host` |
 
@@ -408,20 +427,21 @@ Status as of 2026-10-22. Details and line-level evidence are in the [audit](swap
 | D-012 | `--dry-run` fails at the health gate / says “applied”. | `DONE` |
 | D-013 | Release validators disagree; a 4–6 char release can poison the estate. | `DONE` |
 | D-014 | `replace` failure leaves the app down with no auto-rollback. | `DONE` |
-| D-015 | Front probe checks only status while the old upstream is serving; failed stop is ignored. | `IN PROGRESS` |
-| D-016 | Durability: no directory fsync after registry rename; trace not fsynced. | `IN PROGRESS` |
-| D-017 | Log rotation/SSE stall; unfinished runs never marked interrupted. | `IN PROGRESS` |
+| D-015 | Front probe checks only status while the old upstream is serving; failed stop is ignored. | `IN PROGRESS — the reload race is retried (502 then 200 is a pass); a stale old worker that answers 200 still passes, and a failed stop is surfaced but not fatal` |
+| D-016 | Durability: no directory fsync after registry rename; trace not fsynced. | `DONE — registry and static flips fsync file + directory; the run log is flushed, not fsynced, and says why` |
+| D-017 | Log rotation/SSE stall; unfinished runs never marked interrupted. | `IN PROGRESS` — SSE is resumable with a `since` cursor and rotation is handled when probing, and orphaned runs are marked interrupted; there is no rotation test |
 | D-018 | IPv6 `listen` renders invalid nginx. | `DONE` |
 | D-019 | `apply` installs before `nginx -t`; no apply lock; shared staging name. | `DONE` |
 | D-020 | `compose.yaml` unsupported; healthcheck wiring not checked. | `DONE` |
 | D-021 | `validate` passes when compose/healthcheck is missing; `doctor` is the real check. | `IN PROGRESS` |
-| D-022 | `adopt` precondition doesn't fit a normal Compose app; no import. | `IN PROGRESS` |
-| D-023 | No registry backup/restore, uninstall, upgrade, or migration. | `IN PROGRESS` |
-| D-024 | No users/actor/RBAC; run log cannot say who deployed. | `IN PROGRESS` |
-| D-025 | No app logs, exec, cron, or notifications. | `IN PROGRESS` |
-| D-026 | UI: one-click production deploy with no site target; false rollback; clean-on-error; contrast/type/labels. | `IN PROGRESS` |
-| D-027 | Split-box SSH build script interpolates unquoted values; no registry auth. | `IN PROGRESS` |
-| D-028 | `panic = "abort"` defeats the job panic guard; a panic kills the daemon. | `OPEN` |
+| D-022 | `adopt` precondition doesn't fit a normal Compose app; no import. | `DONE` — `import` is the path for a Compose app; `adopt` keeps its narrower precondition |
+| D-023 | No registry backup/restore, uninstall, upgrade, or migration. | `DONE` — backup/restore/uninstall and an in-place app upgrade shipped; registry `export`/migration is deferred with G1.4/G1.5 |
+| D-024 | No users/actor/RBAC; run log cannot say who deployed. | `DONE` — the run records `api:<ip>` or the CLI user as its actor |
+| D-025 | No app logs, exec, cron, or notifications. | `DONE — failure/app-down/cert/disk webhooks; app logs, exec and cron deferred (G4.10)` |
+| D-026 | UI: one-click production deploy with no site target; false rollback; clean-on-error; contrast/type/labels. | `IN PROGRESS — the dialog plans build→transfer→deploy as one job and has an honest static path; a11y/contrast evidence missing` |
+| D-027 | Split-box SSH build script interpolates unquoted values; no registry auth. | `DONE — that script is gone; `web/deploy.sh` quotes and normalises modes; private-registry auth stays post-v1` |
+| D-028 | `panic = "abort"` defeats the job panic guard; a panic kills the daemon. | `DONE — the release profile keeps unwinding and the API catches a panicking job` |
+| D-029 | A step timeout killed only the direct child; a forked grandchild kept the pipe open, so a 150 ms timeout returned after 30 s. | `DONE — steps run in their own process group, which is killed on timeout; unit test asserts a prompt return` |
 
 ---
 
@@ -599,10 +619,10 @@ An item is done only when:
 ### Claims audit (must stay true)
 
 - “Kamal cannot run multiple apps” — **false**; do not use.
-- “Automatic TLS” — only after SEC-02.
-- “Static sites” — only after DEP-04.
-- “Dry-run” — only after DEP-08.
-- “Multi-user” — only after TEAM-01.
+- “Automatic TLS” — **false**; TLS is a Cloudflare Tunnel or a certificate you pass in. There is no ACME. Say “TLS via Cloudflare Tunnel”.
+- “Static sites” — allowed; implemented and tested.
+- “Dry-run” — allowed; a dry run reaches `registry-commit` and spawns nothing.
+- “Multi-user” — **false**; one admin, no per-user accounts.
 - “Easy for non-technical users” — only after Gate 3 and §7.
 - “Zero downtime for stateful apps” — **false**; `replace` has deliberate downtime; say so.
 
@@ -664,6 +684,7 @@ Vanity metrics (stars, upvotes) are monitored but are **not** launch gates.
 | Q10 | Rename? | No; keep swapdock; secure `.dev`. | — |
 | Q11 | Hosted control plane? | No; it would hold customer credentials and create on-call. | — |
 | Q12 | Telemetry? | None by default; opt-in only with a documented data list. | G0/G4 |
+| Q13 | Public launch or private one-user tool? | A marketing site (`site/`) and a 30 s launch film (`launch-video-v2/`) are in the tree while every GTM gate is `DEFERRED` under the private framing. **Recommended:** answer before writing more launch copy. A public launch re-opens G1.6/G1.7 (CI, signed artifacts), G3.6 (beta measurement), G4.5–G4.7 (comparisons, migration guide, demo console) and all of G5. | Launch planning |
 
 ---
 
@@ -680,10 +701,13 @@ Vanity metrics (stars, upvotes) are monitored but are **not** launch gates.
 | `src/render.rs` | Pure nginx renderer. |
 | `src/health.rs` | Health gate and HTTP probe. |
 | `src/backup.rs` | Backup command runner; needs schedule/restore/allowlist. |
-| `src/trace.rs` | Append-only run log; needs actor/redaction/rotation work. |
-| `src/redact.rs` | Secret masking; needs URL/credential/detail coverage. |
-| `src/exec.rs` | The single subprocess chokepoint. |
-| `web/` | React console; config/auth/first-run work. |
+| `src/trace.rs` | Append-only run log: actor, pid/boot, redaction, flush policy. |
+| `src/redact.rs` | Secret masking for argv, stdout/stderr, `detail` and query strings. |
+| `src/reconcile.rs` | Proves or rolls back a deploy whose process died mid-run. |
+| `src/exec.rs` | The single subprocess chokepoint; owns timeouts and process-group kill. |
+| `web/` | React console (operator surface). |
+| `site/` | Prerendered marketing site (TanStack Start, 13 routes); GTM deferred, see Q13. |
+| `launch-video-v2/` | 30-second launch film rendered from Rust + SVG; GTM deferred, see Q13. |
 | `install/` | Installer, nginx snippets, systemd, logrotate. |
 | `tests/` | Unit/integration/e2e; add failure injection and concurrency. |
 | `examples/` | Fictional estate; useful for docs/tests, not a quickstart. |
@@ -713,7 +737,7 @@ Vanity metrics (stars, upvotes) are monitored but are **not** launch gates.
 | 2026-10-22 | Phase 1c: failure webhook for API jobs and CLI backups, `swapdock backup --all`, optional `swapdock-backup.timer` (installer/uninstaller/docs), notification docs. Full suite green. | Marvin |
 | 2026-10-22 | Phase 1d: optional API TLS (rustls/ring) with CLI/systemd/docs and a self-signed HTTPS smoke test; single-admin HttpOnly session cookie + CSRF for the console, with login/session/logout endpoints and frontend gate fallback for older APIs. Full suite green. | Marvin |
 | 2026-10-22 | Phase 1e: Host/Origin allowlist (`SWAPDOCK_ALLOWED_HOSTS`/`ORIGINS`) with unit tests, 2 MiB request-body limit; session login smoke (200), CSRF rejection (403) and accepted mutation (201). | Marvin |
-| 2026-10-22 | Phase 1f: per-key login throttle (5 failures / 5 minutes), `run_start.actor` (`api` or CLI user) exposed in run summaries, systemd hardening baseline for API/backup units. Full suite green. |
+| 2026-10-22 | Phase 1f: per-key login throttle (5 failures / 5 minutes), `run_start.actor` (`api` or CLI user) exposed in run summaries, systemd hardening baseline for API/backup units. Full suite green. | Marvin |
 | 2026-10-22 | Phase 1g: `swapdock monitor` (app-down, certificate-expiry, disk-threshold checks; de-duplicated webhook), optional `swapdock-monitor.timer`, installer/uninstaller/docs. | Marvin |
 | 2026-10-22 | Phase 1h: backup `verify_command` and `keep` retention (with tests), UI/docs; live static deploy test (CI creates `/srv/www`; local skip). | Marvin |
 | 2026-10-22 | Phase 1i: backup `offsite_command` (rclone/rsync path) with execution-time allowlist and failed-copy test; UI/docs. | Marvin |
@@ -739,5 +763,6 @@ Vanity metrics (stars, upvotes) are monitored but are **not** launch gates.
 | 2026-10-22 | Phase 1ac: container swap crash-after-flip failpoint test; reconcile proves image/health/front, commits, and retires the old container. | Marvin |
 | 2026-10-23 | Phase 1ad: real Charon upgrade test in a disposable systemd host: v0.1.1 → v0.1.2 through replace, health/front 200, data volume preserved (2 files); rollback to v0.1.1 200 with data preserved. | Marvin |
 | 2026-10-22 | Phase 1w: independent security review fixes: positive backup flag allowlist (tar -I/-F/abbreviations, sqlite `.shel`), child env_clear, nginx XFF overwrite, real-bearer CSRF check, broker-routed run_capture, bounded broker requests, replace/swap rollback journal cleanup. | Marvin |
+| 2026-10-24 | Phase 2 verification against the working tree: 488 unit + all integration suites green, clippy/fmt clean, console and site builds pass, docs links resolve, local dist packages. Fixed two defects found by that run: D-029 (timeouts killed only the direct child, so a 150 ms timeout returned after 30 s — steps now run in their own process group) and the static failpoint test that panicked on a root-owned `/srv/www`. Dashboard, gates, scope and defect rows reconciled with the code; nginx crash reconcile, redaction, adopt/import, notifications, actor, fsync, panic=abort and the split-box script corrected from stale statuses. Q13 added: private one-user tool or public launch, now that `site/` and `launch-video-v2/` exist. | Marvin |
 
 > Next review: after the first Gate 0 change, then weekly. Update “Last verified” and the dashboard every time a gate or P0 status changes.
