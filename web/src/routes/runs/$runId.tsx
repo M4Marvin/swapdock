@@ -440,6 +440,12 @@ function RunDetailPage() {
         }
       />
 
+      {end?.error ? (
+        <Callout tone="danger" title="Why this run failed">
+          {end.error}
+        </Callout>
+      ) : null}
+
       {error && phase === "error" ? (
         <Callout
           tone="danger"

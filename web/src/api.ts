@@ -68,6 +68,8 @@ export interface RunSummary {
   non_ok: number
   /** App the run was scoped to, or null for a registry-wide run. */
   app?: string | null
+  /** Why the run failed, when the job recorded a reason. */
+  error?: string | null
 }
 
 export interface TraceEvent {
@@ -249,6 +251,8 @@ export interface ResumeInfo {
   non_ok_steps: number
   /** Terminal status, when the run wrote its `run_end` record. */
   ended: string | null
+  /** The reason recorded on that `run_end`, when there is one. */
+  error?: string | null
 }
 
 /**
@@ -464,6 +468,8 @@ const RETRY_DELAY_MS = 1000
  * event when it cannot read the log. A transport failure is retried up to three
  * times; if it keeps failing, `onError` reports it and the stream ends. `onEnd`
  * fires exactly once — with the run_end status when known, otherwise null.
+ * A reconnect resumes after the last step already delivered, so a long step
+ * that outlives the server's idle close does not replay the run.
  */
 export function openRunEvents(
   id: string,
@@ -478,6 +484,8 @@ export function openRunEvents(
   let es: EventSource | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let eventsUrl: string | null = null
+  /** Last step this follower has handed to the caller, for a resuming tail. */
+  let lastSeq = 0
 
   const finish = (status: string | null) => {
     if (ended) return
@@ -494,7 +502,11 @@ export function openRunEvents(
 
   const connect = () => {
     if (closed || eventsUrl == null) return
-    es = new EventSource(withTokenParam(eventsUrl))
+    // The server closes an idle stream during a long, silent step. Ask it to
+    // resume past what was already delivered instead of replaying the run.
+    const separator = eventsUrl.includes('?') ? '&' : '?'
+    const url = lastSeq > 0 ? `${eventsUrl}${separator}since=${lastSeq}` : eventsUrl
+    es = new EventSource(withTokenParam(url))
 
     es.onopen = () => {
       retries = 0
@@ -521,6 +533,12 @@ export function openRunEvents(
         ev = JSON.parse(msg.data) as TraceEvent
       } catch {
         return
+      }
+      // Defence in depth for a server that ignored `since`: never append a
+      // step twice, no matter how often the connection is re-established.
+      if (ev.event === 'step' && typeof ev.seq === 'number') {
+        if (ev.seq <= lastSeq) return
+        lastSeq = ev.seq
       }
       onEvent(ev)
       if (ev.event === 'run_end') finish(ev.status ?? 'ended')
@@ -587,9 +605,33 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Read a JSON body.
+ *
+ * A 2xx response that is not JSON means the request never reached the API —
+ * typically a static server answering with its SPA shell. Returning `{}`
+ * there used to hand an object to code that expects an array, which surfaced
+ * as an unrelated render crash; name the real problem instead.
+ */
+async function readJson(res: Response): Promise<unknown> {
+  const text = await res.text()
+  if (text === '') return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    if (res.ok) {
+      throw new ApiError(
+        res.status,
+        `${res.url} did not return JSON (${res.headers.get('content-type') ?? 'unknown content type'}); check that /api reaches swapdock serve`,
+      )
+    }
+    return {}
+  }
+}
+
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, { headers: authHeaders(), signal })
-  const json = await res.json().catch(() => ({}))
+  const json = await readJson(res)
   if (!res.ok) {
     if (res.status === 401) markUnauthorized()
     throw new ApiError(
@@ -611,7 +653,7 @@ async function post<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   })
-  const json = await res.json().catch(() => ({}))
+  const json = await readJson(res)
   if (!res.ok) {
     if (res.status === 401) markUnauthorized()
     throw new ApiError(
@@ -633,7 +675,7 @@ async function put<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   })
-  const json = await res.json().catch(() => ({}))
+  const json = await readJson(res)
   if (!res.ok) {
     if (res.status === 401) markUnauthorized()
     const problems = (json as { problems?: { code?: string }[] }).problems
@@ -673,7 +715,7 @@ export const api = {
   validate: async (signal?: AbortSignal) => {
     const url = await deploy('validate')
     const read = async (res: Response) => {
-      const body = (await res.json().catch(() => ({}))) as {
+      const body = (await readJson(res)) as {
         errors?: number
         warnings?: number
         [key: string]: unknown
@@ -703,11 +745,14 @@ export const api = {
     name: string,
     release?: string,
     force = false,
+    /** Build and transfer run inside the same job as the deploy, so the work
+     * continues after the browser tab is closed. */
+    stages: { build?: boolean; transfer?: string } = {},
     signal?: AbortSignal,
   ) =>
     post<{ run_id: string }>(
       await deploy(`apps/${enc(name)}/deploys`),
-      { release, force },
+      { release, force, ...stages },
       signal,
     ),
   rollback: async (name: string, signal?: AbortSignal) =>

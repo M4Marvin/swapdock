@@ -38,6 +38,15 @@ export function TokenGate() {
         credentials: "same-origin",
         body: JSON.stringify({ password: clean }),
       })
+      // A static host answers /api/login with the SPA shell (405 + HTML).
+      // Treating that as an "older API" used to accept any token, then crash
+      // the dashboard on the first query. Only a non-HTML 404/405 is an API.
+      if ((res.headers.get("content-type") ?? "").includes("text/html")) {
+        setError(
+          "This address serves the console page but not its API. Open the console on the origin that proxies /api to swapdock serve."
+        )
+        return
+      }
       if (res.ok) {
         const body = (await res.json()) as { csrf_token?: string }
         if (typeof body.csrf_token === "string" && body.csrf_token !== "") {

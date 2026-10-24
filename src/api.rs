@@ -1790,7 +1790,12 @@ where
                     Err(_) => RunStatus::Failed,
                 };
                 let failure = result.as_ref().err().cloned();
-                let _ = run.finish(status);
+                // The run log is what the console reads, so the reason has to
+                // land in it, not only in the service journal.
+                let _ = match &failure {
+                    Some(error) => run.finish_with_error(status, error.clone()),
+                    None => run.finish(status),
+                };
                 if let Some(error) = failure {
                     tracing::warn!(run = %run_id2, "job failed: {error}");
                     if !dry_run
@@ -1802,7 +1807,7 @@ where
                 }
             }
             Err(payload) => {
-                let _ = run.finish(RunStatus::Failed);
+                let _ = run.finish_with_error(RunStatus::Failed, "job panicked");
                 tracing::error!(run = %run_id2, "job panicked; run closed as failed");
                 if !dry_run
                     && let Err(e) =
@@ -1829,6 +1834,17 @@ struct DeployBody {
     /// Deploy even when the app is already on that release.
     #[serde(default)]
     force: bool,
+    /// Build the image first, in this same run.
+    ///
+    /// Build, transfer and deploy used to be three requests chained by the
+    /// browser, so closing the tab after the build left the deploy unstarted.
+    /// One job means the work finishes whether or not anyone is watching.
+    #[serde(default)]
+    build: bool,
+    /// Image-transfer destination, for a build host that is not the deploy host.
+    transfer: Option<String>,
+    #[serde(default)]
+    build_host: Option<String>,
 }
 
 async fn deploy_app(
@@ -1846,6 +1862,39 @@ async fn deploy_app(
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::CONFLICT, &e.to_string()),
     };
+    // A dry run records the deploy plan; it never builds or ships an image.
+    let build = body.build && !body.dry_run;
+    let transfer = if body.dry_run {
+        None
+    } else {
+        body.transfer.filter(|t| !t.trim().is_empty())
+    };
+    if build || transfer.is_some() {
+        // Fail before opening a run, exactly as the standalone build and
+        // transfer endpoints do.
+        if app.image_repo.is_none() {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!(
+                    "{} has no image_repo recorded; set image_repo before building or transferring",
+                    app.name
+                ),
+            );
+        }
+        if transfer.is_some() && !crate::ssh::is_valid_destination(transfer.as_deref().unwrap()) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "invalid transfer target: pass an ssh or taildrop destination",
+            );
+        }
+    }
+    let build_host = builder::resolve_host(
+        body.build_host.as_deref(),
+        std::env::var("SWAPDOCK_BUILD_HOST").ok().as_deref(),
+        &app,
+    );
+    let transfer_dir = state.transfer_dir.clone();
+    let lock_dir = state.lock_dir.clone();
     let ctx = ctx_for(&state);
     let mut deploy_app = app;
     spawn_job(
@@ -1854,6 +1903,28 @@ async fn deploy_app(
         body.dry_run,
         Some(api_actor(&headers)),
         move |run| {
+            if build {
+                // The same app lock a deploy takes: two builds of one release
+                // share the per-release checkout and would delete each other's
+                // work. Scoped so the deploy below can take it in turn.
+                let _build_lock = crate::lock::Lock::acquire(
+                    &lock_dir,
+                    &crate::lock::app_lock_name(&deploy_app.name),
+                    crate::lock::ACQUIRE_TIMEOUT,
+                )
+                .map_err(|e| e.to_string())?;
+                let work_parent = std::env::temp_dir().join("swapdock-build");
+                if builder::is_local(&build_host) {
+                    builder::build_local(run, &deploy_app, &release, &work_parent)
+                } else {
+                    builder::build_ssh(run, &deploy_app, &release, &build_host)
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some(target) = &transfer {
+                transfer::transfer(run, &deploy_app, &release, target, &transfer_dir)
+                    .map_err(|e| e.to_string())?;
+            }
             deploy::deploy(run, &ctx, &mut deploy_app, &release)
                 .map(|()| serde_json::json!({}))
                 .map_err(|e| e.to_string())
@@ -1928,12 +1999,21 @@ async fn build_app(
     }
     let env_host = std::env::var("SWAPDOCK_BUILD_HOST").ok();
     let host = builder::resolve_host(body.build_host.as_deref(), env_host.as_deref(), &app);
+    let lock_dir = state.lock_dir.clone();
     spawn_job(
         &state,
         Some(&name),
         body.dry_run,
         Some(api_actor(&headers)),
         move |run| {
+            // Same lock a deploy takes: the per-release checkout is shared, so
+            // a build must not run under a flip of the same app.
+            let _build_lock = crate::lock::Lock::acquire(
+                &lock_dir,
+                &crate::lock::app_lock_name(&app.name),
+                crate::lock::ACQUIRE_TIMEOUT,
+            )
+            .map_err(|e| e.to_string())?;
             let built = if builder::is_local(&host) {
                 let work_parent = std::env::temp_dir().join("swapdock-build");
                 builder::build_local(run, &app, &release, &work_parent)
@@ -2389,7 +2469,12 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
                             }
                         }
                     }
-                    TraceEvent::RunEnd { run_id, status, .. } => {
+                    TraceEvent::RunEnd {
+                        run_id,
+                        status,
+                        error,
+                        ..
+                    } => {
                         if let Some(cur) = summaries
                             .iter_mut()
                             .rev()
@@ -2399,6 +2484,9 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
                                 serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
                             cur["state"] =
                                 serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
+                            if let Some(error) = error {
+                                cur["error"] = serde_json::json!(error);
+                            }
                         }
                     }
                 }
@@ -2457,6 +2545,7 @@ async fn resume_run(State(state): State<Shared>, Path(id): Path<String>) -> impl
                 "non_ok_steps": p.non_ok_steps,
                 "state": format!("{:?}", p.state()),
                 "ended": p.ended.map(|s| format!("{s:?}")),
+                "error": p.error,
             })),
         )
             .into_response(),
@@ -2472,9 +2561,13 @@ async fn resume_run(State(state): State<Shared>, Path(id): Path<String>) -> impl
 #[derive(Deserialize)]
 struct EventsQuery {
     run: Option<String>,
+    /// Last step `seq` the client already has. A reconnecting tail starts past
+    /// it instead of replaying the run from the first line.
+    since: Option<u32>,
 }
 
-/// `GET /events?run=<id>` — streams one run's trace events as they appear.
+/// `GET /events?run=<id>&since=<seq>` — streams one run's trace events as they
+/// appear.
 ///
 /// The append-only JSONL log is the source of truth, so this is a tail, not a
 /// second bus: each poll reads the bytes appended since the last one, parses
@@ -2482,6 +2575,9 @@ struct EventsQuery {
 /// arrives the stream sends an explicit `done` event and closes, so a client
 /// never has to poll `/runs/{id}` to learn that the run finished. A run that
 /// stops writing without an end closes after [`EVENTS_IDLE_TIMEOUT`].
+///
+/// A client that reconnects after the idle close passes the last `seq` it saw
+/// as `since`; the stream then skips those steps instead of replaying them.
 async fn run_events(
     State(state): State<Shared>,
     Query(q): Query<EventsQuery>,
@@ -2521,7 +2617,12 @@ async fn run_events(
         }
     };
     let stream = stream::unfold(
-        EventsState::new(state.trace.clone(), run_id.as_str().to_string(), permit),
+        EventsState::new(
+            state.trace.clone(),
+            run_id.as_str().to_string(),
+            q.since.unwrap_or(0),
+            permit,
+        ),
         |mut st| async move {
             loop {
                 if let Some(event) = st.pending.pop_front() {
@@ -2587,6 +2688,8 @@ struct EventsState {
     run_id: String,
     /// Byte offset of the last complete line already forwarded.
     offset: u64,
+    /// Last step the client already had when it reconnected.
+    since: u32,
     /// Events parsed but not yet yielded to the stream.
     pending: VecDeque<Event>,
     done: bool,
@@ -2595,12 +2698,18 @@ struct EventsState {
 }
 
 impl EventsState {
-    fn new(path: PathBuf, run_id: String, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+    fn new(
+        path: PathBuf,
+        run_id: String,
+        since: u32,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
         Self {
             _permit: permit,
             path,
             run_id,
             offset: 0,
+            since,
             pending: VecDeque::new(),
             done: false,
             last_event: Instant::now(),
@@ -2622,6 +2731,17 @@ impl EventsState {
         .map_err(|e| std::io::Error::other(e.to_string()))??;
         self.offset = new_offset;
         for event in events {
+            // A reconnecting client has these already. Skip them so the log it
+            // shows is not repeated, but keep the terminal record so the
+            // stream can still finish.
+            let already_seen = match &event {
+                TraceEvent::Step { seq, .. } => *seq <= self.since,
+                TraceEvent::RunStart { .. } => self.since > 0,
+                TraceEvent::RunEnd { .. } => false,
+            };
+            if already_seen {
+                continue;
+            }
             let ended = matches!(event, TraceEvent::RunEnd { .. });
             self.last_event = Instant::now();
             let json = serde_json::to_string(&event)
@@ -3093,6 +3213,14 @@ mod tests {
         let body: DeployBody = serde_json::from_str("{}").unwrap();
         assert!(!body.force);
         assert_eq!(body.release, None);
+        // Build and transfer are opt-in parts of the same job; the plain deploy
+        // is still a plain deploy.
+        assert!(!body.build);
+        assert_eq!(body.transfer, None);
+        let body: DeployBody =
+            serde_json::from_str(r#"{"build": true, "transfer": "hetzner"}"#).unwrap();
+        assert!(body.build);
+        assert_eq!(body.transfer.as_deref(), Some("hetzner"));
     }
 
     // ---- helpers ----
@@ -3295,6 +3423,64 @@ mod tests {
         assert!(
             text.contains("event: done"),
             "the stream must announce completion:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_since_skips_steps_a_reconnecting_client_has() {
+        let (state, _dir) = test_state();
+        let run_id = {
+            let log = TraceLog::open(&state.trace).unwrap();
+            let mut run = Run::start(
+                log,
+                RunMode::Live,
+                Some("blog".into()),
+                &["swapdock".to_string()],
+                crate::redact::Redactor::new(),
+            )
+            .unwrap();
+            for name in ["pull", "compose-up"] {
+                let argv = vec!["docker".to_string(), name.to_string()];
+                let seq = run.next_seq();
+                run.record_step(crate::trace::StepRecord::new(
+                    seq,
+                    name,
+                    crate::trace::StepStatus::Ok,
+                    &argv,
+                ))
+                .unwrap();
+            }
+            let id = run.id().to_string();
+            run.finish(RunStatus::Ok).unwrap();
+            id
+        };
+
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/events?run={run_id}&since=1"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("\"step\":\"pull\""),
+            "an already-seen step must not be replayed:\n{text}"
+        );
+        assert!(
+            text.contains("\"step\":\"compose-up\""),
+            "the step after `since` must be streamed:\n{text}"
+        );
+        assert!(
+            text.contains("\"event\":\"run_end\""),
+            "the terminal record must still be streamed:\n{text}"
         );
     }
 
@@ -3725,6 +3911,29 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json[0]["app"], "blog");
         assert_eq!(json[0]["status"], "ok", "serde snake_case, not \"Ok\"");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_summary_carries_the_reason() {
+        let (state, _dir) = test_state();
+        {
+            let log = TraceLog::open(&state.trace).unwrap();
+            let run = Run::start(
+                log,
+                RunMode::Live,
+                Some("blog".into()),
+                &["swapdock".to_string()],
+                crate::redact::Redactor::new(),
+            )
+            .unwrap();
+            run.finish_with_error(RunStatus::Failed, "front door answered HTTP 502")
+                .unwrap();
+        }
+
+        let (status, json) = get_json(state, "/runs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json[0]["status"], "failed");
+        assert_eq!(json[0]["error"], "front door answered HTTP 502");
     }
 
     #[test]

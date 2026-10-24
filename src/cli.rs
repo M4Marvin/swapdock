@@ -1334,7 +1334,7 @@ fn apply_config(
         Err(e) => {
             // The run log already holds every step; finish it as failed so the
             // failure is attributable, then report.
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(e.into())
         }
     }
@@ -1412,7 +1412,7 @@ fn adopt_app(
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -1446,7 +1446,7 @@ fn up_app(
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -1467,7 +1467,7 @@ fn rollback_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<()
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -1869,7 +1869,7 @@ fn sync_app(cli: &Cli, name: &str) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -1988,7 +1988,7 @@ fn backup_app(cli: &Cli, name: Option<&str>, all: bool) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -2011,7 +2011,7 @@ fn restore_app(cli: &Cli, name: &str, file: &Path) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             Err(anyhow::anyhow!("{e}"))
         }
     }
@@ -2050,7 +2050,7 @@ fn reconcile_app(cli: &Cli, name: &str, paths: &DeployPaths) -> anyhow::Result<(
             Ok(())
         }
         Err(e) => {
-            let _ = run.finish(RunStatus::Failed);
+            let _ = run.finish_with_error(RunStatus::Failed, e.to_string());
             if !cli.dry_run
                 && let Err(notify_err) =
                     crate::notify::send_failure(Some(name), &run_id, &e.to_string())
@@ -2286,7 +2286,11 @@ fn probe_app(cli: &Cli, name: &str, url: Option<&str>) -> anyhow::Result<()> {
     println!("url     {url}");
     println!("status  {code}");
     println!("run     {run_id}");
-    run.finish(if ok { RunStatus::Ok } else { RunStatus::Failed })?;
+    if ok {
+        run.finish(RunStatus::Ok)?;
+    } else {
+        run.finish_with_error(RunStatus::Failed, format!("probe answered HTTP {code}"))?;
+    }
     if !ok {
         std::process::exit(1);
     }

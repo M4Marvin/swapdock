@@ -128,6 +128,10 @@ pub enum TraceEvent {
         ts_ms: i64,
         status: RunStatus,
         steps: u32,
+        /// Why the run ended the way it did, when the caller knew. Without it a
+        /// failed run is a red pill with nothing behind it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -148,6 +152,8 @@ pub struct ResumePoint {
     /// Distinguishes "finished" from "died mid-way", which is the whole point
     /// of asking where a run stopped.
     pub ended: Option<RunStatus>,
+    /// The reason recorded on `run_end`, when the run had one.
+    pub error: Option<String>,
     /// Process that opened the run, and its boot id, for the interrupted check.
     pub pid: Option<u32>,
     pub boot: Option<String>,
@@ -308,6 +314,7 @@ impl TraceLog {
         let mut found: Option<ResumePoint> = None;
         let mut non_ok = 0u32;
         let mut ended: Option<RunStatus> = None;
+        let mut reason: Option<String> = None;
         let mut pid: Option<u32> = None;
         let mut boot: Option<String> = None;
 
@@ -339,14 +346,19 @@ impl TraceLog {
                         last_status: *status,
                         non_ok_steps: non_ok,
                         ended: None,
+                        error: None,
                         pid,
                         boot: boot.clone(),
                     });
                 }
                 TraceEvent::RunEnd {
-                    run_id: id, status, ..
+                    run_id: id,
+                    status,
+                    error,
+                    ..
                 } if id == run_id.as_str() => {
                     ended = Some(*status);
+                    reason = error.clone();
                 }
                 _ => {}
             }
@@ -354,8 +366,9 @@ impl TraceLog {
 
         // A run that wrote its final record did not stop early, whatever the
         // status of its last step was.
-        if let (Some(point), Some(status)) = (found.as_mut(), ended) {
-            point.ended = Some(status);
+        if let Some(point) = found.as_mut() {
+            point.ended = ended;
+            point.error = reason;
         }
 
         Ok(found)
@@ -471,7 +484,20 @@ impl Run {
     }
 
     /// Appends a `run_end` record.
-    pub fn finish(mut self, status: RunStatus) -> anyhow::Result<()> {
+    pub fn finish(self, status: RunStatus) -> anyhow::Result<()> {
+        self.close(status, None)
+    }
+
+    /// Appends a `run_end` record that says why it ended that way.
+    pub fn finish_with_error(
+        self,
+        status: RunStatus,
+        error: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.close(status, Some(error.into()))
+    }
+
+    fn close(mut self, status: RunStatus, error: Option<String>) -> anyhow::Result<()> {
         let now = Timestamp::now();
         self.log.append(&TraceEvent::RunEnd {
             run_id: self.id.to_string(),
@@ -479,6 +505,7 @@ impl Run {
             ts_ms: now.epoch_millis(),
             status,
             steps: self.seq,
+            error: error.map(|e| self.redactor.text(&e)),
         })?;
         Ok(())
     }
@@ -856,6 +883,39 @@ mod tests {
         let point = TraceLog::resume_point(&path, &id).unwrap().unwrap();
         assert_eq!(point.ended, Some(RunStatus::Ok), "the run finished");
         assert_eq!(point.non_ok_steps, 1, "one step did not succeed");
+    }
+
+    #[test]
+    fn a_failed_run_records_why_it_failed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("swapdock.jsonl");
+
+        let mut run = Run::start(
+            TraceLog::open(&path).unwrap(),
+            RunMode::Live,
+            None,
+            &argv_of(&["swapdock", "api"]),
+            Redactor::new(),
+        )
+        .unwrap();
+        let id = run.id().clone();
+        run.record_step(StepRecord::new(
+            1,
+            "probe-front",
+            StepStatus::Error,
+            &argv_of(&["curl"]),
+        ))
+        .unwrap();
+        run.finish_with_error(RunStatus::Failed, "the front door answered HTTP 502")
+            .unwrap();
+
+        let point = TraceLog::resume_point(&path, &id).unwrap().unwrap();
+        assert_eq!(point.ended, Some(RunStatus::Failed));
+        assert_eq!(
+            point.error.as_deref(),
+            Some("the front door answered HTTP 502"),
+            "the reason must survive the round trip"
+        );
     }
 
     #[test]

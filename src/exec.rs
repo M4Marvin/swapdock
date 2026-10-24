@@ -384,6 +384,13 @@ pub(crate) fn spawn_and_capture(
         cmd.current_dir(dir);
     }
 
+    // Its own process group, so a timeout can kill the command and anything it
+    // forked. `sh -c` is not exec-optimised everywhere (dash forks), and a
+    // survivor keeps the stdout pipe open, so the run waits for it anyway.
+    // Cost: a Ctrl-C at the terminal no longer reaches the child.
+    use std::os::unix::process::CommandExt as _;
+    cmd.process_group(0);
+
     let mut child = cmd.spawn().map_err(|source| ExecError::Spawn {
         program: spec.program.clone(),
         source,
@@ -418,6 +425,7 @@ pub(crate) fn spawn_and_capture(
             None => {
                 if started.elapsed() >= spec.timeout {
                     let _ = child.kill();
+                    kill_group(child.id());
                     timed_out = true;
                     break None;
                 }
@@ -445,6 +453,20 @@ pub(crate) fn spawn_and_capture(
 
     let code = status.and_then(|s| s.code()).unwrap_or(-1);
     Ok((code, out_text, err_text, out_bytes, err_bytes))
+}
+
+/// SIGKILL everything in the child's process group.
+///
+/// Killing only the direct child leaves a forked grandchild alive, and that
+/// grandchild holds the stdout pipe open, so joining the reader threads waits
+/// for its whole lifetime instead of returning at the timeout.
+fn kill_group(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: a negated pid signals the process group `process_group(0)` made
+    // the child the leader of; it cannot reach an unrelated group.
+    unsafe { kill(-(pid as i32), 9) };
 }
 
 /// Accumulates what it reads, keeping the last `cap` bytes.

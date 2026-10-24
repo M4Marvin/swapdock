@@ -16,7 +16,7 @@ import {
   Upload,
   X,
 } from "lucide-react"
-import { api, cfgState, type App, type TraceEvent } from "@/api"
+import { api, cfgState, classifyStatus, type App } from "@/api"
 import { queryKeys } from "@/lib/query-keys"
 import {
   errorText,
@@ -75,6 +75,22 @@ const STAGE_LABELS: Record<StageId, string> = {
   build: "Build image",
   transfer: "Send image",
   deploy: "Deploy & health gate",
+}
+
+/** Step names a build step is recorded under. */
+const BUILD_STEPS = new Set([
+  "build-clone",
+  "build-checkout",
+  "docker-build",
+  "docker-push",
+  "ssh-build",
+])
+
+/** Which plan stage a step belongs to, so one run can drive all three rows. */
+function stageOf(step: string | undefined): StageId {
+  if (step && BUILD_STEPS.has(step)) return "build"
+  if (step?.startsWith("transfer")) return "transfer"
+  return "deploy"
 }
 
 function emptyStage(): StageInfo {
@@ -473,51 +489,49 @@ export function DeployDialog({
     setRunPhase(null)
     setPhase("running")
 
-    const runStage = async (
-      id: StageId,
-      action: () => Promise<{ run_id: string }>,
-      apiBase: "build" | "deploy"
-    ): Promise<string> => {
-      if (!aliveRef.current) throw new Error("cancelled")
+    try {
+      // Build, transfer and deploy are one job on the server, so the release
+      // still moves after this tab is closed. Watching it is optional.
+      const started = await api.deploy(app.name, release, force, {
+        build,
+        transfer: needsTransfer ? (transferTarget ?? undefined) : undefined,
+      }, controller.signal)
+      const runId = started.run_id
+      setLastRun(runId)
+      onStarted?.(runId)
+
+      let active: StageId = build ? "build" : transfer ? "transfer" : "deploy"
       setStages((current) => ({
         ...current,
-        [id]: { ...current[id], state: "active", current: null, error: null },
+        [active]: { ...current[active], state: "active", runId },
       }))
-
-      let runId: string
-      try {
-        const started = await action()
-        runId = started.run_id
-      } catch (caught) {
-        const message = errorText(caught)
-        if (aliveRef.current) {
-          setStages((current) => ({
-            ...current,
-            [id]: { ...current[id], state: "failed", error: message },
-          }))
-        }
-        throw new Error(message)
-      }
-
-      if (!aliveRef.current) throw new Error("cancelled")
-      setRunPhase(null)
-      setStages((current) => ({ ...current, [id]: { ...current[id], runId } }))
 
       const result = await followRun(
         runId,
-        apiBase,
+        "deploy",
         {
-          onStep: (event: TraceEvent) => {
+          onStep: (event) => {
             if (!aliveRef.current) return
-            setStages((current) => ({
-              ...current,
-              [id]: { ...current[id], current: event.step ?? null },
-            }))
+            const next = stageOf(event.step)
+            if (next !== active) {
+              const previous = active
+              active = next
+              setStages((current) => ({
+                ...current,
+                [previous]: { ...current[previous], state: "ok", current: null },
+                [next]: { ...current[next], state: "active", current: event.step ?? null },
+              }))
+            } else {
+              setStages((current) => ({
+                ...current,
+                [next]: { ...current[next], current: event.step ?? null },
+              }))
+            }
             setLogs((current) =>
               [
                 ...current,
                 {
-                  stage: id,
+                  stage: next,
                   step: event.step ?? "step",
                   status: event.status,
                   durationMs: event.duration_ms,
@@ -533,67 +547,44 @@ export function DeployDialog({
         controller.signal
       )
 
-      if (result.status === null && result.error === "cancelled") {
-        throw new Error("cancelled")
-      }
-      if (result.status === "ok") {
-        if (aliveRef.current) {
-          setStages((current) => ({
-            ...current,
-            [id]: { ...current[id], state: "ok", current: null },
-          }))
-        }
-        return runId
+      if (result.status === null && result.error === "cancelled") return
+      const outcome = classifyStatus(result.status)
+      if (outcome === "ok" || outcome === "dry") {
+        if (!aliveRef.current) return
+        setStages((current) => ({
+          build: { ...current.build, state: build ? "ok" : "skipped", current: null },
+          transfer: { ...current.transfer, state: transfer ? "ok" : "skipped", current: null },
+          deploy: { ...current.deploy, state: "ok", current: null },
+        }))
+        setPhase("done")
+        setRunPhase(null)
+        toast.success(`${app.name} is deployed`, {
+          description: `${chooseLabel}${force ? " · health gate re-run" : ""}`,
+        })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.apps })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.runs })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.appStatus(app.name) })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.latest(app.name) })
+        return
       }
 
-      const message = result.error ?? `The stage ended ${result.status ?? "without a status"}.`
+      const message = result.error ?? `The run ended ${result.status ?? "without a status"}.`
       if (aliveRef.current) {
         setStages((current) => ({
           ...current,
-          [id]: { ...current[id], state: "failed", error: message },
+          [active]: { ...current[active], state: "failed", error: message },
         }))
+        setPhase("failed")
+        setRunPhase(null)
+        setError(message)
+        toast.error("Deploy did not finish", { description: message })
       }
-      throw new Error(message)
-    }
-
-    try {
-      if (build) {
-        await runStage("build", () => api.build(app.name, release), "build")
-        void queryClient.invalidateQueries({ queryKey: queryKeys.images(app.name) })
-      }
-      if (transfer) {
-        if (!transferTarget) {
-          throw new Error("Configure a transfer target in config.json before sending an image between hosts.")
-        }
-        await runStage(
-          "transfer",
-          () => api.transfer(app.name, release, transferTarget),
-          "build"
-        )
-      }
-      const deployRun = await runStage(
-        "deploy",
-        () => api.deploy(app.name, release, force),
-        "deploy"
-      )
-
-      if (!aliveRef.current) return
-      setLastRun(deployRun)
-      setPhase("done")
-      setRunPhase(null)
-      toast.success(`${app.name} is deployed`, {
-        description: `${chooseLabel}${force ? " · health gate re-run" : ""}`,
-      })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.app(app.name) })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.apps })
       void queryClient.invalidateQueries({ queryKey: queryKeys.runs })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.appStatus(app.name) })
-      void queryClient.invalidateQueries({ queryKey: queryKeys.latest(app.name) })
-      onStarted?.(deployRun)
     } catch (caught) {
-      if (!aliveRef.current) return
       const message = errorText(caught)
       if (message === "cancelled") return
+      if (!aliveRef.current) return
       setPhase("failed")
       setRunPhase(null)
       setError(message)
@@ -602,7 +593,16 @@ export function DeployDialog({
   }
 
   const handleOpenChange = (next: boolean) => {
-    if (!next && phase === "running") return
+    // Closing only stops the watch. The job is on the server and finishes
+    // whether or not this dialog is still on screen.
+    if (!next && phase === "running") {
+      abortRef.current?.abort()
+      if (lastRun) {
+        toast.message("Deploy continues in the background", {
+          description: "Follow it under Runs whenever you like.",
+        })
+      }
+    }
     onOpenChange(next)
   }
 
@@ -657,10 +657,7 @@ export function DeployDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent
-        className="sm:max-w-xl"
-        showCloseButton={phase !== "running"}
-      >
+      <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>
             {phase === "done"
@@ -677,7 +674,7 @@ export function DeployDialog({
                 ? "Pick a version. swapdock resolves the commit, builds the image if it is missing, and runs the health gate. You never need the commit hash."
                 : "Pick a built image version. This app runs a prebuilt image, so there is nothing to build and no commit hash is involved."
               : phase === "running"
-                ? "The release is moving through build, transfer and the health gate. Keep this dialog open to see the verdict."
+                ? "The release is moving through build, transfer and the health gate. This runs on the server — you can close the dialog and follow the run later."
                 : phase === "done"
                   ? "The health gate passed and traffic is on the new release."
                   : "The release stopped before it finished. Nothing further will be attempted."}
@@ -1053,7 +1050,7 @@ export function DeployDialog({
             <>
               <span className="mr-auto flex items-center gap-2 text-2xs text-muted-foreground">
                 <Loader2 className="size-3 animate-spin" />
-                Keep this open — closing is disabled while the release moves.
+                Runs in the background — closing this dialog is safe.
               </span>
               <Button disabled>
                 <Loader2 className="animate-spin" />

@@ -46,6 +46,10 @@ export function followRun(
       signal?.removeEventListener("abort", onAbort)
     }
 
+    // The `run_end` record is the only place the failure reason is recorded;
+    // keep it so the caller can say why, not just that it failed.
+    let reason: string | undefined
+
     const finish = (status: string | null, error?: string) => {
       if (settled) return
       settled = true
@@ -73,7 +77,7 @@ export function followRun(
           const info = await api.resume(runId, apiBase)
           failures = 0
           if (info.ended) {
-            finish(info.ended)
+            finish(info.ended, info.error ?? undefined)
             return
           }
         } catch {
@@ -97,6 +101,7 @@ export function followRun(
       {
         onEvent: (event) => {
           if (event.event === "step") handlers.onStep?.(event)
+          if (event.event === "run_end" && event.error) reason = event.error
         },
         onStatus: (status) => {
           handlers.onPhase?.(status === "reconnecting" ? "reconnecting" : "streaming")
@@ -105,7 +110,7 @@ export function followRun(
         // polling fallback decide whether the run actually finished.
         onError: () => undefined,
         onEnd: (status) => {
-          if (status != null) finish(status)
+          if (status != null) finish(status, reason)
           else poll()
         },
       },

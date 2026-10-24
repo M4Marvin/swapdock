@@ -88,6 +88,16 @@ Security and correctness hardening; this is the pre-launch work tracked in
   rename, closing a power-loss window before the journal is cleared.
 
 ### Deploy correctness
+- A failed run records why it failed. The job's error lands on `run_end` (and so
+  in `/runs`, `/runs/{id}` and `/resume`) instead of only in the service
+  journal; the console shows it on the run page and in the runs list.
+- `probe-front` retries for five seconds after the nginx reload and records the
+  real answer. One 502 from a worker that had not handed over yet used to fail
+  a good deploy with the step still logged as `ok`.
+- `POST /apps/{name}/deploys` takes `build` and `transfer`, so build, transfer
+  and deploy run as one server-side job. The console used to chain three
+  requests in the browser: closing the tab after the build left the deploy
+  unstarted. The console now lets you close the dialog.
 - `rollback` and `up --force` no longer overwrite the rollback image tag; a
   conflicting tag is a hard `TagConflict` before the old container stops.
 - Estate lock plus reload-under-lock fixes concurrent deploys and stale
@@ -108,12 +118,15 @@ Security and correctness hardening; this is the pre-launch work tracked in
   parent directory after rename.
 - Static apps deploy by verifying `releases/<release>/index.html`, flipping the
   `root` symlink atomically, probing, and restoring the previous link on
-  failure (release-level e2e still pending).
+  failure. A live test covers the flip, the registry commit and the crash path.
 - A pending journal records `flipping`/`flipped`/`stopping` and is exposed in
-  app status; automatic reconcile and interrupted run status are still planned.
-- Static deploy now has a live test (symlink flip, nginx render, registry
-  commit) in addition to the dry-run/unit tests; it uses `/srv/www` and is
-  skipped locally when that root is not writable.
+  app status; `serve` reconciles it before opening the API and an orphaned run
+  shows as interrupted.
+- Static deploy's live test uses `/srv/www` and is skipped when that root is not
+  writable, as is the static crash-failpoint test.
+- A step that exceeds its timeout now dies with everything it forked. `sh -c`
+  is not exec-optimised everywhere, and the surviving child held the stdout
+  pipe, so a 150 ms timeout took the command's whole lifetime to return.
 
 ### Notifications
 - Optional `SWAPDOCK_WEBHOOK_URL` sends a redacted JSON POST after an API job

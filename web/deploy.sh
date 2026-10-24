@@ -39,7 +39,8 @@ printf '== build (%s)\n' "$release"
 (cd "$here" && pnpm build)
 
 printf '== ship to %s:%s/releases/%s\n' "$host" "$root" "$release"
-rsync -az --delete "$here/dist/" "$host:$root/releases/$release/"
+# Normalize modes: a build under umask 007 ships 770/660 and nginx answers 403.
+rsync -az --delete --chmod=D755,F644 "$here/dist/" "$host:$root/releases/$release/"
 
 printf '== flip current\n'
 ssh "$host" "ln -sfn 'releases/$release' '$root/current.tmp' && mv -T '$root/current.tmp' '$root/current'"

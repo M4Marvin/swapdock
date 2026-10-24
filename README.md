@@ -368,6 +368,11 @@ cargo clippy --all-targets     # zero warnings
 cargo fmt --check
 ```
 
+Use [mr boxington](https://mr-boxington.jdx.dev/guide) for the Rust compiler
+cache. Install it as the guide describes, then run `mbx build`, `mbx test`, and
+`mbx clippy` in place of the commands above, or wire plain `cargo` through it.
+Without mbx the commands still work, just slower.
+
 The test suite includes fault injection (broken configs restore byte-identical),
 end-to-end strategies against real containers, and a test that fails the build
 if any module besides `exec.rs` spawns a process. The `examples/` estate is

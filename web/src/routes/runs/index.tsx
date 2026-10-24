@@ -360,6 +360,14 @@ function RunsPage() {
                           </span>
                         ) : null}
                       </span>
+                      {run.error ? (
+                        <span
+                          className="mt-0.5 block truncate text-2xs text-destructive-strong"
+                          title={run.error}
+                        >
+                          {run.error}
+                        </span>
+                      ) : null}
                     </span>
 
                     <span className="hidden w-[92px] shrink-0 md:block">

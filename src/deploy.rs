@@ -54,6 +54,14 @@ pub const DRAIN_SECS: u64 = 15;
 /// Environment variable carrying the image reference into compose.
 pub const IMAGE_ENV: &str = "IMAGE";
 
+/// How many times the front door is probed after a flip, and how long between.
+///
+/// An nginx reload is asynchronous, so one 502 right after it says nothing about
+/// the new release. Five seconds is far longer than a worker handover and short
+/// enough that a real outage still rolls back.
+const FRONT_PROBE_ATTEMPTS: u32 = 10;
+const FRONT_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Step names of the swap strategy, in order. The run log groups by these, so
 /// they are stable identifiers covered by a test.
 pub fn swap_steps() -> Vec<&'static str> {
@@ -1256,29 +1264,59 @@ fn probe_front(run: &mut Run, app: &App) -> Result<(), DeployError> {
         return Ok(());
     }
     for host in &app.hostnames {
-        let code =
-            health::http_status_with_host("127.0.0.1", app.front_port, "/", host).map_err(|e| {
-                HealthError::ProbeFailed {
-                    url: format!("http://127.0.0.1:{}/ (Host: {host})", app.front_port),
-                    attempts: 1,
-                    last: e,
+        // `nginx -s reload` returns before its new workers accept, so the first
+        // request after a flip can still be answered by an old worker pointing
+        // at the release just stopped. Give the front door a moment to catch up
+        // instead of failing a good deploy on that one answer.
+        let mut code: Option<u16> = None;
+        let mut last = String::new();
+        for attempt in 1..=FRONT_PROBE_ATTEMPTS {
+            match health::http_status_with_host("127.0.0.1", app.front_port, "/", host) {
+                Ok(status) => {
+                    code = Some(status);
+                    if (200..400).contains(&status) {
+                        break;
+                    }
+                    last = format!("HTTP {status}");
                 }
-            })?;
+                Err(e) => {
+                    code = None;
+                    last = e;
+                }
+            }
+            if attempt < FRONT_PROBE_ATTEMPTS {
+                std::thread::sleep(FRONT_PROBE_INTERVAL);
+            }
+        }
         let seq = run.next_seq();
-        run.record_step(
-            StepRecord::new(seq, "probe-front", crate::trace::StepStatus::Ok, &[]).with_detail(
-                json!({
-                    "host": host,
-                    "front_port": app.front_port,
-                    "status": code,
-                }),
-            ),
-        )?;
-        if !(200..400).contains(&code) {
+        let failed = !matches!(code, Some(code) if (200..400).contains(&code));
+        let mut record = StepRecord::new(
+            seq,
+            "probe-front",
+            if failed {
+                crate::trace::StepStatus::Error
+            } else {
+                crate::trace::StepStatus::Ok
+            },
+            &[],
+        )
+        .with_detail(json!({
+            "host": host,
+            "front_port": app.front_port,
+            "status": code,
+            "attempts": FRONT_PROBE_ATTEMPTS,
+        }));
+        if failed {
+            record = record.with_error(format!(
+                "the front door for {host} failed the check: {last}"
+            ));
+        }
+        run.record_step(record)?;
+        if failed {
             return Err(HealthError::ProbeFailed {
                 url: format!("http://127.0.0.1:{}/ (Host: {host})", app.front_port),
-                attempts: 1,
-                last: format!("HTTP {code}"),
+                attempts: FRONT_PROBE_ATTEMPTS,
+                last,
             }
             .into());
         }
@@ -2554,6 +2592,63 @@ mod tests {
     // ---- dry run ----
 
     #[test]
+    fn probe_front_retries_the_reload_race_and_records_the_answer() {
+        // An nginx reload is asynchronous: the first request after it can still
+        // be answered by an old worker. This listener answers 502 once, then
+        // 200, which is exactly that window.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (attempt, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 512];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let status = if attempt == 0 {
+                    "HTTP/1.1 502 Bad Gateway"
+                } else {
+                    "HTTP/1.1 200 OK"
+                };
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    format!("{status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                );
+            }
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let trace = dir.path().join("swapdock.jsonl");
+        let mut run = Run::start(
+            TraceLog::open(&trace).unwrap(),
+            RunMode::Live,
+            Some("portfolio".into()),
+            &["swapdock".to_string()],
+            crate::redact::Redactor::new(),
+        )
+        .unwrap();
+        let mut app = sample();
+        app.front_port = port;
+
+        probe_front(&mut run, &app).expect("a 502 followed by a 200 is not a failed deploy");
+
+        let read = TraceLog::read(&trace).unwrap();
+        let probe = read
+            .events
+            .iter()
+            .find_map(|e| match e {
+                crate::trace::TraceEvent::Step {
+                    step,
+                    status,
+                    detail,
+                    ..
+                } if step == "probe-front" => Some((*status, detail.clone())),
+                _ => None,
+            })
+            .expect("probe-front must be recorded");
+        assert_eq!(probe.0, crate::trace::StepStatus::Ok);
+        assert_eq!(probe.1.unwrap()["status"], 200);
+    }
+
+    #[test]
     fn a_dry_run_swap_reaches_registry_commit_without_a_live_container() {
         let dir = tempfile::TempDir::new().unwrap();
         let registry_dir = dir.path().join("apps");
@@ -2640,11 +2735,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root_parent = std::path::Path::new("/srv/www");
-        if std::fs::create_dir_all(root_parent).is_err() {
+        // Writability, not existence: `/srv/www` is root-owned on a normal host
+        // and `create_dir_all` happily succeeds on a directory it cannot write.
+        let Ok(dir) = tempfile::TempDir::new_in(root_parent) else {
             eprintln!("SKIP a_crash_after_static_flip: /srv/www is not writable");
             return;
-        }
-        let dir = tempfile::TempDir::new_in(root_parent).unwrap();
+        };
         let registry_dir = dir.path().join("apps");
         std::fs::create_dir_all(&registry_dir).unwrap();
         let root = dir.path().join("www/docs/current");
