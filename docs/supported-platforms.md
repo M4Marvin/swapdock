@@ -2,10 +2,9 @@
 
 The v1 target is deliberately narrow. It follows [LAUNCH.md](../LAUNCH.md) §8.
 “Supported” here means the design target; **no release has been published yet**,
-so nothing has been validated across the whole matrix. The release workflow
-builds for x86_64 and aarch64 musl when a tag is pushed (see
-[release.md](release.md)), but treat that as build coverage, not a support
-promise.
+so nothing has been validated across the whole matrix. The local release build
+can target x86_64 and aarch64 musl (see [release.md](release.md)), but treat
+that as build coverage, not a support promise.
 
 ## v1 matrix
 

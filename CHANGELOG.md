@@ -183,10 +183,10 @@ Security and correctness hardening; this is the pre-launch work tracked in
   screen-reader status text; first-run “New app” dialog; token gate.
 
 ### Distribution and docs
-- CI (`fmt`, clippy, tests, e2e, audit, web, docs), tag-driven release workflow
-  with musl builds, checksums, keyless Sigstore signatures and SPDX SBOMs
-  (not yet run on GitHub), `scripts/package-dist.sh`,
-  installer `--dry-run`/`--with-service`, uninstaller, docs and SECURITY.md.
+- No GitHub-hosted automation: the CI checks (fmt, clippy, tests, e2e, audit,
+  web, docs) and packaging run locally. `scripts/package-dist.sh` builds the
+  dist tree; installer `--dry-run`/`--with-service`, uninstaller, docs and
+  SECURITY.md are included.
 - No published release, crate, image, signature or SBOM yet; TLS, non-root
   service, Compose import, scheduled backups/notifications and the measured
   15-minute onboarding path remain open in [LAUNCH.md](LAUNCH.md).

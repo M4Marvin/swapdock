@@ -1,7 +1,5 @@
 # swapdock
 
-[![CI](https://github.com/M4Marvin/swapdock/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/M4Marvin/swapdock/actions/workflows/ci.yml)
-
 > **Project status: pre-launch (v0.2).** Not yet recommended for public production. The launch gates, scope, decisions, and definition of ready are in **[LAUNCH.md](LAUNCH.md)**; the evidence behind them is in **[swapdock-pre-launch-audit.md](swapdock-pre-launch-audit.md)**.
 
 **Docs:** [Quickstart](docs/quickstart.md) · [Import an existing app](docs/import.md) ·
@@ -152,10 +150,10 @@ The v1 target is narrow, and it matches [LAUNCH.md](LAUNCH.md) §8:
 - **Not supported in v1:** rootless Docker, multi-host, Kubernetes, and
   Kubernetes-style orchestration.
 
-The release workflow in [.github/workflows/release.yml](.github/workflows/release.yml)
-builds static musl binaries for both architectures when a tag is pushed, but
-**no release has been published yet** and no artifact is claimed to work on a
-host other than the one that built it. See
+`scripts/package-dist.sh` builds the release locally; **no GitHub Actions
+workflow is used**. It builds static musl binaries for both architectures when
+asked, but **no release has been published yet** and no artifact is claimed to
+work on a host other than the one that built it. See
 [docs/supported-platforms.md](docs/supported-platforms.md) and
 [docs/release.md](docs/release.md).
 
@@ -362,7 +360,7 @@ those routes.
 ## Development
 
 ```bash
-cargo build --release          # native release build; the release workflow uses musl
+cargo build --release          # native release build; package-dist can build musl
 cargo test                     # unit, e2e (real Docker), installer and chokepoint tests
 cargo clippy --all-targets     # zero warnings
 cargo fmt --check
@@ -444,7 +442,7 @@ details live in [web/README.md](web/README.md).
 | [Security](docs/security.md) | Current posture, threat model, exposure rules, Gate 0 work. |
 | [Troubleshooting](docs/troubleshooting.md) | The failures a pre-launch install actually hits. |
 | [Supported platforms](docs/supported-platforms.md) | v1 matrix and unsupported-host behavior. |
-| [Releases](docs/release.md) | Release workflow, keyless Sigstore signing, SBOM, verification. |
+| [Releases](docs/release.md) | Local build, package, checksum and verification steps. |
 | [Contributing](CONTRIBUTING.md) | Build/test commands, single-spawn-point rule, PR norms. |
 | [Security policy](SECURITY.md) | Reporting, 48-hour acknowledgement, scope, no bounty. |
 

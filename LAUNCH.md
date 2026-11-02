@@ -258,11 +258,11 @@ Recorded against the working tree; no live host was mutated and no release was c
 | `cargo fmt --all --check` | pass |
 | `pnpm build` | pass |
 | `pnpm lint` | 0 errors, 36 warnings |
-| `package-dist.sh` | glibc pass; x86_64 musl must be built with `musl-tools` (CI installs it; local host lacks `musl-gcc`) |
+| `package-dist.sh` | glibc pass; x86_64 musl must be built with `musl-tools` (install it on the release host; this host lacks `musl-gcc`) |
 | TLS smoke (self-signed) | `serve --tls-cert/--tls-key` answered HTTPS `/health` 200; `/api/apps` without a token returned 401 |
 | Session/CSRF smoke | `POST /api/login` 200; cookie `GET /api/apps` 200; POST without CSRF 403; with CSRF 201 |
 | Docs link check | 98 links / 17 files resolve |
-| CI workflows | actionlint clean; not executed on GitHub |
+| GitHub Actions | none; checks run locally |
 | Real root install / release / signing / beta | not run |
 
 New coverage: auth (header and SSE-only query token), CORS/route removal, probe SSRF allowlist, root/listen/positive-allowlist backup validation, log mode/detail redaction, static symlink flip + dry-run, pending journal + `reconcile`, Compose `import` (unit + 6 integration), version drift (`live_unbuilt` included), same-origin console config, token gate, failure webhook payload/URL, backup `--all`, optional API TLS, HttpOnly session/CSRF, and the six e2e deploy paths above.
@@ -742,7 +742,7 @@ Vanity metrics (stars, upvotes) are monitored but are **not** launch gates.
 | 2026-10-22 | Phase 1h: backup `verify_command` and `keep` retention (with tests), UI/docs; live static deploy test (CI creates `/srv/www`; local skip). | Marvin |
 | 2026-10-22 | Phase 1i: backup `offsite_command` (rclone/rsync path) with execution-time allowlist and failed-copy test; UI/docs. | Marvin |
 | 2026-10-22 | Phase 1j: real SQLite backup→verify→offsite→destroy→restore drill (`tests/backup_restore.rs`), plus retention pruning test. | Marvin |
-| 2026-10-22 | Phase 1k: keyless Sigstore signing + SPDX SBOM in `release.yml`, duplicate download-artifact fix, release verification docs. Not yet run on GitHub. | Marvin |
+| 2026-10-22 | Phase 1k: keyless Sigstore signing + SPDX SBOM in the old GitHub Actions workflow, duplicate download-artifact fix, release verification docs. Not yet run on GitHub; the workflow was later removed with all GitHub-hosted automation. | Marvin |
 | 2026-10-22 | Phase 1l: import→first-deploy Docker test (`tests/import_deploy.rs`): imported Compose service starts, health-gates, applies nginx, probes the front door and commits. | Marvin |
 | 2026-10-22 | Phase 1m: non-root API + root broker (Unix socket, token-authenticated) for nginx and an allowlisted Docker argv; opt-in installer mode, hardened units; tested under systemd in a disposable container without a docker group. | Marvin |
 | 2026-10-22 | Phase 1n: second imported release deploy (rolling swap with health gate, nginx apply, front probe, commit) in `tests/import_deploy.rs`. | Marvin |

@@ -26,14 +26,14 @@ rustup target add x86_64-unknown-linux-musl
 ```
 
 `scripts/package-dist.sh` builds for the host by default. Use `--target` for a
-musl build, exactly as the release workflow does:
+musl build:
 
 ```bash
 bash scripts/package-dist.sh --target x86_64-unknown-linux-musl
 ```
 
-The release workflow also builds `aarch64-unknown-linux-musl` with `cross`; see
-[release.md](release.md).
+The same script can target `aarch64-unknown-linux-musl` on a host with `cross`
+installed; see [release.md](release.md). No GitHub Actions workflow is used.
 
 ## What the installer does
 

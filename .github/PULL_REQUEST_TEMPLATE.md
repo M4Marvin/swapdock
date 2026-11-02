@@ -11,7 +11,7 @@ Fixes/relates to: <!-- SEC-01, DEP-03, DIST-02, ... or "none" -->
 - [ ] Deploy correctness / recovery (Gate 2)
 - [ ] Install / upgrade / uninstall (Gate 1)
 - [ ] Documentation
-- [ ] CI, release or packaging
+- [ ] Release or packaging
 - [ ] Refactor with no behavior change
 
 ## What changed
