@@ -88,6 +88,11 @@ Security and correctness hardening; this is the pre-launch work tracked in
   rename, closing a power-loss window before the journal is cleared.
 
 ### Deploy correctness
+- Build and deploy steps are announced when they start, not only when they
+  finish, and the events stream stays open while the run's process is alive. A
+  quiet Docker build now shows its elapsed time instead of a false "stalled",
+  and the run page shows the captured stdout/stderr tails. An interrupted run
+  is final, not followed forever.
 - A failed run records why it failed. The job's error lands on `run_end` (and so
   in `/runs`, `/runs/{id}` and `/resume`) instead of only in the service
   journal; the console shows it on the run page and in the runs list.

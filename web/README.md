@@ -127,8 +127,11 @@ the operator translate a hash before every release.
   the public-probe toggle matches. Latest-release and image queries are cached
   for a minute.
 - Build/transfer/deploy runs and the run detail page tail
-  `GET /api/events?run=<id>&token=<session token>` over SSE. When a long step writes nothing (a Docker
-  build), the client falls back to `GET /api/runs/{id}/resume` polling.
+  `GET /api/events?run=<id>&token=<session token>` over SSE. A step is announced
+  when it starts and replaced when it finishes, so a silent Docker build still
+  shows a running row and its elapsed time. The server keeps the stream open
+  while the run's process is alive; the client falls back to
+  `GET /api/runs/{id}/resume` polling only when the connection is lost.
 - A run that has only written `run_start` reports its mode (`live`) as its
   status. `classifyStatus` folds that onto **Running**, so in-progress work never
   reads as an unknown outcome.

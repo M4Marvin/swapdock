@@ -527,6 +527,9 @@ export function DeployDialog({
                 [next]: { ...current[next], current: event.step ?? null },
               }))
             }
+            // A start only names the command that is running; it has no
+            // result to log yet. The matching finish replaces it below.
+            if (event.event === "step_start") return
             setLogs((current) =>
               [
                 ...current,

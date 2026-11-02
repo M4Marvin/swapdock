@@ -73,7 +73,7 @@ export interface RunSummary {
 }
 
 export interface TraceEvent {
-  event: 'run_start' | 'step' | 'run_end'
+  event: 'run_start' | 'step_start' | 'step' | 'run_end'
   run_id: string
   ts: string
   /** App this event belongs to, when the run was scoped to one. */
@@ -83,10 +83,15 @@ export interface TraceEvent {
   seq?: number
   step?: string
   argv?: string[]
+  /** Step timeout, on a `step_start` record. */
+  timeout_ms?: number
   exit_code?: number | null
   duration_ms?: number | null
   detail?: unknown
   error?: string | null
+  /** Last part of the command's output, when the step finished. */
+  stdout_tail?: string | null
+  stderr_tail?: string | null
   steps?: number
 }
 
@@ -251,6 +256,8 @@ export interface ResumeInfo {
   non_ok_steps: number
   /** Terminal status, when the run wrote its `run_end` record. */
   ended: string | null
+  /** Lifecycle state: `Running`, `Interrupted`, or a terminal status. */
+  state?: string
   /** The reason recorded on that `run_end`, when there is one. */
   error?: string | null
 }
@@ -784,8 +791,11 @@ export const api = {
     ),
   runs: async (limit = 50, signal?: AbortSignal) =>
     get<RunSummary[]>(await deploy(`runs?limit=${limit}`), signal),
-  run: async (id: string, signal?: AbortSignal) =>
-    get<TraceEvent[]>(await deploy(`runs/${enc(id)}`), signal),
+  run: async (id: string, apiBase: EventsApi = 'deploy', signal?: AbortSignal) =>
+    get<TraceEvent[]>(
+      await (apiBase === 'build' ? build : deploy)(`runs/${enc(id)}`),
+      signal,
+    ),
   resume: async (
     id: string,
     apiBase: EventsApi = 'deploy',

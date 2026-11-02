@@ -18,6 +18,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,9 @@ pub enum StepStatus {
     Timeout,
     /// Not run, because the tool is in dry-run mode.
     DryRun,
+    /// Started but no finish was recorded yet. Only `resume_point` synthesizes
+    /// this; a finished `step` record never carries it.
+    Running,
 }
 
 impl StepStatus {
@@ -97,6 +101,19 @@ pub enum TraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<String>,
         argv: Vec<String>,
+    },
+    /// A command that has started but not finished. Its `seq` is the same as
+    /// the `step` record written when it exits, so a console can show the
+    /// running command and then replace it with the result.
+    StepStart {
+        run_id: String,
+        ts: String,
+        ts_ms: i64,
+        app: Option<String>,
+        seq: u32,
+        step: String,
+        argv: Vec<String>,
+        timeout_ms: u64,
     },
     Step {
         run_id: String,
@@ -312,6 +329,8 @@ impl TraceLog {
     ) -> std::io::Result<Option<ResumePoint>> {
         let read = Self::read(path)?;
         let mut found: Option<ResumePoint> = None;
+        let mut running: Option<(u32, String)> = None;
+        let mut started = false;
         let mut non_ok = 0u32;
         let mut ended: Option<RunStatus> = None;
         let mut reason: Option<String> = None;
@@ -326,8 +345,17 @@ impl TraceLog {
                     boot: run_boot,
                     ..
                 } if id == run_id.as_str() => {
+                    started = true;
                     pid = *run_pid;
                     boot = run_boot.clone();
+                }
+                TraceEvent::StepStart {
+                    run_id: id,
+                    seq,
+                    step,
+                    ..
+                } if id == run_id.as_str() => {
+                    running = Some((*seq, step.clone()));
                 }
                 TraceEvent::Step {
                     run_id: id,
@@ -336,6 +364,7 @@ impl TraceLog {
                     status,
                     ..
                 } if id == run_id.as_str() => {
+                    running = None;
                     if status.is_failure() {
                         non_ok += 1;
                     }
@@ -362,6 +391,36 @@ impl TraceLog {
                 }
                 _ => {}
             }
+        }
+
+        // The step that started and has no finish is where the run stopped.
+        if let Some((seq, step)) = running {
+            found = Some(ResumePoint {
+                run_id: run_id.clone(),
+                last_seq: seq,
+                last_step: step,
+                last_status: StepStatus::Running,
+                non_ok_steps: non_ok,
+                ended: None,
+                error: None,
+                pid,
+                boot: boot.clone(),
+            });
+        } else if found.is_none() && started && ended.is_none() {
+            // The run opened but no command recorded a step yet, for example
+            // while it waits for the app lock. It is still resumable, and its
+            // pid decides whether it is running or interrupted.
+            found = Some(ResumePoint {
+                run_id: run_id.clone(),
+                last_seq: 0,
+                last_step: String::new(),
+                last_status: StepStatus::Running,
+                non_ok_steps: 0,
+                ended: None,
+                error: None,
+                pid,
+                boot: boot.clone(),
+            });
         }
 
         // A run that wrote its final record did not stop early, whatever the
@@ -506,6 +565,29 @@ impl Run {
             status,
             steps: self.seq,
             error: error.map(|e| self.redactor.text(&e)),
+        })?;
+        Ok(())
+    }
+
+    /// Appends a `step_start` record. The caller records the matching `step`
+    /// with the same seq once the command exits.
+    pub fn record_step_start(
+        &mut self,
+        seq: u32,
+        name: &str,
+        timeout: Duration,
+        argv: &[String],
+    ) -> anyhow::Result<()> {
+        let now = Timestamp::now();
+        self.log.append(&TraceEvent::StepStart {
+            run_id: self.id.to_string(),
+            ts: now.to_rfc3339(),
+            ts_ms: now.epoch_millis(),
+            app: self.app.clone(),
+            seq,
+            step: name.to_string(),
+            argv: self.redactor.argv(argv),
+            timeout_ms: timeout.as_millis() as u64,
         })?;
         Ok(())
     }
@@ -853,7 +935,59 @@ mod tests {
         assert_eq!(point.ended, None, "this run never wrote a final record");
 
         let other = TraceLog::resume_point(&path, &second_id).unwrap();
-        assert!(other.is_none(), "a run with no steps has no point");
+        assert!(
+            other.is_none(),
+            "a completed run with no steps has no point"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_run_has_a_point_even_before_its_first_step_finishes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("swapdock.jsonl");
+
+        // Waiting for the app lock: run_start only, no command has started.
+        let waiting = Run::start(
+            TraceLog::open(&path).unwrap(),
+            RunMode::Live,
+            Some("portfolio".into()),
+            &argv_of(&["swapdock"]),
+            Redactor::new(),
+        )
+        .unwrap();
+        let waiting_id = waiting.id().clone();
+        drop(waiting);
+
+        // Inside the first command: a start with no finish.
+        let mut started = Run::start(
+            TraceLog::open(&path).unwrap(),
+            RunMode::Live,
+            Some("portfolio".into()),
+            &argv_of(&["swapdock"]),
+            Redactor::new(),
+        )
+        .unwrap();
+        let started_id = started.id().clone();
+        let argv = argv_of(&["docker", "build"]);
+        let seq = started.next_seq();
+        started
+            .record_step_start(seq, "docker-build", Duration::from_secs(1800), &argv)
+            .unwrap();
+        drop(started);
+
+        let waiting_point = TraceLog::resume_point(&path, &waiting_id)
+            .unwrap()
+            .expect("a run waiting for its first step is still a run");
+        assert_eq!(waiting_point.last_seq, 0);
+        assert_eq!(waiting_point.last_status, StepStatus::Running);
+        assert_eq!(waiting_point.ended, None);
+
+        let started_point = TraceLog::resume_point(&path, &started_id)
+            .unwrap()
+            .expect("a run inside its first step is still a run");
+        assert_eq!(started_point.last_seq, 1);
+        assert_eq!(started_point.last_step, "docker-build");
+        assert_eq!(started_point.last_status, StepStatus::Running);
     }
 
     #[test]
@@ -987,6 +1121,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 TraceEvent::RunStart { ts, .. }
+                | TraceEvent::StepStart { ts, .. }
                 | TraceEvent::Step { ts, .. }
                 | TraceEvent::RunEnd { ts, .. } => ts.as_str(),
             })

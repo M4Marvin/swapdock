@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
 import { createFileRoute, Link } from "@tanstack/react-router"
-import { useQuery } from "@tanstack/react-query"
 import {
   ArrowRight,
   ArrowUpRight,
@@ -19,10 +18,10 @@ import {
   classifyStatus,
   formatStatus,
   openRunEvents,
+  type EventsApi,
   type RunStream,
   type TraceEvent,
 } from "@/api"
-import { queryKeys } from "@/lib/query-keys"
 import {
   errorText,
   formatClock,
@@ -32,6 +31,8 @@ import {
   shortId,
 } from "@/lib/format"
 import { useCopy, useDocumentTitle } from "@/lib/hooks"
+import { useNow } from "@/lib/now"
+import { mergeStep, mergeSteps } from "@/lib/steps"
 import { cn } from "cn"
 import { PageHeader } from "@/components/PageHeader"
 import { AppGlyph } from "@/components/AppGlyph"
@@ -44,7 +45,8 @@ export const Route = createFileRoute("/runs/$runId")({
   component: RunDetailPage,
 })
 
-const IDLE_TIMEOUT_MS = 60_000
+/** How often a silent run is checked for liveness, not failed. */
+const QUIET_CHECK_MS = 60_000
 
 type Phase = "loading" | "streaming" | "reconnecting" | "ended" | "error"
 
@@ -77,17 +79,33 @@ function StepRow({
   step,
   index,
   last,
+  ended,
 }: {
   step: TraceEvent
   index: number
   last: boolean
+  /** The run is over, so a start without a finish was interrupted. */
+  ended: boolean
 }) {
   const [open, setOpen] = useState(false)
+  const now = useNow()
+  const running = step.event === "step_start" && !ended
+  const interrupted = step.event === "step_start" && ended
+  const shown = running ? "running" : interrupted ? "interrupted" : step.status
+  const startedAt = running && step.ts ? Date.parse(step.ts) : NaN
+  const elapsed = Number.isFinite(startedAt) ? Math.max(0, now - startedAt) : null
   const failed =
-    classifyStatus(step.status) === "failed" ||
-    (step.exit_code != null && step.exit_code !== 0)
+    !running &&
+    !interrupted &&
+    (classifyStatus(step.status) === "failed" ||
+      (step.exit_code != null && step.exit_code !== 0))
   const hasDetail =
-    step.argv != null || step.detail != null || step.error != null || step.exit_code != null
+    step.argv != null ||
+    step.detail != null ||
+    step.error != null ||
+    step.exit_code != null ||
+    step.stdout_tail != null ||
+    step.stderr_tail != null
 
   return (
     <li className="animate-fade-in relative">
@@ -107,7 +125,7 @@ function StepRow({
         )}
       >
         <span className="relative z-10 mt-0.5 flex size-5 items-center justify-center rounded-full border border-border bg-card">
-          <StatusDot tone={runTone(step.status)} />
+          <StatusDot tone={runTone(shown)} pulse={running} />
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -123,8 +141,9 @@ function StepRow({
               {step.step ?? "step"}
             </span>
             <StatusPill
-              tone={runTone(step.status)}
-              label={step.status ? formatStatus(step.status) : "recorded"}
+              tone={runTone(shown)}
+              label={shown ? formatStatus(shown) : "recorded"}
+              pulse={running}
             />
             {step.exit_code != null && step.exit_code !== 0 ? (
               <span className="rounded bg-destructive/10 px-1 py-0.5 font-mono text-[11px] text-destructive-strong">
@@ -132,7 +151,13 @@ function StepRow({
               </span>
             ) : null}
             <span className="ml-auto flex items-center gap-2 text-2xs text-subtle-foreground">
-              {step.duration_ms != null ? (
+              {running ? (
+                <span className="tabular font-mono" title={step.timeout_ms != null ? `timeout ${formatDuration(step.timeout_ms)}` : undefined}>
+                  {elapsed != null ? formatDuration(elapsed) : "running"}
+                </span>
+              ) : interrupted ? (
+                <span className="font-mono">stopped</span>
+              ) : step.duration_ms != null ? (
                 <span className="tabular font-mono">{formatDuration(step.duration_ms)}</span>
               ) : null}
               {step.ts ? <span>{formatClock(step.ts)}</span> : null}
@@ -169,6 +194,22 @@ function StepRow({
                   </pre>
                 </span>
               ) : null}
+              {step.stdout_tail ? (
+                <span className="block">
+                  <span className="label-eyebrow">stdout</span>
+                  <pre className="mt-1 max-h-64 overflow-auto font-mono text-[10px] whitespace-pre text-muted-foreground">
+                    {step.stdout_tail}
+                  </pre>
+                </span>
+              ) : null}
+              {step.stderr_tail ? (
+                <span className="block">
+                  <span className="label-eyebrow">stderr</span>
+                  <pre className="mt-1 max-h-64 overflow-auto font-mono text-[10px] whitespace-pre text-muted-foreground">
+                    {step.stderr_tail}
+                  </pre>
+                </span>
+              ) : null}
               {step.exit_code != null ? (
                 <span className="flex items-center gap-3 text-[10px] text-subtle-foreground">
                   <span>exit {step.exit_code}</span>
@@ -176,7 +217,11 @@ function StepRow({
                   {step.ts ? <span>{formatExact(step.ts)}</span> : null}
                 </span>
               ) : null}
-              {!step.argv && step.detail == null && step.exit_code == null ? (
+              {!step.argv &&
+              step.detail == null &&
+              step.exit_code == null &&
+              !step.stdout_tail &&
+              !step.stderr_tail ? (
                 <span className="text-[10px] text-subtle-foreground">
                   No extra detail was recorded for this step.
                 </span>
@@ -198,125 +243,220 @@ function RunDetailPage() {
   const [attempt, setAttempt] = useState(0)
   const { copied, copy } = useCopy()
 
-  const resumeQuery = useQuery({
-    queryKey: queryKeys.run(runId),
-    queryFn: ({ signal }) => api.resume(runId, "deploy", signal),
-    retry: 0,
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-  })
-
   useEffect(() => {
     setEvents([])
     setEnded(null)
     setError(null)
     setPhase("loading")
-    setAttempt(0)
   }, [runId])
 
   useEffect(() => {
-    if (resumeQuery.status === "pending") return
-
     const controller = new AbortController()
     let stream: RunStream | null = null
-    let idle: ReturnType<typeof setTimeout> | null = null
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let base: EventsApi = "deploy"
+    let settled = false
+    let polling = false
 
-    const clearIdle = () => {
-      if (idle) {
-        clearTimeout(idle)
-        idle = null
+    const clearTimer = () => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
       }
     }
-    const finish = (status: string | null) => {
-      clearIdle()
-      setEnded(status ?? "stream closed")
+    const finish = (status: string) => {
+      if (settled || controller.signal.aborted) return
+      settled = true
+      clearTimer()
+      stream?.close()
+      stream = null
+      setEnded(status)
+      setError(null)
       setPhase("ended")
     }
-    const armIdle = () => {
-      clearIdle()
-      idle = setTimeout(() => {
-        stream?.close()
-        setError("stalled: no events for 60s — the run may have been killed")
-        setPhase("error")
-      }, IDLE_TIMEOUT_MS)
+    const fail = (message: string) => {
+      if (settled || controller.signal.aborted) return
+      settled = true
+      clearTimer()
+      stream?.close()
+      stream = null
+      setError(message)
+      setPhase("error")
     }
 
-    const startStream = () => {
-      setPhase("streaming")
-      stream = openRunEvents(runId, {
-        onEvent: (event) => {
-          setEvents((current) => [...current, event])
-          armIdle()
-        },
-        onError: (message) => setError(message),
-        onStatus: (status) => setPhase(status === "reconnecting" ? "reconnecting" : "streaming"),
-        onEnd: (status) => finish(status),
-      })
-      armIdle()
+    // A quiet build is not an error. Ask the server whether the run is still
+    // alive; close nothing while it is. The old code failed the view after
+    // 60s of silence, which is exactly one Docker build.
+    const armQuietCheck = () => {
+      if (polling) return
+      clearTimer()
+      timer = setTimeout(() => void checkQuiet(), QUIET_CHECK_MS)
     }
-
-    const loadHistory = async (status: string) => {
+    const checkQuiet = async () => {
+      if (settled || controller.signal.aborted) return
       try {
-        const past = await api.run(runId, controller.signal)
-        if (controller.signal.aborted) return
-        setEvents(past)
-        finish(status)
-      } catch (caught) {
-        if (controller.signal.aborted) return
-        setError(errorText(caught))
-        setPhase("error")
-      }
-    }
-
-    const fallbackToTrace = async () => {
-      try {
-        const past = await api.run(runId, controller.signal)
-        if (controller.signal.aborted) return
-        const end = past.find((event) => event.event === "run_end")
-        if (end) {
-          setEvents(past)
-          finish(end.status ?? "stream closed")
-        } else {
-          startStream()
+        const info = await api.resume(runId, base, controller.signal)
+        if (settled || controller.signal.aborted || polling) return
+        if (info.ended) {
+          finish(info.ended)
+          return
+        }
+        if (classifyStatus(info.state) === "interrupted") {
+          finish("interrupted")
+          return
         }
       } catch {
+        // A 404 means the run is still inside its first step; a transient
+        // error is not evidence that it died. Either way, keep following.
+      }
+      armQuietCheck()
+    }
+
+    // The live stream ended without a terminal record (a restart, a proxy, or
+    // a server that marked the run interrupted). Poll until the run is final.
+    const poll = () => {
+      polling = true
+      clearTimer()
+      setPhase("reconnecting")
+      setError(null)
+      const started = Date.now()
+      let failures = 0
+      const tick = async () => {
+        if (settled || controller.signal.aborted) return
+        try {
+          const info = await api.resume(runId, base, controller.signal)
+          failures = 0
+          if (info.ended) {
+            finish(info.ended)
+            return
+          }
+          if (classifyStatus(info.state) === "interrupted") {
+            finish("interrupted")
+            return
+          }
+        } catch (caught) {
+          if (!(caught instanceof ApiError && caught.status === 404)) {
+            failures += 1
+            if (failures >= 3) {
+              fail("the run stream was lost")
+              return
+            }
+          }
+        }
+        if (Date.now() - started > 45 * 60 * 1000) {
+          fail("the run did not finish within 45 minutes")
+          return
+        }
+        timer = setTimeout(() => void tick(), 3000)
+      }
+      void tick()
+    }
+
+    const append = (event: TraceEvent) => {
+      setEvents((current) => {
+        if (event.event === "step" || event.event === "step_start") {
+          return mergeStep(current, event)
+        }
+        if (event.event === "run_start" && current.some((e) => e.event === "run_start")) {
+          return current
+        }
+        if (event.event === "run_end" && current.some((e) => e.event === "run_end")) {
+          return current
+        }
+        return [...current, event]
+      })
+    }
+
+    const startStream = (streamBase: EventsApi) => {
+      base = streamBase
+      setPhase("streaming")
+      stream = openRunEvents(
+        runId,
+        {
+          onEvent: (event) => {
+            append(event)
+            armQuietCheck()
+          },
+          onError: (message) => setError(message),
+          onStatus: (status) =>
+            setPhase(status === "reconnecting" ? "reconnecting" : "streaming"),
+          onEnd: (status) => {
+            if (status != null) finish(status)
+            else poll()
+          },
+        },
+        streamBase
+      )
+      armQuietCheck()
+    }
+
+    const load = async () => {
+      try {
+        // A build run can live on the build box, a deploy run on the deploy
+        // box. Find the trace first, then use that base for resume and SSE.
+        let located: { base: EventsApi; events: TraceEvent[] } | null = null
+        for (const candidate of ["deploy", "build"] as const) {
+          try {
+            located = {
+              base: candidate,
+              events: await api.run(runId, candidate, controller.signal),
+            }
+            break
+          } catch (caught) {
+            if (!(caught instanceof ApiError) || caught.status !== 404) throw caught
+          }
+        }
         if (controller.signal.aborted) return
-        setPhase("error")
-        setError("run not found")
+        if (!located) {
+          fail("run not found")
+          return
+        }
+        base = located.base
+        setEvents(located.events)
+
+        const end = located.events.find((event) => event.event === "run_end")
+        if (end) {
+          finish(end.status ?? "ok")
+          return
+        }
+        // No run_end: distinguish a dead run from a quiet live one.
+        try {
+          const info = await api.resume(runId, base, controller.signal)
+          if (controller.signal.aborted) return
+          if (info.ended) {
+            finish(info.ended)
+            return
+          }
+          if (classifyStatus(info.state) === "interrupted") {
+            finish("interrupted")
+            return
+          }
+        } catch (caught) {
+          if (controller.signal.aborted) return
+          if (!(caught instanceof ApiError && caught.status === 404)) throw caught
+          // 404: no completed step yet, which is normal for a running build.
+        }
+        startStream(base)
+      } catch (caught) {
+        if (!controller.signal.aborted) fail(errorText(caught))
       }
     }
 
-    if (resumeQuery.status === "success") {
-      if (resumeQuery.data.ended != null) void loadHistory(resumeQuery.data.ended)
-      else startStream()
-    } else {
-      const caught = resumeQuery.error
-      if (caught instanceof ApiError && caught.status === 404) void fallbackToTrace()
-      else {
-        setPhase("error")
-        setError(errorText(caught))
-      }
-    }
+    void load()
 
     return () => {
       controller.abort()
-      clearIdle()
+      clearTimer()
       stream?.close()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, resumeQuery.status, attempt])
+  }, [runId, attempt])
 
   const start = events.find((event) => event.event === "run_start")
   const end = events.find((event) => event.event === "run_end")
-  const steps = useMemo(
-    () =>
-      events
-        .filter((event) => event.event === "step")
-        .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0)),
-    [events]
-  )
-  const okCount = steps.filter((step) => classifyStatus(step.status) === "ok").length
-  const failedCount = steps.filter(
+  const steps = useMemo(() => mergeSteps(events), [events])
+  const finishedSteps = steps.filter((step) => step.event === "step")
+  const okCount = finishedSteps.filter((step) => classifyStatus(step.status) === "ok").length
+  const failedCount = finishedSteps.filter(
     (step) =>
       classifyStatus(step.status) === "failed" ||
       (step.exit_code != null && step.exit_code !== 0)
@@ -332,22 +472,19 @@ function RunDetailPage() {
     }`
   )
 
-  if (resumeQuery.isError && phase === "error" && steps.length === 0) {
-    const notFound = resumeQuery.error instanceof ApiError && resumeQuery.error.status === 404
-    if (notFound && error === "run not found") {
-      return (
-        <EmptyState
-          icon={ScrollText}
-          title="That run is not in the log"
-          description="The run id was not found in this estate's trace file. It may have been rotated away, or the API points at another host."
-          action={
-            <Button variant="outline" size="sm" render={<Link to="/runs" />}>
-              Back to runs
-            </Button>
-          }
-        />
-      )
-    }
+  if (phase === "error" && steps.length === 0 && error === "run not found") {
+    return (
+      <EmptyState
+        icon={ScrollText}
+        title="That run is not in the log"
+        description="The run id was not found in this estate's trace file. It may have been rotated away, or the API points at another host."
+        action={
+          <Button variant="outline" size="sm" render={<Link to="/runs" />}>
+            Back to runs
+          </Button>
+        }
+      />
+    )
   }
 
   return (
@@ -455,7 +592,6 @@ function RunDetailPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                void resumeQuery.refetch()
                 setAttempt((value) => value + 1)
               }}
             >
@@ -515,13 +651,20 @@ function RunDetailPage() {
             ) : phase === "error" ? (
               <>
                 <WifiOff className="size-3 text-destructive-strong" />
-                stalled
+                stream lost
               </>
             ) : phase === "ended" ? (
-              <>
-                <Check className="size-3 text-success" />
-                trace complete
-              </>
+              classifyStatus(outcome) === "interrupted" ? (
+                <>
+                  <WifiOff className="size-3 text-warning" />
+                  interrupted
+                </>
+              ) : (
+                <>
+                  <Check className="size-3 text-success" />
+                  trace complete
+                </>
+              )
             ) : (
               <>
                 <Clock className="size-3" />
@@ -538,7 +681,11 @@ function RunDetailPage() {
                 key={`${step.seq ?? index}-bar`}
                 className={cn(
                   "h-full",
-                  classifyStatus(step.status) === "failed" ? "bg-destructive/70" : "bg-success/60"
+                  classifyStatus(step.status) === "failed"
+                    ? "bg-destructive/70"
+                    : step.event === "step_start"
+                      ? "bg-info/60"
+                      : "bg-success/60"
                 )}
                 style={{ width: `${(1 / steps.length) * 100}%` }}
               />
@@ -584,6 +731,12 @@ function RunDetailPage() {
                   <Skeleton className="h-3 w-16" />
                 </div>
               ))}
+              {live ? (
+                <p className="pt-1 text-2xs text-muted-foreground">
+                  Waiting for the first step; another operation can hold the app lock
+                  for up to 5 minutes.
+                </p>
+              ) : null}
             </div>
           ) : (
             <div className="flex flex-col items-center gap-2 px-4 py-10 text-center">
@@ -602,6 +755,7 @@ function RunDetailPage() {
                 step={step}
                 index={index}
                 last={index === steps.length - 1}
+                ended={phase === "ended"}
               />
             ))}
           </ol>

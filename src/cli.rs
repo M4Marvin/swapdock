@@ -862,6 +862,7 @@ fn list_runs(cli: &Cli, limit: usize) -> anyhow::Result<()> {
                     ended: false,
                 });
             }
+            TraceEvent::StepStart { .. } => {}
             TraceEvent::Step { run_id, status, .. } => {
                 // Attribute to the run that is currently open.
                 if let Some(current) = summaries.iter_mut().rev().find(|s| &s.run_id == run_id) {
@@ -965,10 +966,14 @@ fn resume_run(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     match TraceLog::resume_point(&cli.trace, &run_id)? {
         Some(point) => {
             println!("run            {run_id}");
-            println!(
-                "last step      {} (seq {})",
-                point.last_step, point.last_seq
-            );
+            if point.last_seq == 0 {
+                println!("last step      none yet");
+            } else {
+                println!(
+                    "last step      {} (seq {})",
+                    point.last_step, point.last_seq
+                );
+            }
             println!("last status    {:?}", point.last_status);
             println!("non-ok steps   {}", point.non_ok_steps);
             println!("state          {:?}", point.state());

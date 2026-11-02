@@ -43,10 +43,10 @@ use crate::{apply, builder, exec, git, import, transfer, validator};
 /// How often the SSE handler re-reads the run log for new lines.
 const EVENTS_POLL: Duration = Duration::from_millis(300);
 
-/// How long an SSE stream may go without a new event for its run before it
-/// closes. A run that stopped writing without a `run_end` would otherwise hold
-/// the connection open forever.
-const EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// When a quiet run is checked for liveness. A Docker build can be silent for
+/// many minutes; silence alone is not an end, so the stream stays open while
+/// the process that opened the run is alive.
+const EVENTS_LIVENESS_CHECK: Duration = Duration::from_secs(60);
 
 /// Upper bound on a `git rev-parse` for `/apps/{name}/latest`. A local ref
 /// lookup is instantaneous; the bound exists so a wedged checkout cannot hold
@@ -2469,6 +2469,7 @@ async fn list_runs(State(state): State<Shared>, Query(q): Query<RunsQuery>) -> i
                             }
                         }
                     }
+                    TraceEvent::StepStart { .. } => {}
                     TraceEvent::RunEnd {
                         run_id,
                         status,
@@ -2509,6 +2510,7 @@ async fn show_run(State(state): State<Shared>, Path(id): Path<String>) -> impl I
         .iter()
         .filter(|e| match e {
             TraceEvent::RunStart { run_id, .. }
+            | TraceEvent::StepStart { run_id, .. }
             | TraceEvent::Step { run_id, .. }
             | TraceEvent::RunEnd { run_id, .. } => run_id.as_str() == id.as_str(),
         })
@@ -2573,11 +2575,15 @@ struct EventsQuery {
 /// second bus: each poll reads the bytes appended since the last one, parses
 /// complete lines, and forwards the ones tagged with `run`. When a `run_end`
 /// arrives the stream sends an explicit `done` event and closes, so a client
-/// never has to poll `/runs/{id}` to learn that the run finished. A run that
-/// stops writing without an end closes after [`EVENTS_IDLE_TIMEOUT`].
+/// never has to poll `/runs/{id}` to learn that the run finished.
 ///
-/// A client that reconnects after the idle close passes the last `seq` it saw
-/// as `since`; the stream then skips those steps instead of replaying them.
+/// Silence is not an ending: while the process that opened the run is alive,
+/// the stream stays open even when a step prints nothing (a Docker build is
+/// routinely quiet for minutes). It closes only when the process is gone, so
+/// an interrupted run cannot hold a connection forever.
+///
+/// A client that reconnects passes the last completed step `seq` it saw as
+/// `since`; the stream then skips those steps instead of replaying them.
 async fn run_events(
     State(state): State<Shared>,
     Query(q): Query<EventsQuery>,
@@ -2631,9 +2637,19 @@ async fn run_events(
                 if st.done {
                     return None;
                 }
-                if st.last_event.elapsed() >= EVENTS_IDLE_TIMEOUT {
-                    // Nothing new for this run in a minute; close rather than
-                    // hold a connection open for a run that stopped writing.
+                if st.last_event.elapsed() >= EVENTS_LIVENESS_CHECK {
+                    // A quiet build is a live run, not an ended one. Keep the
+                    // stream open while the opening process is alive; close
+                    // only when nothing can write a `run_end` any more.
+                    if matches!(
+                        crate::trace::run_state(st.pid, st.boot.as_deref(), None),
+                        RunStatus::Running
+                    ) {
+                        st.last_event = Instant::now();
+                        continue;
+                    }
+                    st.pending
+                        .push_back(Event::default().event("done").data("{}"));
                     st.done = true;
                     continue;
                 }
@@ -2693,8 +2709,12 @@ struct EventsState {
     /// Events parsed but not yet yielded to the stream.
     pending: VecDeque<Event>,
     done: bool,
-    /// When an event for this run was last seen; drives the idle timeout.
+    /// When an event for this run was last seen; drives the liveness check.
     last_event: Instant,
+    /// Process that opened the run, captured from `run_start`. With `boot`,
+    /// this tells a quiet-but-alive build from a run that stopped writing.
+    pid: Option<u32>,
+    boot: Option<String>,
 }
 
 impl EventsState {
@@ -2713,6 +2733,8 @@ impl EventsState {
             pending: VecDeque::new(),
             done: false,
             last_event: Instant::now(),
+            pid: None,
+            boot: None,
         }
     }
 
@@ -2731,11 +2753,22 @@ impl EventsState {
         .map_err(|e| std::io::Error::other(e.to_string()))??;
         self.offset = new_offset;
         for event in events {
+            if let TraceEvent::RunStart {
+                pid: run_pid,
+                boot: run_boot,
+                ..
+            } = &event
+            {
+                self.pid = *run_pid;
+                self.boot = run_boot.clone();
+            }
             // A reconnecting client has these already. Skip them so the log it
             // shows is not repeated, but keep the terminal record so the
             // stream can still finish.
             let already_seen = match &event {
-                TraceEvent::Step { seq, .. } => *seq <= self.since,
+                TraceEvent::Step { seq, .. } | TraceEvent::StepStart { seq, .. } => {
+                    *seq <= self.since
+                }
                 TraceEvent::RunStart { .. } => self.since > 0,
                 TraceEvent::RunEnd { .. } => false,
             };
@@ -2761,6 +2794,7 @@ impl EventsState {
 fn event_belongs_to(event: &TraceEvent, run_id: &str) -> bool {
     match event {
         TraceEvent::RunStart { run_id: id, .. }
+        | TraceEvent::StepStart { run_id: id, .. }
         | TraceEvent::Step { run_id: id, .. }
         | TraceEvent::RunEnd { run_id: id, .. } => id == run_id,
     }
@@ -3934,6 +3968,49 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json[0]["status"], "failed");
         assert_eq!(json[0]["error"], "front door answered HTTP 502");
+    }
+
+    #[tokio::test]
+    async fn a_step_start_is_in_history_but_not_counted_as_another_step() {
+        let (state, _dir) = test_state();
+        let run_id = {
+            let log = TraceLog::open(&state.trace).unwrap();
+            let mut run = Run::start(
+                log,
+                RunMode::Live,
+                Some("blog".into()),
+                &["swapdock".to_string()],
+                crate::redact::Redactor::new(),
+            )
+            .unwrap();
+            let argv = vec!["docker".to_string(), "build".to_string()];
+            let seq = run.next_seq();
+            run.record_step_start(seq, "docker-build", Duration::from_secs(1800), &argv)
+                .unwrap();
+            run.record_step(crate::trace::StepRecord::new(
+                seq,
+                "docker-build",
+                crate::trace::StepStatus::Ok,
+                &argv,
+            ))
+            .unwrap();
+            let id = run.id().to_string();
+            run.finish(RunStatus::Ok).unwrap();
+            id
+        };
+
+        let (status, json) = get_json(state.clone(), &format!("/runs/{run_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json.as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "step_start"),
+            "the run page needs the running record: {json}"
+        );
+
+        let (_, summary) = get_json(state, "/runs").await;
+        assert_eq!(summary[0]["steps"], 1, "start and finish are one step");
     }
 
     #[test]

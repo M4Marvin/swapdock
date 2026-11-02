@@ -230,6 +230,11 @@ impl Run {
             return crate::broker::docker_exec(self, spec, std::path::Path::new(socket.trim()));
         }
 
+        // Write the start before spawning: a Docker build can be silent for
+        // minutes, and this is the only event that shows it is alive.
+        self.record_step_start(seq, spec.name, spec.timeout, &argv)
+            .map_err(ExecError::Trace)?;
+
         let started = Instant::now();
         let result = spawn_and_capture(spec);
         let duration = started.elapsed();
@@ -545,6 +550,30 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert_eq!(out.stdout_trimmed(), "hello");
         assert!(out.success());
+    }
+
+    #[test]
+    fn a_step_is_announced_before_it_finishes() {
+        let dir = TempDir::new().unwrap();
+        let mut r = run(&dir);
+        r.exec(&sh("slow", "sleep 0.05")).unwrap();
+        r.finish(RunStatus::Ok).unwrap();
+
+        let read = TraceLog::read(dir.path().join("swapdock.jsonl")).unwrap();
+        let sequence: Vec<String> = read
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::StepStart { seq, step, .. } => Some(format!("start {seq} {step}")),
+                TraceEvent::Step { seq, step, .. } => Some(format!("finish {seq} {step}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            ["start 1 slow", "finish 1 slow"],
+            "the console needs the start event before the command can be quiet"
+        );
     }
 
     #[test]

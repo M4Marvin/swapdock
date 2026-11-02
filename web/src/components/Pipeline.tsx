@@ -15,6 +15,7 @@ import {
   Upload,
 } from "lucide-react"
 import {
+  ApiError,
   api,
   cfgState,
   classifyStatus,
@@ -29,6 +30,8 @@ import {
 import { queryKeys } from "@/lib/query-keys"
 import { errorText, formatDuration, isRelease, plural, shortId } from "@/lib/format"
 import { sameRelease } from "@/lib/releases"
+import { useNow } from "@/lib/now"
+import { mergeStep } from "@/lib/steps"
 import { cn } from "cn"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -53,9 +56,17 @@ interface StageInfo {
   runId: string | null
   steps: TraceEvent[]
   error: string | null
+  /** When the stage was started, for a live elapsed timer. */
+  startedAt: number | null
 }
 
-const EMPTY_STAGE: StageInfo = { state: "idle", runId: null, steps: [], error: null }
+const EMPTY_STAGE: StageInfo = {
+  state: "idle",
+  runId: null,
+  steps: [],
+  error: null,
+  startedAt: null,
+}
 const EMPTY_STAGES: Record<Stage, StageInfo> = {
   build: EMPTY_STAGE,
   transfer: EMPTY_STAGE,
@@ -94,7 +105,9 @@ function Connector() {
 }
 
 function StepConsole({ steps, active }: { steps: TraceEvent[]; active: boolean }) {
+  const now = useNow()
   const recent = steps.slice(-VISIBLE_STEPS)
+  const running = recent.find((step) => step.event === "step_start")
   return (
     <div
       aria-live="polite"
@@ -102,29 +115,58 @@ function StepConsole({ steps, active }: { steps: TraceEvent[]; active: boolean }
     >
       {recent.length === 0 ? (
         <p className="py-1 font-mono text-2xs text-subtle-foreground">
-          {active ? "Waiting for the first step…" : "Output appears here while it runs."}
+          {active
+            ? "Waiting for the first step; another operation can hold the lock for up to 5 minutes."
+            : "Output appears here while it runs."}
         </p>
       ) : (
-        recent.map((step, index) => (
-          <div
-            key={`${step.seq ?? index}-${step.step ?? ""}`}
-            className="animate-fade-in flex items-center gap-1.5 py-[1px] font-mono text-2xs leading-4"
-          >
-            <StatusDot tone={runTone(step.status)} className="size-1" />
-            <span className="min-w-0 flex-1 truncate text-muted-foreground">
-              {step.step ?? "step"}
-            </span>
-            {step.duration_ms != null ? (
-              <span className="shrink-0 text-subtle-foreground">
-                {formatDuration(step.duration_ms)}
+        recent.map((step, index) => {
+          const isRunning = step.event === "step_start" && active
+          const interrupted = step.event === "step_start" && !active
+          const shown = isRunning ? "running" : interrupted ? "interrupted" : step.status
+          const started = isRunning && step.ts ? Date.parse(step.ts) : NaN
+          const elapsed = Number.isFinite(started) ? Math.max(0, now - started) : null
+          return (
+            <div
+              key={`${step.seq ?? index}-${step.step ?? ""}`}
+              title={
+                isRunning && step.timeout_ms != null
+                  ? `timeout ${formatDuration(step.timeout_ms)}`
+                  : undefined
+              }
+              className="animate-fade-in flex items-center gap-1.5 py-[1px] font-mono text-2xs leading-4"
+            >
+              <StatusDot
+                tone={runTone(shown)}
+                pulse={isRunning}
+                className="size-1"
+              />
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                {step.step ?? "step"}
               </span>
-            ) : null}
-            {step.error ? (
-              <span className="max-w-[45%] shrink-0 truncate text-destructive-strong">{step.error}</span>
-            ) : null}
-          </div>
-        ))
+              {isRunning ? (
+                <span className="shrink-0 text-info">
+                  {elapsed != null ? formatDuration(elapsed) : "running"}
+                </span>
+              ) : interrupted ? (
+                <span className="shrink-0">stopped</span>
+              ) : step.duration_ms != null ? (
+                <span className="shrink-0 text-subtle-foreground">
+                  {formatDuration(step.duration_ms)}
+                </span>
+              ) : null}
+              {step.error ? (
+                <span className="max-w-[45%] shrink-0 truncate text-destructive-strong">{step.error}</span>
+              ) : null}
+            </div>
+          )
+        })
       )}
+      {active && running ? (
+        <p className="mt-1 border-t border-border/60 pt-1 text-2xs text-subtle-foreground">
+          Still running; Docker builds can be quiet for several minutes.
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -150,6 +192,11 @@ function StageCard({
   hint?: string
   children?: React.ReactNode
 }) {
+  const now = useNow()
+  const elapsed =
+    info.state === "active" && info.startedAt != null
+      ? Math.max(0, now - info.startedAt)
+      : null
   return (
     <div
       className={cn(
@@ -185,7 +232,14 @@ function StageCard({
           </div>
           <p className="mt-0.5 text-2xs leading-relaxed text-muted-foreground">{description}</p>
         </div>
-        <div className="shrink-0">{statePill(info.state)}</div>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {statePill(info.state)}
+          {elapsed != null ? (
+            <span className="text-2xs tabular text-subtle-foreground">
+              {formatDuration(elapsed)}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <div className="mt-2.5 min-w-0">
@@ -360,7 +414,13 @@ export function Pipeline({
     const toastId = `${app.name}:${stage}`
     setStages((current) => ({
       ...current,
-      [stage]: { state: "active", runId: null, steps: [], error: null },
+      [stage]: {
+        state: "active",
+        runId: null,
+        steps: [],
+        error: null,
+        startedAt: Date.now(),
+      },
     }))
 
     const settle = (status: string | null) => {
@@ -417,12 +477,21 @@ export function Pipeline({
           run_id,
           {
             onEvent: (event) => {
-              if (event.event !== "step") return
+              if (event.event === "run_end") {
+                if (event.error) {
+                  setStages((current) => ({
+                    ...current,
+                    [stage]: { ...current[stage], error: event.error ?? null },
+                  }))
+                }
+                return
+              }
+              if (event.event !== "step" && event.event !== "step_start") return
               setStages((current) => ({
                 ...current,
                 [stage]: {
                   ...current[stage],
-                  steps: [...current[stage].steps, event].slice(-50),
+                  steps: mergeStep(current[stage].steps, event).slice(-50),
                 },
               }))
             },
@@ -448,11 +517,19 @@ export function Pipeline({
                       settle(info.ended)
                       return
                     }
-                  } catch {
-                    failures += 1
-                    if (failures >= 3) {
-                      settle(null)
+                    if (classifyStatus(info.state) === "interrupted") {
+                      settle("interrupted")
                       return
+                    }
+                  } catch (caught) {
+                    // No completed step yet: the run is inside its first
+                    // command, not lost. Give it the same patience as a build.
+                    if (!(caught instanceof ApiError && caught.status === 404)) {
+                      failures += 1
+                      if (failures >= 3) {
+                        settle(null)
+                        return
+                      }
                     }
                   }
                   if (Date.now() - started > 45 * 60 * 1000) {

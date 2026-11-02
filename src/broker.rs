@@ -195,6 +195,8 @@ fn docker_exec_with_token(
     let started = Instant::now();
     let seq = run.next_seq();
     let argv = spec.full_argv();
+    run.record_step_start(seq, spec.name, spec.timeout, &argv)
+        .map_err(ExecError::Trace)?;
     let response = send_request(
         socket,
         &Request {

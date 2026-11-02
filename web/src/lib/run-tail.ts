@@ -1,9 +1,16 @@
-import { api, openRunEvents, type RunStream, type TraceEvent } from "@/api"
+import {
+  ApiError,
+  api,
+  classifyStatus,
+  openRunEvents,
+  type RunStream,
+  type TraceEvent,
+} from "@/api"
 
 export type RunPhase = "streaming" | "reconnecting" | "polling"
 
 export interface FollowRunHandlers {
-  /** Every recorded step, as it lands. */
+  /** Every recorded step, as it lands. A start is followed by its finish. */
   onStep?: (event: TraceEvent) => void
   /** Transport state, for a quiet "following" indicator. */
   onPhase?: (phase: RunPhase) => void
@@ -18,9 +25,10 @@ export interface FollowRunResult {
 /**
  * Follow one run until it ends.
  *
- * The events endpoint closes an idle stream when a long step (a Docker build)
- * writes nothing. That is a transport event, not a failure: this helper falls
- * back to `/resume` polling and keeps the same promise alive.
+ * A quiet stream is normal: a Docker build can write nothing for minutes. The
+ * server keeps it open while the run's process is alive, but a restart or a
+ * proxy can still drop it. That is a transport event, not a failure: this
+ * helper falls back to `/resume` polling and treats `interrupted` as final.
  *
  * Pass an AbortSignal to stop following (the run itself is not cancelled).
  */
@@ -35,6 +43,8 @@ export function followRun(
     let polling = false
     let pollTimer: ReturnType<typeof setTimeout> | null = null
     let stream: RunStream | null = null
+    /** The stream delivered `run_start`, so the id is real even at 404 resume. */
+    let sawStart = false
 
     const cleanup = () => {
       if (pollTimer) {
@@ -80,11 +90,24 @@ export function followRun(
             finish(info.ended, info.error ?? undefined)
             return
           }
-        } catch {
-          failures += 1
-          if (failures >= 3) {
-            finish(null, "the run stream was lost")
+          if (classifyStatus(info.state) === "interrupted") {
+            finish("interrupted", info.error ?? undefined)
             return
+          }
+        } catch (caught) {
+          // A run killed inside its first step has no completed step yet, so
+          // `/resume` is a 404 even though the run exists. Do not call that a
+          // lost stream once `run_start` has been delivered.
+          const firstStep =
+            caught instanceof ApiError &&
+            caught.status === 404 &&
+            sawStart
+          if (!firstStep) {
+            failures += 1
+            if (failures >= 3) {
+              finish(null, "the run stream was lost")
+              return
+            }
           }
         }
         if (Date.now() - started > 45 * 60 * 1000) {
@@ -100,7 +123,10 @@ export function followRun(
       runId,
       {
         onEvent: (event) => {
-          if (event.event === "step") handlers.onStep?.(event)
+          if (event.event === "run_start") sawStart = true
+          if (event.event === "step" || event.event === "step_start") {
+            handlers.onStep?.(event)
+          }
           if (event.event === "run_end" && event.error) reason = event.error
         },
         onStatus: (status) => {
