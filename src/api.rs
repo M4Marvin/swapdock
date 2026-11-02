@@ -826,20 +826,19 @@ async fn app_doctor(
     if selected.is_empty() {
         return error_response(StatusCode::NOT_FOUND, &format!("no app named {name:?}"));
     }
-    let state_for_job = state.clone();
+    let app_name = name.clone();
     match tokio::task::spawn_blocking(move || {
-        let log = TraceLog::open(&state_for_job.trace)?;
-        let mut run = Run::start(
-            log,
+        // A console doctor poll is read-only. Keep it out of the audit ledger;
+        // otherwise every overview refresh becomes a 36-step "run".
+        let mut run = Run::silent(
             RunMode::Live,
-            Some(name.clone()),
-            &["swapdock".to_string(), "api".to_string()],
+            Some(app_name),
             crate::redact::Redactor::new(),
-        )?;
+        );
         let mut problems: Vec<Problem> = selected.iter().flat_map(|a| a.problems()).collect();
         problems.extend(crate::doctor::check(&mut run, &selected, None, q.public));
         validator::sort_problems(&mut problems);
-        run.finish(RunStatus::Ok)?;
+        let _ = run.finish(RunStatus::Ok);
         Ok::<_, anyhow::Error>(problems)
     })
     .await
@@ -880,21 +879,15 @@ async fn doctor_all(
     if selected.is_empty() {
         return error_response(StatusCode::NOT_FOUND, "no matching apps");
     }
-    let state_for_job = state.clone();
     let public = q.public;
     match tokio::task::spawn_blocking(move || {
-        let log = TraceLog::open(&state_for_job.trace)?;
-        let mut run = Run::start(
-            log,
-            RunMode::Live,
-            None,
-            &["swapdock".to_string(), "api".to_string()],
-            crate::redact::Redactor::new(),
-        )?;
+        // Read-only: see app_doctor above. The CLI `swapdock doctor` still
+        // writes a receipt because it is an explicit operator command.
+        let mut run = Run::silent(RunMode::Live, None, crate::redact::Redactor::new());
         let mut problems: Vec<Problem> = selected.iter().flat_map(|a| a.problems()).collect();
         problems.extend(crate::doctor::check(&mut run, &selected, None, public));
         validator::sort_problems(&mut problems);
-        run.finish(RunStatus::Ok)?;
+        let _ = run.finish(RunStatus::Ok);
         Ok::<_, anyhow::Error>(problems)
     })
     .await
@@ -3757,6 +3750,20 @@ mod tests {
         assert!(
             read.events.is_empty(),
             "a read-only query must not appear in the run log: {:?}",
+            read.events
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_is_a_read_only_check() {
+        let (state, _dir) = test_state();
+        let (status, _) = get_json(state.clone(), "/doctor").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let read = TraceLog::read(&state.trace).unwrap();
+        assert!(
+            read.events.is_empty(),
+            "a console doctor poll must not write a ledger run: {:?}",
             read.events
         );
     }

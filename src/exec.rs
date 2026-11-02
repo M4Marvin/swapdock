@@ -577,6 +577,24 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_run_writes_no_ledger_entries() {
+        let dir = TempDir::new().unwrap();
+        let mut r = Run::silent(
+            RunMode::Live,
+            Some("blog".into()),
+            crate::redact::Redactor::new(),
+        );
+        let out = r.exec(&sh("echo", "echo hello")).unwrap();
+        assert_eq!(out.stdout_trimmed(), "hello");
+        r.finish(RunStatus::Ok).unwrap();
+
+        assert!(
+            !dir.path().join("swapdock.jsonl").exists(),
+            "a read-only check must not create a trace file"
+        );
+    }
+
+    #[test]
     fn a_non_zero_exit_is_a_result_not_an_error() {
         let dir = TempDir::new().unwrap();
         let mut r = run(&dir);

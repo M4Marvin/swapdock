@@ -171,6 +171,9 @@ Security and correctness hardening; this is the pre-launch work tracked in
 - TLS reverse-proxy example and docs (`docs/tls.md`); not automated.
 
 ### Console
+- Console doctor checks are read-only: they no longer create a 36-step run on
+  every overview refresh. The overview caches host findings for five minutes
+  and ignores window focus; the Doctor page keeps its manual refresh.
 - New version-drift card and header badge: current release/health, latest
   fetched source release, commit subject/time, commits behind, image/release
   readiness, and one action (deploy/build/check).

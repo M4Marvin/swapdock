@@ -84,7 +84,8 @@ function useOverviewData() {
     queryKey: [...queryKeys.doctor, false],
     queryFn: ({ signal }) => api.doctorAll(false, signal),
     retry: false,
-    staleTime: 60_000,
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
   })
 
   const apps = appsQuery.data ?? []

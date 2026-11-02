@@ -71,7 +71,8 @@ function DoctorPage() {
   const doctorQuery = useQuery({
     queryKey: [...queryKeys.doctor, publicUrls],
     queryFn: ({ signal }) => api.doctorAll(publicUrls, signal),
-    staleTime: 30_000,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
     retry: 0,
   })
 

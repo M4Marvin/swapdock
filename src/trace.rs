@@ -449,7 +449,7 @@ pub struct Run {
     app: Option<String>,
     mode: RunMode,
     redactor: Redactor,
-    log: TraceLog,
+    log: Option<TraceLog>,
     seq: u32,
 }
 
@@ -498,24 +498,41 @@ impl Run {
             app,
             mode,
             redactor,
-            log,
+            log: Some(log),
             seq: 0,
         };
 
-        run.log.append(&TraceEvent::RunStart {
-            run_id: id.to_string(),
-            ts: now.to_rfc3339(),
-            ts_ms: now.epoch_millis(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            mode,
-            app: run.app.clone(),
-            actor,
-            pid: Some(std::process::id()),
-            boot: current_boot_id(),
-            argv: run.redactor.argv(argv),
-        })?;
+        run.log
+            .as_mut()
+            .expect("start_as opens a log")
+            .append(&TraceEvent::RunStart {
+                run_id: id.to_string(),
+                ts: now.to_rfc3339(),
+                ts_ms: now.epoch_millis(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                mode,
+                app: run.app.clone(),
+                actor,
+                pid: Some(std::process::id()),
+                boot: current_boot_id(),
+                argv: run.redactor.argv(argv),
+            })?;
 
         Ok(run)
+    }
+
+    /// A run for a read-only check: commands still go through the one exec
+    /// chokepoint, but no ledger records are written. A console poll must not
+    /// fill the audit page with checks that changed nothing.
+    pub fn silent(mode: RunMode, app: Option<String>, redactor: Redactor) -> Self {
+        Self {
+            id: RunId::generate(),
+            app,
+            mode,
+            redactor,
+            log: None,
+            seq: 0,
+        }
     }
 
     pub fn id(&self) -> &RunId {
@@ -557,8 +574,11 @@ impl Run {
     }
 
     fn close(mut self, status: RunStatus, error: Option<String>) -> anyhow::Result<()> {
+        let Some(log) = self.log.as_mut() else {
+            return Ok(());
+        };
         let now = Timestamp::now();
-        self.log.append(&TraceEvent::RunEnd {
+        log.append(&TraceEvent::RunEnd {
             run_id: self.id.to_string(),
             ts: now.to_rfc3339(),
             ts_ms: now.epoch_millis(),
@@ -578,8 +598,11 @@ impl Run {
         timeout: Duration,
         argv: &[String],
     ) -> anyhow::Result<()> {
+        let Some(log) = self.log.as_mut() else {
+            return Ok(());
+        };
         let now = Timestamp::now();
-        self.log.append(&TraceEvent::StepStart {
+        log.append(&TraceEvent::StepStart {
             run_id: self.id.to_string(),
             ts: now.to_rfc3339(),
             ts_ms: now.epoch_millis(),
@@ -595,8 +618,11 @@ impl Run {
     /// Appends a `step` record. Redaction happens here, at the last moment
     /// before the data can reach a file.
     pub fn record_step(&mut self, step: StepRecord<'_>) -> anyhow::Result<()> {
+        let Some(log) = self.log.as_mut() else {
+            return Ok(());
+        };
         let now = Timestamp::now();
-        self.log.append(&TraceEvent::Step {
+        log.append(&TraceEvent::Step {
             run_id: self.id.to_string(),
             ts: now.to_rfc3339(),
             ts_ms: now.epoch_millis(),
